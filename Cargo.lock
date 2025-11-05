@@ -427,7 +427,6 @@ dependencies = [
  "alloy-primitives",
  "alloy-pubsub",
  "alloy-rpc-client",
- "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
  "alloy-signer",
  "alloy-sol-types",
@@ -6064,7 +6063,6 @@ dependencies = [
  "reqwest",
  "reth",
  "reth-basic-payload-builder",
- "reth-bench",
  "reth-chain-state",
  "reth-chainspec",
  "reth-cli",
@@ -7091,46 +7089,6 @@ dependencies = [
  "reth-storage-api",
  "reth-tasks",
  "tokio",
- "tracing",
-]
-
-[[package]]
-name = "reth-bench"
-version = "1.8.3"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.8.3#42197415102b7a20be42e4fe919f024b81ceb55b"
-dependencies = [
- "alloy-eips",
- "alloy-json-rpc",
- "alloy-primitives",
- "alloy-provider",
- "alloy-pubsub",
- "alloy-rpc-client",
- "alloy-rpc-types-engine",
- "alloy-transport",
- "alloy-transport-http",
- "alloy-transport-ipc",
- "alloy-transport-ws",
- "async-trait",
- "clap",
- "csv",
- "eyre",
- "futures",
- "humantime",
- "op-alloy-consensus",
- "op-alloy-rpc-types-engine",
- "reqwest",
- "reth-cli-runner",
- "reth-cli-util",
- "reth-fs-util",
- "reth-node-api",
- "reth-node-core",
- "reth-primitives-traits",
- "reth-tracing",
- "serde",
- "serde_json",
- "thiserror 2.0.12",
- "tokio",
- "tower",
  "tracing",
 ]
 

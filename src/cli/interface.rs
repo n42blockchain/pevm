@@ -12,10 +12,10 @@ use reth_cli_commands::{
 };
 use reth_cli_runner::CliRunner;
 use reth_node_core::args::LogArgs;
-use reth_node_ethereum::{consensus::EthBeaconConsensus, EthExecutorProvider, EthereumNode};
+use reth_node_ethereum::{consensus::EthBeaconConsensus, EthEvmConfig, EthereumNode};
 use reth_node_metrics::recorder::install_prometheus_recorder;
 use reth_tracing::FileWorkerGuard;
-use std::{ffi::OsString, fmt, future::Future, sync::Arc};
+use std::{ffi::OsString, fmt, sync::Arc};
 use tracing::info;
 
 /// The main reth cli interface.
@@ -142,7 +142,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
 
         let components = |spec: Arc<C::ChainSpec>| {
             (
-                EthExecutorProvider::ethereum(spec.clone()),
+                EthEvmConfig::ethereum(spec.clone()),
                 Arc::new(EthBeaconConsensus::new(spec)),
             )
         };
@@ -241,6 +241,7 @@ pub enum Commands<C: ChainSpecParser, Ext: clap::Args + fmt::Debug> {
     /// Various debug routines
     #[command(name = "debug")]
     Debug(Box<debug_cmd::Command<C>>),
+    /// Execute EVM commands
     #[command(name = "evm")]
     Evm(Box<evm::EvmCommand<C>>),
     /// Prune according to the configuration without any limits
@@ -361,6 +362,8 @@ mod tests {
 
     #[test]
     fn parse_env_filter_directives() {
+        use reth_cli_commands::launcher::FnLauncher;
+
         let temp_dir = tempfile::tempdir().unwrap();
 
         unsafe { std::env::set_var("RUST_LOG", "info,evm=debug") };
@@ -373,6 +376,6 @@ mod tests {
             "debug,net=trace",
         ])
         .unwrap();
-        assert!(reth.run(async move |_, _| Ok(())).is_ok());
+        assert!(reth.run(FnLauncher::new::<EthereumChainSpecParser, NoArgs>(async move |_, _| Ok(()))).is_ok());
     }
 }

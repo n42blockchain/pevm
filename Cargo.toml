@@ -10,6 +10,9 @@ resolver = "2"
 name = "pevm"
 path = "src/main.rs"
 
+[features]
+dev = []
+
 [lints]
 rust.missing_debug_implementations = "warn"
 rust.missing_docs = "warn"
@@ -146,7 +149,6 @@ num_cpus = "1.16.0"
 
 reth = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.8.3" }
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.8.3" }
-reth-bench = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.8.3" }
 #reth-blockchain-tree = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.8.3" }
 #reth-blockchain-tree-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.8.3" }
 reth-chain-state = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.8.3" }

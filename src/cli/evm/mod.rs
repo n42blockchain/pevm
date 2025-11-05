@@ -23,12 +23,13 @@ use reth_node_ethereum::{consensus::EthBeaconConsensus, EthEvmConfig};
 use reth_evm::{execute::Executor, ConfigureEvm};
 use reth_revm::database::StateProviderDatabase;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::thread::JoinHandle;
 use eyre::{Report, Result};
 use std::panic::AssertUnwindSafe;
 use reth_primitives_traits::{BlockBody, format_gas_throughput};
+use tokio::signal;
 
 /// EVM commands
 #[derive(Debug, Parser)]
@@ -60,6 +61,16 @@ pub const MEGAGAS: u64 = KILOGAS * 1_000;
 /// Represents one Gigagas, or `1_000_000_000` gas.
 pub const GIGAGAS: u64 = MEGAGAS * 1_000;
 
+/// Formats gas throughput as Gigagas per second.
+///
+/// # Arguments
+///
+/// * `gas` - Total gas consumed
+/// * `execution_duration` - Duration of execution
+///
+/// # Returns
+///
+/// A formatted string representing the gas throughput in Ggas/s
 pub fn format_gas_throughput_as_ggas(gas: u64, execution_duration: Duration) -> String {
     let gas_per_second = gas as f64 / execution_duration.as_secs_f64();
     format!("{:.2}", gas_per_second / GIGAGAS as f64)
@@ -75,7 +86,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         >,
     >(
         self,
-        ctx: CliContext,
+        _ctx: CliContext,
     ) -> eyre::Result<()> {
         info!("Executing EVM command...");
 
@@ -116,24 +127,43 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         let thread_count = self.get_cpu_count() * 2 - 1;
         let mut threads: Vec<JoinHandle<Result<()>>> = Vec::with_capacity(thread_count);
 
-        // 创建共享 gas 计数器
+        // 创建共享 gas 计数器和停止标志
         let task_queue = Arc::new(Mutex::new(tasks));
         let cumulative_gas = Arc::new(Mutex::new(0));
         let block_counter = Arc::new(Mutex::new(self.begin_number - 1));
         let txs_counter = Arc::new(Mutex::new(0));
+        let should_stop = Arc::new(AtomicBool::new(false));
+
+        // 设置 Ctrl+C 信号处理
+        let should_stop_clone = Arc::clone(&should_stop);
+        tokio::spawn(async move {
+            if signal::ctrl_c().await.is_ok() {
+                info!("Received Ctrl+C, shutting down gracefully...");
+                should_stop_clone.store(true, Ordering::Relaxed);
+            }
+        });
 
         // 创建状态输出线程
         {
             let cumulative_gas = Arc::clone(&cumulative_gas);
             let block_counter = Arc::clone(&block_counter);
             let txs_counter = Arc::clone(&txs_counter);
+            let should_stop_status = Arc::clone(&should_stop);
             let start = Instant::now();
+            let begin_number = self.begin_number;
+            let end_number = self.end_number;
 
             thread::spawn(move || {
                 let mut previous_cumulative_gas: u64 = 0;
-                let mut previous_block_counter: u64 = self.begin_number - 1;
+                let mut previous_block_counter: u64 = begin_number - 1;
                 let mut previous_txs_counter: u64 = 0;
                 loop {
+                    // 检查停止标志
+                    if should_stop_status.load(Ordering::Relaxed) {
+                        info!("Status thread stopping due to Ctrl+C");
+                        break;
+                    }
+
                     thread::sleep(Duration::from_secs(1));
 
                     let current_cumulative_gas = cumulative_gas.lock().unwrap();
@@ -166,10 +196,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                         );
                     }
 
-                    if *current_block_counter >= (self.end_number - self.begin_number + 1) {
-                        // return Ok(true);
+                    if *current_block_counter >= (end_number - begin_number + 1) {
+                        break;
                     }
-                    //println!("current_cumulative_gas={}", current_cumulative_gas);
                 }
             });
         }
@@ -179,6 +208,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             let cumulative_gas = Arc::clone(&cumulative_gas);
             let block_counter = Arc::clone(&block_counter);
             let txs_counter = Arc::clone(&txs_counter);
+            let should_stop_worker = Arc::clone(&should_stop);
 
             let provider_factory = provider_factory.clone();
             let blockchain_db = blockchain_db.clone();
@@ -186,6 +216,12 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             threads.push(thread::spawn(move || {
                 let thread_id = thread::current().id();
                 loop {
+                    // 检查停止标志
+                    if should_stop_worker.load(Ordering::Relaxed) {
+                        debug!(target: "exex::evm", thread_id = ?thread_id, "Worker thread stopping due to Ctrl+C");
+                        break;
+                    }
+
                     let task = {
                         let mut queue = task_queue.lock().unwrap();
                         if queue.is_empty() {
@@ -195,6 +231,12 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                     };
 
                     if let Some(task) = task {
+                        // 再次检查停止标志，避免开始执行新任务
+                        if should_stop_worker.load(Ordering::Relaxed) {
+                            debug!(target: "exex::evm", thread_id = ?thread_id, "Worker thread stopping before task execution");
+                            break;
+                        }
+
                         debug!(
                             target: "exex::evm",
                             task_start = task.start,
@@ -267,6 +309,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             }));
         }
 
+        // 等待所有线程完成，或检查停止标志
         for thread in threads {
             match thread.join() {
                 Ok(res) => {
@@ -277,8 +320,13 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 Err(e) => error!("Thread execution error: {:?}", e),
             };
         }
-        thread::sleep(Duration::from_secs(1));
 
+        if should_stop.load(Ordering::Relaxed) {
+            info!("EVM command stopped by user");
+        } else {
+            thread::sleep(Duration::from_secs(1));
+            info!("EVM command completed successfully");
+        }
 
         Ok(())
     }

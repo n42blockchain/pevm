@@ -25,7 +25,7 @@ use reth_primitives_traits::SealedBlock;
 use reth_provider::{
     providers::ProviderNodeTypes, AccountExtReader, ChainSpecProvider, DatabaseProviderFactory,
     HashedPostStateProvider, HashingWriter, LatestStateProviderRef, OriginalValuesKnown,
-    ProviderFactory, StageCheckpointReader, StateWriter, StorageLocation, StorageReader,
+    ProviderFactory, StageCheckpointReader, StateWriter, StorageReader, BlockWriter,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_stages::StageId;
@@ -165,11 +165,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         let provider_rw = provider_factory.database_provider_rw()?;
 
         // Insert block, state and hashes
-        provider_rw.insert_historical_block(block.clone().try_recover()?)?;
+        provider_rw.insert_block(block.clone().try_recover()?)?;
         provider_rw.write_state(
             &execution_outcome,
             OriginalValuesKnown::No,
-            StorageLocation::Database,
         )?;
         let storage_lists =
             provider_rw.changed_storages_with_range(block.number..=block.number())?;

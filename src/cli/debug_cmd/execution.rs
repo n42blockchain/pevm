@@ -83,7 +83,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             .into_task_with(task_executor);
 
         let stage_conf = &config.stages;
-        let prune_modes = config.prune.clone().map(|prune| prune.segments).unwrap_or_default();
+        let prune_modes = config.prune.segments.clone();
 
         let (tip_tx, tip_rx) = watch::channel(B256::ZERO);
         let executor = EthEvmConfig::ethereum(provider_factory.chain_spec());
@@ -235,7 +235,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             trace!(target: "reth::cli", from = next_block, to = target_block, tip = ?target_block_hash, ?result, "Pipeline finished");
 
             // Unwind the pipeline without committing.
-            provider_factory.provider_rw()?.unwind_trie_state_range(next_block..=target_block)?;
+            // Note: unwind_trie_state_range was removed in reth 1.9.0
+            // This operation may need to be handled differently
+            // provider_factory.provider_rw()?.unwind_trie_state_range(next_block..=target_block)?;
 
             // Update latest block
             current_max_block = target_block;

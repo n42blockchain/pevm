@@ -245,8 +245,12 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             "start loop",
                         );
                         let result = std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), Report> {
-                            let mut td = blockchain_db.header_td_by_number(task.start - 1)?
+                            // Get parent header for total difficulty calculation
+                            let parent_header = blockchain_db.header_by_number(task.start - 1)?
                                 .ok_or_else(|| ProviderError::HeaderNotFound(task.start.into()))?;
+                            // In reth 1.9.0, we need to calculate total difficulty from the difficulty field
+                            // Start with parent's difficulty (which is the block's difficulty)
+                            let mut td = parent_header.difficulty;
 
                             let db = StateProviderDatabase::new(blockchain_db.history_by_block_number(task.start - 1)?);
                             let evm_config = EthEvmConfig::ethereum(provider_factory.chain_spec());

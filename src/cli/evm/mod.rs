@@ -185,14 +185,17 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                         let total_seconds = seconds as f64 + millis as f64 / 1000.0;
                         let gas_throughput_str = format_gas_throughput_as_ggas(diff_gas, Duration::from_secs(1));
                         //let gas_throughput_final : String =gas_throughput_str.chars().take(gas_throughput_str.len()-" Ggas/second".len()).collect();
+                        let tps_colored = format!("\x1b[32m{}\x1b[0m", diff_txs);
+                        let ggas_colored = format!("\x1b[32m{}\x1b[0m", gas_throughput_str);
                         info!(
-                            "Execution bn={} txs={} b/s={} TPS={color_green}{}{color_reset} Ggas/s={color_green}{}{color_reset} time={:.1} totalgas={}", current_block_counter,
-                            current_txs_counter,
-                            diff_block,
-                            diff_txs,
-                            gas_throughput_str,
-                            total_seconds,
-                            current_cumulative_gas,
+                            bn = %current_block_counter,
+                            txs = %current_txs_counter,
+                            b_per_s = %diff_block,
+                            TPS = %tps_colored,
+                            Ggas_per_s = %ggas_colored,
+                            time = %format!("{:.1}", total_seconds),
+                            totalgas = %current_cumulative_gas,
+                            "Execution"
                         );
                     }
 

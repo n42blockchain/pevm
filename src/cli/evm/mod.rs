@@ -9,7 +9,6 @@ use reth_ethereum_primitives::EthPrimitives;
 use reth_node_ethereum::EthEngineTypes;
 
 use tracing::{info, debug, error, trace};
-use inline_colorization::*;
 use std::time::{Duration, Instant};
 use reth_cli_commands::common::{AccessRights, Environment, EnvironmentArgs};
 

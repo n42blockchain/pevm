@@ -6086,6 +6086,7 @@ dependencies = [
  "futures-util",
  "generic-array",
  "hash-db",
+ "hex",
  "hickory-resolver",
  "hmac",
  "http",

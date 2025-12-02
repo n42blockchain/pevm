@@ -14,7 +14,7 @@ use reth_cli_commands::common::{AccessRights, Environment, EnvironmentArgs};
 
 use reth_consensus::FullConsensus;
 use reth_provider::{
-    BlockNumReader, HeaderProvider, ProviderError,
+    BlockNumReader, HeaderProvider, ProviderError, 
     providers::BlockchainProvider, BlockReader, ChainSpecProvider, StateProviderFactory,
 };
 use reth_errors::ConsensusError;
@@ -29,6 +29,11 @@ use eyre::{Report, Result};
 use std::panic::AssertUnwindSafe;
 use reth_primitives_traits::{BlockBody, format_gas_throughput};
 use tokio::signal;
+use std::fs::File;
+use std::io::Write;
+use alloy_primitives::{Address, B256, U256};
+use crate::revm::Database;
+use crate::revm::state::{AccountInfo, Bytecode};
 
 /// EVM commands
 #[derive(Debug, Parser)]
@@ -44,11 +49,155 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// step size for loop
     #[arg(long, alias = "step", short = 's', default_value = "100")]
     step_size: usize,
+    /// Block number to log reads for (generates a log file with account and storage reads)
+    #[arg(long, alias = "log-block")]
+    log_block: Option<u64>,
 }
 
 struct Task {
     start: u64,
     end: u64,
+}
+
+/// Read log entry types - 按访问顺序记录
+#[derive(Debug, Clone)]
+enum ReadLogEntry {
+    Account { address: Address, data: Vec<u8> },
+    Storage { address: Address, key: B256, data: Vec<u8> },
+}
+
+/// 包装的 Database，用于拦截读取操作并记录日志
+struct LoggingDatabase<DB> {
+    inner: DB,
+    read_logs: Arc<Mutex<Vec<ReadLogEntry>>>,
+}
+
+impl<DB> std::fmt::Debug for LoggingDatabase<DB> 
+where
+    DB: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoggingDatabase")
+            .field("inner", &self.inner)
+            .field("read_logs", &self.read_logs)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<DB: crate::revm::Database> crate::revm::Database for LoggingDatabase<DB> {
+    type Error = <DB as Database>::Error;
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, <DB as Database>::Error> {
+        let result = self.inner.basic(address)?;
+        
+        // 记录账户读取：使用拦截到的 AccountInfo 数据，编码为与 PlainState 一致的 RLP 格式
+        if let Some(account_info) = &result {
+            // PlainState 中账户的 RLP 编码格式: [nonce, balance, storage_root?, code_hash?]
+            // 如果 storage_root 为 ZERO 或 code_hash 为空 code 的 hash，则省略
+            use alloy_rlp::Encodable;
+            
+            // 空 code 的 hash: KECCAK256("") = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
+            let empty_code_hash = B256::from_slice(&[
+                0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c,
+                0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
+                0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b,
+                0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
+            ]);
+            
+            let storage_root = B256::ZERO;
+            let code_hash = account_info.code_hash();
+            
+            // 决定哪些字段需要编码
+            let include_storage_root = storage_root != B256::ZERO;
+            let include_code_hash = code_hash != empty_code_hash;
+            
+            // 计算 payload 长度
+            let mut payload_len = account_info.nonce.length() + account_info.balance.length();
+            if include_storage_root {
+                payload_len += storage_root.length();
+            }
+            if include_code_hash {
+                payload_len += code_hash.length();
+            }
+            
+            let mut buf = Vec::new();
+            let header = alloy_rlp::Header {
+                list: true,
+                payload_length: payload_len,
+            };
+            header.encode(&mut buf);
+            account_info.nonce.encode(&mut buf);
+            account_info.balance.encode(&mut buf);
+            if include_storage_root {
+                storage_root.encode(&mut buf);
+            }
+            if include_code_hash {
+                code_hash.encode(&mut buf);
+            }
+            
+            let mut logs = self.read_logs.lock().unwrap();
+            logs.push(ReadLogEntry::Account {
+                address,
+                data: buf,
+            });
+        }
+        
+        Ok(result)
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, <DB as Database>::Error> {
+        // 代码读取忽略（按用户要求）
+        self.inner.code_by_hash(code_hash)
+    }
+
+    fn storage(&mut self, address: Address, index: U256) -> Result<U256, <DB as Database>::Error> {
+        let result = self.inner.storage(address, index)?;
+        
+        // 记录存储读取：使用拦截到的存储值，编码为 RLP
+        let key_bytes = index.to_be_bytes::<32>();
+        let key = B256::from_slice(&key_bytes);
+        
+        // 将存储值编码为 RLP
+        use alloy_rlp::Encodable;
+        let mut buf = Vec::new();
+        result.encode(&mut buf);
+        
+        let mut logs = self.read_logs.lock().unwrap();
+        logs.push(ReadLogEntry::Storage {
+            address,
+            key,
+            data: buf,
+        });
+        
+        Ok(result)
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<B256, <DB as Database>::Error> {
+        self.inner.block_hash(number)
+    }
+}
+
+/// 写入读取日志到文件
+fn write_read_logs(block_number: u64, read_logs: &[ReadLogEntry]) -> eyre::Result<()> {
+    let log_file_path = format!("block_{}_reads.log", block_number);
+    let mut log_file = File::create(&log_file_path)?;
+    
+    // 按照访问顺序写入日志
+    for entry in read_logs {
+        match entry {
+            ReadLogEntry::Account { address, data } => {
+                // 格式: address, 0x{账户数据不解码}（十六进制）
+                writeln!(log_file, "{}, 0x{}", address, hex::encode(data))?;
+            }
+            ReadLogEntry::Storage { address, key, data } => {
+                // 格式: address 0x{key}, 0x{存储数据}（十六进制）
+                writeln!(log_file, "{} 0x{:x}, 0x{}", address, key, hex::encode(data))?;
+            }
+        }
+    }
+    
+    info!("Read log written to: {} ({} entries)", log_file_path, read_logs.len());
+    Ok(())
 }
 
 /// Represents one Kilogas, or `1_000` gas.
@@ -330,6 +479,39 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 }
                 Err(e) => error!("Thread execution error: {:?}", e),
             };
+        }
+
+        // 如果指定了 log_block，按正常访问顺序生成该块的 account/storage 日志
+        if let Some(log_block) = self.log_block {
+            // 为避免影响上面的并行执行，这里单独重新构建一次 provider 和 executor
+            let blockchain_db = BlockchainProvider::new(provider_factory.clone())?;
+            let state_provider = blockchain_db.history_by_block_number(
+                log_block.checked_sub(1).unwrap_or(0)
+            )?;
+            let inner_db = StateProviderDatabase::new(&state_provider);
+            
+            // 创建日志收集器
+            let read_logs = Arc::new(Mutex::new(Vec::<ReadLogEntry>::new()));
+            let logging_db = LoggingDatabase {
+                inner: inner_db,
+                read_logs: Arc::clone(&read_logs),
+            };
+            
+            let evm_config = EthEvmConfig::ethereum(provider_factory.chain_spec());
+            let executor = evm_config.batch_executor(logging_db);
+
+            let blocks = blockchain_db
+                .block_with_senders_range(log_block..=log_block)
+                .map_err(|e| eyre::eyre!("failed to load block {}: {}", log_block, e))?;
+
+            if let Some(block) = blocks.first() {
+                // 执行该块，LoggingDatabase 会在读取时自动记录日志
+                executor.execute(block)?;
+                
+                // 获取记录的日志（按正常访问顺序）
+                let logs = read_logs.lock().unwrap();
+                write_read_logs(log_block, &logs)?;
+            }
         }
 
         if should_stop.load(Ordering::Relaxed) {

@@ -22,7 +22,7 @@ use reth_node_ethereum::{consensus::EthBeaconConsensus, EthEvmConfig};
 use reth_provider::{
     providers::ProviderNodeTypes, BlockNumReader, BlockWriter, ChainSpecProvider,
     DatabaseProviderFactory, LatestStateProviderRef, OriginalValuesKnown, ProviderFactory,
-    StateWriter,
+    StateWriter, StorageLocation,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_stages::{
@@ -153,7 +153,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                 block.try_recover().map_err(|_| eyre::eyre!("Error sealing block with senders"))?;
             trace!(target: "reth::cli", block_number, "Executing block");
 
-            provider_rw.insert_block(sealed_block.clone())?;
+            provider_rw.insert_block(sealed_block.clone(), StorageLocation::Database)?;
 
             let executor = executor_provider.batch_executor(StateProviderDatabase::new(
                 LatestStateProviderRef::new(&provider_rw),
@@ -163,6 +163,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             provider_rw.write_state(
                 &ExecutionOutcome::single(block_number, output),
                 OriginalValuesKnown::Yes,
+                StorageLocation::Database,
             )?;
 
             let checkpoint = Some(StageCheckpoint::new(

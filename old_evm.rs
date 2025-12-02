@@ -9,12 +9,13 @@ use reth_ethereum_primitives::EthPrimitives;
 use reth_node_ethereum::EthEngineTypes;
 
 use tracing::{info, debug, error, trace};
+use inline_colorization::*;
 use std::time::{Duration, Instant};
 use reth_cli_commands::common::{AccessRights, Environment, EnvironmentArgs};
 
 use reth_consensus::FullConsensus;
 use reth_provider::{
-    BlockNumReader, HeaderProvider, ProviderError,
+    BlockNumReader, HeaderProvider, ProviderError, 
     providers::BlockchainProvider, BlockReader, ChainSpecProvider, StateProviderFactory,
 };
 use reth_errors::ConsensusError;
@@ -91,13 +92,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
         let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RO)?;
 
-        // 提前获取 chain_spec，避免在线程中重复调用（可能有锁）
-        let chain_spec = provider_factory.chain_spec();
         let _consensus: Arc<dyn FullConsensus<EthPrimitives, Error = ConsensusError>> =
-            Arc::new(EthBeaconConsensus::new(chain_spec.clone()));
+            Arc::new(EthBeaconConsensus::new(provider_factory.chain_spec()));
 
-        // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
         let blockchain_db = BlockchainProvider::new(provider_factory.clone())?;
+
         let provider = provider_factory.provider()?;
 
         let last = provider.last_block_number()?;
@@ -109,7 +108,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             eyre::bail!("The end block number is higher than the latest block number")
         }
 
-        // 创建任务池
+        // 鍒涘缓浠诲姟姹?
         let mut tasks = VecDeque::new();
         let mut current_start = self.begin_number;
         while current_start <= self.end_number {
@@ -124,18 +123,18 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             current_start = current_end + 1;
         }
 
-        // 获取 CPU 核心数，减一作为线程数
+        // 鑾峰彇 CPU 鏍稿績鏁帮紝鍑忎竴浣滀负绾跨▼鏁?
         let thread_count = self.get_cpu_count() * 2 - 1;
         let mut threads: Vec<JoinHandle<Result<()>>> = Vec::with_capacity(thread_count);
 
-        // 创建共享 gas 计数器和停止标志
+        // 鍒涘缓鍏变韩 gas 璁℃暟鍣ㄥ拰鍋滄鏍囧織
         let task_queue = Arc::new(Mutex::new(tasks));
         let cumulative_gas = Arc::new(Mutex::new(0));
         let block_counter = Arc::new(Mutex::new(self.begin_number - 1));
         let txs_counter = Arc::new(Mutex::new(0));
         let should_stop = Arc::new(AtomicBool::new(false));
 
-        // 设置 Ctrl+C 信号处理
+        // 璁剧疆 Ctrl+C 淇″彿澶勭悊
         let should_stop_clone = Arc::clone(&should_stop);
         tokio::spawn(async move {
             if signal::ctrl_c().await.is_ok() {
@@ -144,7 +143,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             }
         });
 
-        // 创建状态输出线程
+        // 鍒涘缓鐘舵€佽緭鍑虹嚎绋?
         {
             let cumulative_gas = Arc::clone(&cumulative_gas);
             let block_counter = Arc::clone(&block_counter);
@@ -159,7 +158,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 let mut previous_block_counter: u64 = begin_number - 1;
                 let mut previous_txs_counter: u64 = 0;
                 loop {
-                    // 检查停止标志
+                    // 妫€鏌ュ仠姝㈡爣蹇?
                     if should_stop_status.load(Ordering::Relaxed) {
                         info!("Status thread stopping due to Ctrl+C");
                         break;
@@ -186,17 +185,14 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                         let total_seconds = seconds as f64 + millis as f64 / 1000.0;
                         let gas_throughput_str = format_gas_throughput_as_ggas(diff_gas, Duration::from_secs(1));
                         //let gas_throughput_final : String =gas_throughput_str.chars().take(gas_throughput_str.len()-" Ggas/second".len()).collect();
-                        let tps_colored = format!("\x1b[32m{}\x1b[0m", diff_txs);
-                        let ggas_colored = format!("\x1b[32m{}\x1b[0m", gas_throughput_str);
                         info!(
-                            bn = %current_block_counter,
-                            txs = %current_txs_counter,
-                            b_per_s = %diff_block,
-                            TPS = %tps_colored,
-                            Ggas_per_s = %ggas_colored,
-                            time = %format!("{:.1}", total_seconds),
-                            totalgas = %current_cumulative_gas,
-                            "Execution"
+                            "Execution bn={} txs={} b/s={} TPS={color_green}{}{color_reset} Ggas/s={color_green}{}{color_reset} time={:.1} totalgas={}", current_block_counter,
+                            current_txs_counter,
+                            diff_block,
+                            diff_txs,
+                            gas_throughput_str,
+                            total_seconds,
+                            current_cumulative_gas,
                         );
                     }
 
@@ -214,18 +210,13 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             let txs_counter = Arc::clone(&txs_counter);
             let should_stop_worker = Arc::clone(&should_stop);
 
-            let chain_spec = chain_spec.clone();
+            let provider_factory = provider_factory.clone();
             let blockchain_db = blockchain_db.clone();
 
-            // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
             threads.push(thread::spawn(move || {
                 let thread_id = thread::current().id();
-                
-                // 预先创建 EVM 配置，避免在循环中重复创建
-                let evm_config = EthEvmConfig::ethereum(chain_spec.clone());
-                
                 loop {
-                    // 检查停止标志
+                    // 妫€鏌ュ仠姝㈡爣蹇?
                     if should_stop_worker.load(Ordering::Relaxed) {
                         debug!(target: "exex::evm", thread_id = ?thread_id, "Worker thread stopping due to Ctrl+C");
                         break;
@@ -240,7 +231,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                     };
 
                     if let Some(task) = task {
-                        // 再次检查停止标志，避免开始执行新任务
+                        // 鍐嶆妫€鏌ュ仠姝㈡爣蹇楋紝閬垮厤寮€濮嬫墽琛屾柊浠诲姟
                         if should_stop_worker.load(Ordering::Relaxed) {
                             debug!(target: "exex::evm", thread_id = ?thread_id, "Worker thread stopping before task execution");
                             break;
@@ -257,18 +248,16 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             let mut td = blockchain_db.header_td_by_number(task.start - 1)?
                                 .ok_or_else(|| ProviderError::HeaderNotFound(task.start.into()))?;
 
-                            // 使用共享的 blockchain_db（如 v1.8.4 的方式）
-                            // 预先创建的 evm_config 避免重复创建
                             let db = StateProviderDatabase::new(blockchain_db.history_by_block_number(task.start - 1)?);
+                            let evm_config = EthEvmConfig::ethereum(provider_factory.chain_spec());
                             let executor = evm_config.batch_executor(db);
                             let blocks = blockchain_db.block_with_senders_range(task.start..=task.end).unwrap();
-
-                            let execute_result = executor.execute_batch(blocks.iter())?;
 
                             let start = Instant::now();
                             let mut step_cumulative_gas: u64 = 0;
                             let mut step_txs_counter: usize = 0;
 
+                            let execute_result = executor.execute_batch(blocks.iter())?;
                             trace!(target: "exex::evm", ?execute_result);
                             blocks.iter().for_each(|block| {
                                     td += block.sealed_block().header().difficulty;
@@ -320,7 +309,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             }));
         }
 
-        // 等待所有线程完成，或检查停止标志
+        // 绛夊緟鎵€鏈夌嚎绋嬪畬鎴愶紝鎴栨鏌ュ仠姝㈡爣蹇?
         for thread in threads {
             match thread.join() {
                 Ok(res) => {
@@ -342,7 +331,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         Ok(())
     }
 
-    // 获取系统 CPU 核心数
+    // 鑾峰彇绯荤粺 CPU 鏍稿績鏁?
     fn get_cpu_count(&self) -> usize {
         num_cpus::get()
     }

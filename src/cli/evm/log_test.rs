@@ -26,7 +26,7 @@ mod tests {
         
         // 写入日志（新格式）
         let block_number = 99999; // 使用一个不太可能冲突的块号
-        write_read_logs_binary(block_number, &test_entries).unwrap();
+        write_read_logs_binary(block_number, &test_entries, "auto").unwrap();
         
         // 读取日志
         let log_file_path = format!("block_{}_reads.bin", block_number);

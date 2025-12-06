@@ -159,7 +159,7 @@ opt-level = 3
 
 [profile.release]
 codegen-units = 16
-debug = "line-tables-only"
+debug = false
 lto = "thin"
 opt-level = 3
 panic = "unwind"
@@ -356,6 +356,8 @@ humantime-serde = "1.1"
 itertools = { version = "0.14", default-features = false }
 linked_hash_set = "0.1"
 lz4 = "1.28.1"
+brotli = "3.4"
+xz2 = "0.1"
 modular-bitfield = "0.11.2"
 notify = { version = "8.2", default-features = false, features = ["macos_fsevent"] }
 nybbles = { version = "0.3.0", default-features = false }

@@ -23,10 +23,38 @@ $env:PEVM_LOG_DIR = ".\bench_logs"
 3. 分别测试不使用日志和使用日志 bin 的执行性能
 4. 输出详细的性能对比报告
 
-### 2. 使用火焰图进行性能分析
+### 2. 使用性能分析工具
 
-火焰图可以帮助识别性能瓶颈：
+#### 选项 A: Windows Performance Toolkit (WPT) - Windows 推荐
 
+Windows 上推荐使用 WPT 进行性能分析：
+
+```powershell
+# 分析不使用日志的执行
+.\scripts\profile_with_wpt.ps1 -BeginBlock 1000 -EndBlock 2000 -UseLog $false -OutputFile "pevm_without_log.etl"
+
+# 分析使用日志 bin 的执行
+.\scripts\profile_with_wpt.ps1 -BeginBlock 1000 -EndBlock 2000 -UseLog $true -OutputFile "pevm_with_log.etl"
+```
+
+然后使用 Windows Performance Analyzer (WPA) 打开 `.etl` 文件进行分析。
+
+#### 选项 B: 火焰图（仅限 Linux/macOS 或 WSL）
+
+**注意**：`cargo flamegraph` 在 Windows 上**无法正常工作**，因为它需要 Linux 的 `perf` 工具或 macOS 的 `dtrace`。
+
+如果需要在 Windows 上使用火焰图，可以：
+
+1. **使用 WSL (Windows Subsystem for Linux)**：
+```bash
+# 在 WSL 中安装
+cargo install flamegraph
+
+# 在 WSL 中运行（注意路径转换）
+cargo flamegraph --bin pevm -- evm -b 1000 -e 2000 --datadir /mnt/d/reth2k
+```
+
+2. **在 Linux 或 macOS 上运行**：
 ```powershell
 # 分析不使用日志的执行
 .\scripts\profile_with_flamegraph.ps1 -BeginBlock 1000 -EndBlock 2000 -UseLog $false -OutputFile "flamegraph_without_log.svg"
@@ -35,7 +63,7 @@ $env:PEVM_LOG_DIR = ".\bench_logs"
 .\scripts\profile_with_flamegraph.ps1 -BeginBlock 1000 -EndBlock 2000 -UseLog $true -OutputFile "flamegraph_with_log.svg"
 ```
 
-**注意**：在 Windows 上安装火焰图工具：
+**在 Windows 上安装火焰图工具（不推荐，会失败）**：
 
 ```bash
 # 方法 1: 安装 flamegraph（推荐，但 Windows 上可能有限制）

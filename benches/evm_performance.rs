@@ -1,6 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
 use std::process::Command;
-use std::time::Instant;
 use std::path::PathBuf;
 
 /// 性能基准测试：对比使用日志 bin 和不使用日志的执行性能
@@ -20,7 +19,7 @@ use std::path::PathBuf;
 /// 
 /// 或者使用火焰图分析：
 /// ```bash
-/// cargo install cargo-flamegraph
+/// cargo install flamegraph
 /// cargo flamegraph --bench evm_performance -- --bench
 /// ```
 
@@ -42,12 +41,22 @@ fn bench_evm_execution(c: &mut Criterion) {
         .unwrap_or_else(|_| "./target/release/pevm.exe".to_string());
     
     // 检查可执行文件是否存在
-    if !PathBuf::from(&pevm_exe).exists() {
+    let pevm_path = PathBuf::from(&pevm_exe);
+    if !pevm_path.exists() {
         eprintln!("警告: PEVM 可执行文件不存在: {}", pevm_exe);
         eprintln!("请先构建: cargo build --release");
         eprintln!("或设置 PEVM_EXE 环境变量指向正确的路径");
+        eprintln!("");
+        eprintln!("跳过基准测试（因为可执行文件不存在）");
         return;
     }
+    
+    // 输出配置信息（用于调试）
+    eprintln!("基准测试配置:");
+    eprintln!("  可执行文件: {} (存在: {})", pevm_exe, pevm_path.exists());
+    eprintln!("  数据目录: {}", datadir);
+    eprintln!("  日志目录: {}", log_dir);
+    eprintln!("");
     
     for (begin, end) in test_blocks {
         let block_count = end - begin + 1;
@@ -86,6 +95,7 @@ fn bench_evm_execution(c: &mut Criterion) {
 }
 
 /// 通过命令行工具执行块
+#[allow(missing_docs)]
 fn execute_blocks_via_cli(
     begin: u64,
     end: u64,
@@ -119,6 +129,7 @@ fn execute_blocks_via_cli(
 }
 
 /// 确保日志文件存在（如果不存在则生成）
+#[allow(missing_docs)]
 fn ensure_logs_exist(begin: u64, end: u64, datadir: &str, log_dir: &str, pevm_exe: &str) {
     let log_path = PathBuf::from(log_dir).join("blocks_log.idx");
     if !log_path.exists() {

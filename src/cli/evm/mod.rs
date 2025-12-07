@@ -1,5 +1,8 @@
 //! `reth evm` command.
 
+#[cfg(any(unix, windows))]
+mod profiling;
+
 use clap::Parser;
 use reth_chainspec::ChainSpec;
 use reth_cli::chainspec::ChainSpecParser;
@@ -72,6 +75,9 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// Use single thread for execution (useful for log generation to avoid file locking)
     #[arg(long, alias = "single-thread")]
     single_thread: bool,
+    /// Enable CPU profiling and generate flamegraph (output: flamegraph.svg)
+    #[arg(long, alias = "profile")]
+    enable_profiling: bool,
 }
 
 struct Task {
@@ -1204,6 +1210,36 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
     ) -> eyre::Result<()> {
         info!("Executing EVM command...");
 
+        // 如果启用了性能分析，启动 CPU profiling（跨平台支持）
+        #[cfg(any(unix, windows))]
+        let mut _profiler_guard = if self.enable_profiling {
+            info!("CPU profiling enabled, will generate flamegraph.svg after execution");
+            // 采样频率 100Hz（每秒采样 100 次）
+            match profiling::ProfilerGuardWrapper::new(100) {
+                Ok(guard) => {
+                    #[cfg(unix)]
+                    info!("CPU profiler started (100Hz sampling rate, using pprof-rs)");
+                    #[cfg(windows)]
+                    info!("CPU profiler started (100Hz sampling rate, using thread-based sampling)");
+                    Some(guard)
+                }
+                Err(e) => {
+                    warn!("Failed to start CPU profiler: {}. Continuing without profiling.", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        
+        #[cfg(not(any(unix, windows)))]
+        let _profiler_guard: Option<()> = if self.enable_profiling {
+            warn!("CPU profiling is not supported on this platform.");
+            None
+        } else {
+            None
+        };
+
         // 步骤1: 获取日志目录（如果指定了 log_dir，使用累加文件系统；否则使用单个文件）
         let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RO)?;
         let log_dir = self.log_dir.as_deref();
@@ -1943,6 +1979,23 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         } else {
             thread::sleep(Duration::from_secs(1));
             info!("EVM command completed successfully");
+        }
+
+        // 如果启用了性能分析，生成火焰图（跨平台支持）
+        #[cfg(any(unix, windows))]
+        if let Some(ref mut guard) = _profiler_guard {
+            info!("Generating flamegraph...");
+            let output_file = "flamegraph.svg";
+            match guard.generate_flamegraph(output_file) {
+                Ok(()) => {
+                    info!("🔥 火焰图已生成: {}", output_file);
+                    #[cfg(windows)]
+                    info!("注意: Windows 版本使用简化的线程采样，可能不如 Unix 版本精确。建议使用 WSL 或 Windows Performance Toolkit 进行更详细的分析。");
+                }
+                Err(e) => {
+                    warn!("Failed to generate flamegraph: {}", e);
+                }
+            }
         }
 
         Ok(())

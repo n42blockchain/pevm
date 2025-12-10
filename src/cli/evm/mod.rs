@@ -2557,6 +2557,19 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                             break;
                                         }
                                     }
+                                    // 文件系统模式：统计更新
+                                    // 更新 block_counter 和 txs_counter
+                                    {
+                                        let mut step_gas: u64 = 0;
+                                        let mut step_txs: u64 = 0;
+                                        for block in blocks.iter() {
+                                            step_gas += block.sealed_block().header().gas_used;
+                                            step_txs += block.sealed_block().body().transaction_count() as u64;
+                                        }
+                                        *cumulative_gas.lock().unwrap() += step_gas;
+                                        *txs_counter.lock().unwrap() += step_txs;
+                                        *block_counter.lock().unwrap() += blocks.len() as u64;
+                                    }
                                 } else {
                                     error!("--use-log on requires --log-dir to be specified");
                                     return Err(eyre::eyre!("--use-log on requires --log-dir"));
@@ -2568,52 +2581,51 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                 let _execute_result = executor.execute_batch(blocks.iter())?;
                             }
 
-                            let _start = Instant::now(); // 保留用于将来的性能统计
-                            let mut step_cumulative_gas: u64 = 0;
-                            let mut step_txs_counter: usize = 0;
+                            // 通用统计代码（仅用于非 use_log 模式）
+                            // use_log 模式的统计已在各自分支中完成
+                            if !use_log_enabled {
+                                let _start = Instant::now(); // 保留用于将来的性能统计
+                                let mut step_cumulative_gas: u64 = 0;
+                                let mut step_txs_counter: usize = 0;
 
-                            // 只统计实际处理的块（不包括已存在的块，用于断点续传）
-                            // 只在 --log-block on 模式下过滤已存在的块
-                            blocks.iter()
-                                .filter(|block| {
-                                    let block_num = block.sealed_block().header().number;
-                                    if let Some(_log_dir) = &log_dir_clone {
-                                        if log_block_enabled {
-                                            !existing_blocks_clone.contains(&block_num)
+                                // 只统计实际处理的块（不包括已存在的块，用于断点续传）
+                                // 只在 --log-block on 模式下过滤已存在的块
+                                blocks.iter()
+                                    .filter(|block| {
+                                        let block_num = block.sealed_block().header().number;
+                                        if let Some(_log_dir) = &log_dir_clone {
+                                            if log_block_enabled {
+                                                !existing_blocks_clone.contains(&block_num)
+                                            } else {
+                                                true // 其他模式，统计所有块
+                                            }
                                         } else {
-                                            true // --use-log on 或其他模式，统计所有块
+                                            true
                                         }
+                                    })
+                                    .for_each(|block| {
+                                        td += block.sealed_block().header().difficulty;
+                                        step_cumulative_gas += block.sealed_block().header().gas_used;
+                                        step_txs_counter += block.sealed_block().body().transaction_count();
+                                    });
+
+                                // Ensure the locks are correctly used without deadlock
+                                {
+                                    *cumulative_gas.lock().unwrap() += step_cumulative_gas;
+                                }
+                                {
+                                    // 只统计实际处理的块数（不包括已存在的块，用于断点续传）
+                                    let processed_count = if let Some(_log_dir) = &log_dir_clone {
+                                        blocks_to_process_numbers.len() as u64
                                     } else {
-                                        true
-                                    }
-                                })
-                                .for_each(|block| {
-                                    td += block.sealed_block().header().difficulty;
-                                    step_cumulative_gas += block.sealed_block().header().gas_used;
-                                    step_txs_counter += block.sealed_block().body().transaction_count();
-                                    // 性能优化：移除热路径中的 debug! 日志
-                                    // 即使日志级别为 INFO，tracing 仍会检查是否需要记录，产生大量开销
-                                });
-
-                            // Ensure the locks are correctly used without deadlock
-                            {
-                                *cumulative_gas.lock().unwrap() += step_cumulative_gas;
+                                        blocks.len() as u64
+                                    };
+                                    *block_counter.lock().unwrap() += processed_count;
+                                }
+                                {
+                                    *txs_counter.lock().unwrap() += step_txs_counter as u64;
+                                }
                             }
-                            {
-                                // 只统计实际处理的块数（不包括已存在的块，用于断点续传）
-                                let processed_count = if let Some(_log_dir) = &log_dir_clone {
-                                    blocks_to_process_numbers.len() as u64
-                                } else {
-                                    blocks.len() as u64
-                                };
-                                *block_counter.lock().unwrap() += processed_count;
-                            }
-                            {
-                                *txs_counter.lock().unwrap() += step_txs_counter as u64;
-                            }
-
-                            // 性能优化：移除热路径上的 debug 日志，避免 tracing 开销
-                            // 即使是 debug 级别，tracing 仍然会检查过滤器并格式化参数
 
                             Ok(())
                         })();

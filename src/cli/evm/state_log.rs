@@ -2,65 +2,79 @@
 //! 
 //! 使用内存映射（mmap）存储状态日志，支持大数据集（400GB+）
 //! 
-//! 文件格式：
+//! 文件格式（v2 - 分离索引）：
 //! ```text
+//! state_logs_data.bin - 数据文件（追加写入）
 //! +----------------+  0
-//! | Header (32B)   |  magic(8) + version(4) + block_count(8) + index_offset(8) + reserved(4)
+//! | Header (32B)   |  magic(8) + version(4) + reserved(20)
 //! +----------------+  32
 //! | Data Section   |  连续存储所有块的日志数据（未压缩）
 //! | ...            |
-//! +----------------+  index_offset
-//! | Index Section  |  每条 20 bytes: block_number(8) + offset(8) + length(4)
+//! +----------------+
+//! 
+//! state_logs_index.bin - 索引文件（追加写入）
+//! +----------------+  0
+//! | Header (32B)   |  magic(8) + version(4) + block_count(8) + reserved(12)
+//! +----------------+  32
+//! | Index Entries  |  每条 20 bytes: block_number(8) + offset(8) + length(4)
 //! | ...            |
 //! +----------------+
 //! ```
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use tracing::{info, error};
+use tracing::{info, warn, error};
 
 use super::ReadLogEntry;
 
-/// 内存映射状态日志数据库
+/// 内存映射状态日志数据库（v2 - 分离索引，Windows 兼容）
 /// 
 /// 特点：
-/// - 只将索引加载到内存（约 480MB for 24M blocks）
-/// - 数据通过 mmap 零拷贝访问
-/// - 操作系统智能缓存热点数据
+/// - 数据文件追加写入，无需重写
+/// - 索引文件独立存储，追加写入
+/// - 只读时使用 mmap，写入时使用普通文件 I/O
+/// - 避免 Windows mmap 扩展文件的问题
 pub struct MmapStateLogDatabase {
-    /// 内存映射（只读）
-    mmap: Option<memmap2::Mmap>,
+    /// 数据文件的内存映射（只读）
+    mmap_data: Option<memmap2::Mmap>,
     /// 索引：block_number -> (offset, length)
     index: HashMap<u64, (u64, u32)>,
     /// 数据文件路径
-    file_path: PathBuf,
+    data_file_path: PathBuf,
+    /// 索引文件路径
+    index_file_path: PathBuf,
     /// 当前数据段末尾位置（用于追加）
     data_end: u64,
     /// 是否有未保存的修改
     dirty: bool,
     /// 待写入的新数据（批量写入优化）
     pending_writes: Vec<(u64, Vec<u8>)>,
+    /// 是否为只读模式
+    read_only: bool,
 }
 
 impl std::fmt::Debug for MmapStateLogDatabase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MmapStateLogDatabase")
-            .field("file_path", &self.file_path)
+            .field("data_file_path", &self.data_file_path)
             .field("index_count", &self.index.len())
             .field("data_end", &self.data_end)
             .field("dirty", &self.dirty)
             .field("pending_writes", &self.pending_writes.len())
+            .field("read_only", &self.read_only)
             .finish_non_exhaustive()
     }
 }
 
 impl MmapStateLogDatabase {
-    /// 文件魔数
-    const MAGIC: &'static [u8; 8] = b"STLOGMM1";
+    /// 文件魔数（数据文件）
+    const MAGIC_DATA: &'static [u8; 8] = b"STLOGDT2";
+    /// 文件魔数（索引文件）
+    const MAGIC_INDEX: &'static [u8; 8] = b"STLOGIX2";
     /// 版本号
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
     /// 头部大小
     const HEADER_SIZE: u64 = 32;
     /// 索引条目大小
@@ -68,91 +82,196 @@ impl MmapStateLogDatabase {
     
     /// 打开或创建内存映射状态日志数据库
     pub fn open(log_dir: &Path) -> eyre::Result<Self> {
-        let file_path = log_dir.join("state_logs_mmap.bin");
+        let data_file_path = log_dir.join("state_logs_data.bin");
+        let index_file_path = log_dir.join("state_logs_index.bin");
         std::fs::create_dir_all(log_dir)?;
         
-        if file_path.exists() {
-            Self::open_existing(&file_path)
+        // 检查是否存在 v1 格式的文件
+        let old_file_path = log_dir.join("state_logs_mmap.bin");
+        if old_file_path.exists() && !data_file_path.exists() {
+            info!("Found v1 format file, migrating to v2...");
+            Self::migrate_v1_to_v2(&old_file_path, &data_file_path, &index_file_path)?;
+        }
+        
+        if data_file_path.exists() && index_file_path.exists() {
+            Self::open_existing(&data_file_path, &index_file_path)
         } else {
-            Self::create_new(&file_path)
+            Self::create_new(&data_file_path, &index_file_path)
         }
     }
     
+    /// 迁移 v1 格式到 v2 格式
+    fn migrate_v1_to_v2(old_path: &Path, data_path: &Path, index_path: &Path) -> eyre::Result<()> {
+        info!("Migrating state_logs_mmap.bin to v2 format...");
+        
+        let old_file = File::open(old_path)?;
+        let old_mmap = unsafe { memmap2::Mmap::map(&old_file)? };
+        
+        if old_mmap.len() < 32 {
+            return Err(eyre::eyre!("Old file too small"));
+        }
+        
+        // 读取旧格式头部
+        let magic = &old_mmap[0..8];
+        if magic != b"STLOGMM1" {
+            return Err(eyre::eyre!("Invalid old file format"));
+        }
+        
+        let block_count = u64::from_le_bytes(old_mmap[12..20].try_into().unwrap());
+        let index_offset = u64::from_le_bytes(old_mmap[20..28].try_into().unwrap());
+        
+        info!("Old file: {} blocks, index_offset={}", block_count, index_offset);
+        
+        // 创建新的数据文件
+        let mut data_file = BufWriter::new(File::create(data_path)?);
+        
+        // 写入数据文件头部
+        let mut header = [0u8; 32];
+        header[0..8].copy_from_slice(Self::MAGIC_DATA);
+        header[8..12].copy_from_slice(&Self::VERSION.to_le_bytes());
+        data_file.write_all(&header)?;
+        
+        // 复制数据部分（从旧文件的第 32 字节到 index_offset）
+        let data_section = &old_mmap[32..index_offset as usize];
+        data_file.write_all(data_section)?;
+        data_file.flush()?;
+        drop(data_file);
+        
+        // 创建新的索引文件
+        let mut index_file = BufWriter::new(File::create(index_path)?);
+        
+        // 写入索引文件头部
+        let mut index_header = [0u8; 32];
+        index_header[0..8].copy_from_slice(Self::MAGIC_INDEX);
+        index_header[8..12].copy_from_slice(&Self::VERSION.to_le_bytes());
+        index_header[12..20].copy_from_slice(&block_count.to_le_bytes());
+        index_file.write_all(&index_header)?;
+        
+        // 复制索引部分
+        let index_section = &old_mmap[index_offset as usize..];
+        index_file.write_all(index_section)?;
+        index_file.flush()?;
+        drop(index_file);
+        
+        info!("Migration complete: {} bytes data, {} bytes index", 
+            data_section.len(), index_section.len());
+        
+        // 重命名旧文件
+        let backup_path = old_path.with_extension("bin.v1.bak");
+        std::fs::rename(old_path, &backup_path)?;
+        info!("Old file renamed to {:?}", backup_path);
+        
+        Ok(())
+    }
+    
     /// 打开已存在的文件
-    fn open_existing(file_path: &Path) -> eyre::Result<Self> {
-        let file = File::open(file_path)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    fn open_existing(data_path: &Path, index_path: &Path) -> eyre::Result<Self> {
+        // 打开数据文件
+        let data_file = File::open(data_path)?;
+        let data_mmap = unsafe { memmap2::Mmap::map(&data_file)? };
         
-        // 验证头部
-        if mmap.len() < Self::HEADER_SIZE as usize {
-            return Err(eyre::eyre!("File too small"));
+        // 验证数据文件头部
+        if data_mmap.len() < Self::HEADER_SIZE as usize {
+            return Err(eyre::eyre!("Data file too small"));
         }
         
-        let magic = &mmap[0..8];
-        if magic != Self::MAGIC {
-            return Err(eyre::eyre!("Invalid file format (magic mismatch)"));
+        let magic = &data_mmap[0..8];
+        if magic != Self::MAGIC_DATA {
+            return Err(eyre::eyre!("Invalid data file format (magic mismatch)"));
         }
         
-        let version = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
+        let version = u32::from_le_bytes(data_mmap[8..12].try_into().unwrap());
         if version != Self::VERSION {
             return Err(eyre::eyre!("Unsupported version: {}", version));
         }
         
-        let block_count = u64::from_le_bytes(mmap[12..20].try_into().unwrap());
-        let index_offset = u64::from_le_bytes(mmap[20..28].try_into().unwrap());
+        let data_end = data_mmap.len() as u64;
         
-        // 加载索引
+        // 读取索引文件
+        let mut index_file = File::open(index_path)?;
+        let mut index_header = [0u8; 32];
+        index_file.read_exact(&mut index_header)?;
+        
+        let index_magic = &index_header[0..8];
+        if index_magic != Self::MAGIC_INDEX {
+            return Err(eyre::eyre!("Invalid index file format (magic mismatch)"));
+        }
+        
+        let index_version = u32::from_le_bytes(index_header[8..12].try_into().unwrap());
+        if index_version != Self::VERSION {
+            return Err(eyre::eyre!("Unsupported index version: {}", index_version));
+        }
+        
+        let block_count = u64::from_le_bytes(index_header[12..20].try_into().unwrap());
+        
+        // 读取所有索引条目
         let mut index = HashMap::with_capacity(block_count as usize);
-        let index_start = index_offset as usize;
+        let mut entry_buf = [0u8; Self::INDEX_ENTRY_SIZE as usize];
         
-        for i in 0..block_count {
-            let entry_start = index_start + (i as usize * Self::INDEX_ENTRY_SIZE as usize);
-            let entry_end = entry_start + Self::INDEX_ENTRY_SIZE as usize;
-            
-            if entry_end > mmap.len() {
-                return Err(eyre::eyre!("Index entry out of bounds"));
+        for _ in 0..block_count {
+            if index_file.read_exact(&mut entry_buf).is_err() {
+                break;
             }
-            
-            let block_number = u64::from_le_bytes(mmap[entry_start..entry_start+8].try_into().unwrap());
-            let offset = u64::from_le_bytes(mmap[entry_start+8..entry_start+16].try_into().unwrap());
-            let length = u32::from_le_bytes(mmap[entry_start+16..entry_start+20].try_into().unwrap());
-            
+            let block_number = u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
+            let offset = u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
+            let length = u32::from_le_bytes(entry_buf[16..20].try_into().unwrap());
             index.insert(block_number, (offset, length));
         }
         
-        info!("MmapStateLogDatabase opened: {} blocks from {:?}", index.len(), file_path);
+        info!("MmapStateLogDatabase opened (v2): {} blocks, data_end={}", index.len(), data_end);
         
         Ok(Self {
-            mmap: Some(mmap),
+            mmap_data: Some(data_mmap),
             index,
-            file_path: file_path.to_path_buf(),
-            data_end: index_offset,
+            data_file_path: data_path.to_path_buf(),
+            index_file_path: index_path.to_path_buf(),
+            data_end,
             dirty: false,
             pending_writes: Vec::new(),
+            read_only: false,
         })
     }
     
     /// 创建新文件
-    fn create_new(file_path: &Path) -> eyre::Result<Self> {
-        let mut file = File::create(file_path)?;
+    fn create_new(data_path: &Path, index_path: &Path) -> eyre::Result<Self> {
+        // 创建数据文件
+        let mut data_file = File::create(data_path)?;
         
-        // 写入头部
-        file.write_all(Self::MAGIC)?;
-        file.write_all(&Self::VERSION.to_le_bytes())?;
-        file.write_all(&0u64.to_le_bytes())?; // block_count = 0
-        file.write_all(&Self::HEADER_SIZE.to_le_bytes())?; // index_offset
-        file.write_all(&[0u8; 4])?; // reserved
-        file.flush()?;
+        // 写入数据文件头部
+        let mut header = [0u8; 32];
+        header[0..8].copy_from_slice(Self::MAGIC_DATA);
+        header[8..12].copy_from_slice(&Self::VERSION.to_le_bytes());
+        data_file.write_all(&header)?;
+        data_file.flush()?;
+        drop(data_file);
         
-        info!("MmapStateLogDatabase created: {:?}", file_path);
+        // 创建索引文件
+        let mut index_file = File::create(index_path)?;
+        
+        // 写入索引文件头部
+        let mut index_header = [0u8; 32];
+        index_header[0..8].copy_from_slice(Self::MAGIC_INDEX);
+        index_header[8..12].copy_from_slice(&Self::VERSION.to_le_bytes());
+        // block_count 初始为 0
+        index_file.write_all(&index_header)?;
+        index_file.flush()?;
+        drop(index_file);
+        
+        // 打开数据文件用于 mmap
+        let data_file = File::open(data_path)?;
+        let mmap_data = unsafe { memmap2::Mmap::map(&data_file)? };
+        
+        info!("MmapStateLogDatabase created (v2)");
         
         Ok(Self {
-            mmap: None,
+            mmap_data: Some(mmap_data),
             index: HashMap::new(),
-            file_path: file_path.to_path_buf(),
+            data_file_path: data_path.to_path_buf(),
+            index_file_path: index_path.to_path_buf(),
             data_end: Self::HEADER_SIZE,
             dirty: false,
             pending_writes: Vec::new(),
+            read_only: false,
         })
     }
     
@@ -160,7 +279,7 @@ impl MmapStateLogDatabase {
     pub fn read_block_log(&self, block_number: u64) -> Option<&[u8]> {
         let (offset, length) = self.index.get(&block_number)?;
         
-        if let Some(ref mmap) = self.mmap {
+        if let Some(ref mmap) = self.mmap_data {
             let start = *offset as usize;
             let end = start + *length as usize;
             if end <= mmap.len() {
@@ -212,83 +331,97 @@ impl MmapStateLogDatabase {
         Ok(())
     }
     
-    /// 刷新待写入的数据到文件
+    /// 刷新待写入的数据到文件（追加写入，不重映射）
     pub fn flush(&mut self) -> eyre::Result<()> {
         if self.pending_writes.is_empty() {
             return Ok(());
         }
+        
+        if self.read_only {
+            return Err(eyre::eyre!("Database is in read-only mode"));
+        }
+        
+        let pending_count = self.pending_writes.len();
         
         // 计算新数据大小
         let new_data_size: u64 = self.pending_writes.iter()
             .map(|(_, data)| data.len() as u64)
             .sum();
         
-        // 计算新索引大小
-        let new_index_entries = self.pending_writes.len();
-        let total_index_entries = self.index.len() + new_index_entries;
-        let index_size = total_index_entries as u64 * Self::INDEX_ENTRY_SIZE;
-        
-        // 计算新文件大小
-        let new_data_end = self.data_end + new_data_size;
-        let new_file_size = new_data_end + index_size;
-        
-        // 打开文件进行写入
-        let file = OpenOptions::new()
-            .read(true)
+        // 打开数据文件进行追加写入（使用 BufWriter 提高性能）
+        let data_file = OpenOptions::new()
             .write(true)
-            .open(&self.file_path)?;
+            .append(true)
+            .open(&self.data_file_path)?;
+        let mut data_writer = BufWriter::with_capacity(1024 * 1024, data_file); // 1MB buffer
         
-        // 扩展文件
-        file.set_len(new_file_size)?;
-        
-        // 创建可写的 mmap
-        let mut mmap_mut = unsafe { memmap2::MmapMut::map_mut(&file)? };
-        
-        // 写入新数据
+        // 准备索引条目
+        let mut new_index_entries: Vec<(u64, u64, u32)> = Vec::with_capacity(pending_count);
         let mut current_offset = self.data_end;
         
+        // 写入新数据
         for (block_number, data) in self.pending_writes.drain(..) {
             let data_len = data.len() as u32;
             
             // 写入数据
-            let start = current_offset as usize;
-            let end = start + data.len();
-            mmap_mut[start..end].copy_from_slice(&data);
+            data_writer.write_all(&data)?;
             
             // 记录索引
+            new_index_entries.push((block_number, current_offset, data_len));
             self.index.insert(block_number, (current_offset, data_len));
             
             current_offset += data.len() as u64;
         }
         
-        // 写入所有索引
-        let index_start = new_data_end as usize;
-        let mut index_offset = index_start;
+        data_writer.flush()?;
+        drop(data_writer);
         
-        for (&block_number, &(offset, length)) in self.index.iter() {
-            mmap_mut[index_offset..index_offset+8].copy_from_slice(&block_number.to_le_bytes());
-            mmap_mut[index_offset+8..index_offset+16].copy_from_slice(&offset.to_le_bytes());
-            mmap_mut[index_offset+16..index_offset+20].copy_from_slice(&length.to_le_bytes());
-            index_offset += Self::INDEX_ENTRY_SIZE as usize;
+        // 打开索引文件进行追加写入
+        let mut index_file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&self.index_file_path)?;
+        
+        // 追加新索引条目
+        let mut index_buf = Vec::with_capacity(pending_count * Self::INDEX_ENTRY_SIZE as usize);
+        for (block_number, offset, length) in new_index_entries {
+            index_buf.extend_from_slice(&block_number.to_le_bytes());
+            index_buf.extend_from_slice(&offset.to_le_bytes());
+            index_buf.extend_from_slice(&length.to_le_bytes());
         }
+        index_file.write_all(&index_buf)?;
         
-        // 更新头部
-        mmap_mut[12..20].copy_from_slice(&(self.index.len() as u64).to_le_bytes());
-        mmap_mut[20..28].copy_from_slice(&new_data_end.to_le_bytes());
-        
-        // 刷新到磁盘
-        mmap_mut.flush()?;
-        drop(mmap_mut);
+        // 更新索引文件头部的 block_count
+        index_file.seek(SeekFrom::Start(12))?;
+        index_file.write_all(&(self.index.len() as u64).to_le_bytes())?;
+        index_file.flush()?;
+        drop(index_file);
         
         // 更新状态
-        self.data_end = new_data_end;
+        self.data_end = current_offset;
         self.dirty = false;
         
-        // 重新打开只读 mmap
-        let file = File::open(&self.file_path)?;
-        self.mmap = Some(unsafe { memmap2::Mmap::map(&file)? });
+        // 重新打开 mmap（只读）
+        // 注意：这里我们先 drop 旧的 mmap，再创建新的，避免文件锁冲突
+        self.mmap_data = None;
+        let data_file = File::open(&self.data_file_path)?;
+        self.mmap_data = Some(unsafe { memmap2::Mmap::map(&data_file)? });
         
-        info!("MmapStateLogDatabase flushed: {} total blocks, data_end={}", self.index.len(), self.data_end);
+        info!("MmapStateLogDatabase flushed (v2): {} new blocks, {} total blocks, data_end={}", 
+            pending_count, self.index.len(), self.data_end);
+        
+        Ok(())
+    }
+    
+    /// 刷新并重新映射（用于读取时确保最新数据可见）
+    pub fn refresh_mmap(&mut self) -> eyre::Result<()> {
+        // 先 drop 旧的 mmap
+        self.mmap_data = None;
+        
+        // 重新打开文件并映射
+        let data_file = File::open(&self.data_file_path)?;
+        self.mmap_data = Some(unsafe { memmap2::Mmap::map(&data_file)? });
+        self.data_end = self.mmap_data.as_ref().map(|m| m.len() as u64).unwrap_or(Self::HEADER_SIZE);
         
         Ok(())
     }
@@ -344,11 +477,10 @@ impl MmapStateLogDatabase {
 
 impl Drop for MmapStateLogDatabase {
     fn drop(&mut self) {
-        if self.dirty {
+        if self.dirty && !self.pending_writes.is_empty() {
             if let Err(e) = self.flush() {
                 error!("Failed to flush MmapStateLogDatabase on drop: {}", e);
             }
         }
     }
 }
-

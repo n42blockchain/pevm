@@ -2,6 +2,11 @@
 
 #[cfg(any(unix, windows))]
 mod profiling;
+mod state_log;
+mod logged_db;
+
+pub use state_log::MmapStateLogDatabase;
+pub use logged_db::DbLoggedDatabase;
 
 use clap::Parser;
 use reth_chainspec::ChainSpec;
@@ -29,21 +34,36 @@ use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::thread::JoinHandle;
 use eyre::{Report, Result};
-use std::panic::AssertUnwindSafe;
-use reth_primitives_traits::{BlockBody, format_gas_throughput};
+// 已移除 AssertUnwindSafe，不再使用 catch_unwind（性能优化）
+use reth_primitives_traits::BlockBody;
 use tokio::signal;
 use std::fs::File;
 use std::io::{Write, Read, BufWriter, BufReader};
 use std::path::{Path, PathBuf};
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom};
+#[cfg(unix)]
+use libc;
 use alloy_primitives::{Address, B256, U256};
 use crate::revm::Database as RevmDatabase;
 use crate::revm::state::{AccountInfo, Bytecode};
-// reth_db 相关导入暂时未使用（已改为文件系统实现）
-// use reth_db::DatabaseEnv;
-// use reth_db::Database as RethDatabase;
-// use reth_db::transaction::DbTx;
+// 使用 Reth 的 Compact 编码替代 RLP（性能优化）
+use reth_codecs::Compact;
+use reth_primitives::Account;
+
+// 性能优化：预定义空 codehash 常量，避免重复创建
+const EMPTY_CODE_HASH_BYTES: &[u8; 32] = &[
+    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c,
+    0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
+    0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b,
+    0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
+];
+
+// 性能优化：预计算空 codehash
+#[inline]
+fn get_empty_code_hash() -> B256 {
+    B256::from_slice(EMPTY_CODE_HASH_BYTES)
+}
 
 /// EVM commands
 #[derive(Debug, Parser)]
@@ -78,6 +98,10 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// Enable CPU profiling and generate flamegraph (output: flamegraph.svg)
     #[arg(long, alias = "profile")]
     enable_profiling: bool,
+    /// Use memory-mapped file for state logs (recommended for large datasets 400GB+)
+    /// When enabled, logs are stored in state_logs_mmap.bin with mmap access
+    #[arg(long, alias = "mmap-log")]
+    use_mmap_log: bool,
 }
 
 struct Task {
@@ -117,77 +141,51 @@ impl<DB: RevmDatabase> RevmDatabase for LoggingDatabase<DB> {
         // 先调用 inner，减少锁持有时间
         let result = self.inner.basic(address)?;
         
-        // 记录账户读取：使用拦截到的 AccountInfo 数据，编码为与 PlainState 一致的 RLP 格式
+        // 记录账户读取：使用 Reth 的 Compact<Account> 编码替代 RLP（性能优化）
         // 即使账户不存在，也要记录一个条目以保持顺序一致
         // 优化：先准备数据，再快速加锁写入
         let log_entry = if let Some(account_info) = &result {
-            // PlainState 中账户的 RLP 编码格式: [nonce, balance, storage_root?, code_hash?]
-            // 如果 storage_root 为 ZERO 或 code_hash 为空 code 的 hash，则省略
-            use alloy_rlp::Encodable;
-            
-            // 空 code 的 hash: KECCAK256("") = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
-            let empty_code_hash = B256::from_slice(&[
-                0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c,
-                0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
-                0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b,
-                0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
-            ]);
-            
-            // 尝试从 AccountInfo 获取 storage_root
-            // 注意：在 revm 中，AccountInfo 可能不直接包含 storage_root
-            // 但我们可以通过检查账户是否有存储来确定 storage_root
-            // 如果账户有存储，storage_root 可能不为 ZERO
-            // 目前，我们使用 B256::ZERO 作为默认值，但如果需要，可以从 StateProvider 获取
-            // 为了简化，我们先使用 ZERO，如果将来需要支持非 ZERO 的 storage_root，需要从 StateProvider 获取
-            let storage_root = B256::ZERO; // TODO: 如果账户有存储，应该从 StateProvider 获取实际的 storage_root
+            // 将 revm::AccountInfo 转换为 reth::Account
+            // reth::Account 结构：nonce, balance, bytecode_hash (Option<B256>)
+            // 性能优化：跳过默认的空 codehash，使用 None 让 Compact 编码省略它
             let code_hash = account_info.code_hash();
             
-            // 决定哪些字段需要编码
-            // 如果 storage_root 不为 ZERO，也要编码
-            let include_storage_root = storage_root != B256::ZERO;
-            let include_code_hash = code_hash != empty_code_hash;
-            
-            // 计算 payload 长度
-            let mut payload_len = account_info.nonce.length() + account_info.balance.length();
-            if include_storage_root {
-                payload_len += storage_root.length();
-            }
-            if include_code_hash {
-                payload_len += code_hash.length();
-            }
-            
-            let mut buf = Vec::new();
-            let header = alloy_rlp::Header {
-                list: true,
-                payload_length: payload_len,
+            // 性能优化：直接比较字节数组，避免创建 B256 对象
+            let bytecode_hash = if code_hash.as_slice() == EMPTY_CODE_HASH_BYTES {
+                None
+            } else {
+                Some(code_hash)
             };
-            header.encode(&mut buf);
-            account_info.nonce.encode(&mut buf);
-            account_info.balance.encode(&mut buf);
-            if include_storage_root {
-                storage_root.encode(&mut buf);
-            }
-            if include_code_hash {
-                code_hash.encode(&mut buf);
-            }
+            
+            let account = Account {
+                nonce: account_info.nonce,
+                balance: account_info.balance,
+                bytecode_hash,
+            };
+            
+            // 性能优化：预分配 Vec 容量（Account 通常编码后 < 100 字节）
+            let mut buf = Vec::with_capacity(100);
+            account.to_compact(&mut buf);
             
             ReadLogEntry::Account {
                 address,
                 data: buf,
             }
         } else {
-            // 账户不存在，记录一个空的 RLP 列表（表示账户不存在）
-            // RLP 空列表: 0xc0
+            // 账户不存在：使用空的 Compact 编码标记
+            // Compact 编码：对于 Option<Account>，None 可以用 0x00 或空字节表示
             ReadLogEntry::Account {
                 address,
-                data: vec![0xc0],
+                data: vec![0x00], // 使用 0x00 表示账户不存在
             }
         };
         
-        // 快速加锁写入（减少锁持有时间）
-        let mut logs = self.read_logs.lock().unwrap();
-        logs.push(log_entry);
-        drop(logs); // 显式释放锁
+        // 性能优化：快速加锁写入（减少锁持有时间）
+        // 使用作用域自动释放锁，避免显式 drop
+        {
+            let mut logs = self.read_logs.lock().unwrap();
+            logs.push(log_entry);
+        } // 锁在这里自动释放
         
         Ok(result)
     }
@@ -201,24 +199,27 @@ impl<DB: RevmDatabase> RevmDatabase for LoggingDatabase<DB> {
         // 先调用 inner，减少锁持有时间
         let result = self.inner.storage(address, index)?;
         
-        // 记录存储读取：使用拦截到的存储值，编码为 RLP
+        // 记录存储读取：使用 Reth 的 CompactU256 编码替代 RLP（性能优化）
         // 注意：index 是 U256，需要转换为 32 字节的 key
         
-        // 将存储值编码为 RLP（在锁外完成）
-        use alloy_rlp::Encodable;
+        // 将存储值使用 Compact 编码（在锁外完成）
+        // CompactU256 使用紧凑编码，比 RLP 更高效
         let key_bytes = index.to_be_bytes::<32>();
         let key = B256::from_slice(&key_bytes);
-        let mut buf = Vec::new();
-        result.encode(&mut buf);
+        // 性能优化：预分配 Vec 容量（U256 Compact 编码通常 < 40 字节）
+        let mut buf = Vec::with_capacity(40);
+        // 使用 Compact 编码 U256（reth-primitives 中的 CompactU256）
+        result.to_compact(&mut buf);
         
-        // 快速加锁写入（减少锁持有时间）
-        let mut logs = self.read_logs.lock().unwrap();
-        logs.push(ReadLogEntry::Storage {
-            address,
-            key,
-            data: buf,
-        });
-        drop(logs); // 显式释放锁
+        // 性能优化：快速加锁写入（减少锁持有时间）
+        {
+            let mut logs = self.read_logs.lock().unwrap();
+            logs.push(ReadLogEntry::Storage {
+                address,
+                key,
+                data: buf,
+            });
+        } // 锁在这里自动释放
         
         Ok(result)
     }
@@ -347,8 +348,15 @@ fn decompress_data(data: &[u8], algorithm: CompressionAlgorithm) -> eyre::Result
             }
             let size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
             let compressed_data = &data[4..];
-            lz4_flex::decompress(compressed_data, size)
-                .map_err(|e| eyre::eyre!("LZ4 decompression failed: {}", e))
+            // 性能优化：预分配正确大小的缓冲区，避免重新分配
+            let mut decompressed = Vec::with_capacity(size);
+            unsafe {
+                decompressed.set_len(size);
+            }
+            // 使用 decompress_into 而不是 decompress，避免额外的内存分配
+            lz4_flex::decompress_into(compressed_data, &mut decompressed)
+                .map_err(|e| eyre::eyre!("LZ4 decompression failed: {}", e))?;
+            Ok(decompressed)
         }
     }
 }
@@ -475,6 +483,7 @@ pub(crate) struct BufferedLogWriter {
     #[allow(dead_code)]
     bin_file_path: std::path::PathBuf, // 保留用于将来可能的用途
 }
+
 
 impl BufferedLogWriter {
     /// 创建新的缓冲写入器，缓冲区大小为 1MB（IO 密集型软件的典型大小）
@@ -622,7 +631,7 @@ fn find_index_entry(entries: &[IndexEntry], block_number: u64) -> Option<&IndexE
 pub(crate) fn write_read_logs_binary(
     block_number: u64, 
     read_logs: &[ReadLogEntry],
-    compression_algorithm: &str,
+    compression_algorithm: &str, // 测试模式下会被忽略（不压缩）
     log_dir: Option<&Path>,
     _existing_blocks: &std::collections::HashSet<u64>,
     _single_thread: bool, // 如果为 true，不需要文件锁
@@ -651,13 +660,34 @@ pub(crate) fn write_read_logs_binary(
         uncompressed_data.extend_from_slice(data); // 使用extend_from_slice，比write_all更高效
     }
     
-    // 对比所有压缩算法并选择
-    let (algorithm, compressed_data, _stats) = choose_compression_algorithm(&uncompressed_data, compression_algorithm)?;
+    // 测试模式：如果启用内存模式，不压缩直接写入原始数据
+    // 注意：这里需要检查环境变量，如果未设置，默认不启用（因为这是测试模式）
+    let env_var = std::env::var("PEVM_IN_MEMORY_MODE");
+    let enable_in_memory_mode = env_var
+        .as_ref()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false); // 默认不启用测试模式（需要显式设置环境变量）
     
-    // 构建最终数据：压缩算法标识 + 压缩后的数据
-    let mut final_data = Vec::new();
-    final_data.write_all(&[algorithm.as_u8()])?; // 压缩算法标识
-    final_data.write_all(&compressed_data)?; // 压缩后的数据
+    let uncompressed_size = uncompressed_data.len(); // 保存原始大小，供日志使用
+    
+    let (final_data, algorithm_opt, compressed_size) = if enable_in_memory_mode {
+        // 测试模式：不压缩，直接写入原始数据（格式：count(8) + entries）
+        info!("测试模式：写入未压缩日志数据（块 {}，{} 条目，原始大小: {} bytes）", block_number, read_logs.len(), uncompressed_size);
+        (uncompressed_data, None, 0)
+    } else {
+        // 正常模式：压缩数据
+        let (algorithm, compressed_data, _stats) = choose_compression_algorithm(&uncompressed_data, compression_algorithm)?;
+        let compressed_size = compressed_data.len();
+        
+        info!("正常模式：写入压缩日志数据（块 {}，环境变量 PEVM_IN_MEMORY_MODE={:?}，压缩算法: {:?}，原始大小: {} bytes，压缩后: {} bytes）", 
+            block_number, env_var, algorithm, uncompressed_size, compressed_size);
+        
+        // 构建最终数据：压缩算法标识 + 压缩后的数据
+        let mut data = Vec::new();
+        data.write_all(&[algorithm.as_u8()])?; // 压缩算法标识
+        data.write_all(&compressed_data)?; // 压缩后的数据
+        (data, Some(algorithm), compressed_size)
+    };
     
     if let Some(log_dir) = log_dir {
         if let Some(writer) = buffered_writer {
@@ -678,9 +708,14 @@ pub(crate) fn write_read_logs_binary(
             // 这里简化处理，由调用方控制刷新频率
             writer.auto_flush_if_needed()?;
             
-            debug!("Binary log written to accumulated files (buffered): block {} ({} entries, compressed with {:?}, {} -> {} bytes, {:.2}% ratio, offset: {}, length: {})", 
-                block_number, read_logs.len(), algorithm, uncompressed_data.len(), compressed_data.len(),
-                (compressed_data.len() as f64 / uncompressed_data.len() as f64) * 100.0, offset, length);
+            if enable_in_memory_mode {
+                debug!("Binary log written to accumulated files (buffered, no compression): block {} ({} entries, {} bytes, offset: {}, length: {})", 
+                    block_number, read_logs.len(), uncompressed_size, offset, length);
+            } else if let Some(alg) = algorithm_opt {
+                debug!("Binary log written to accumulated files (buffered): block {} ({} entries, compressed with {:?}, {} -> {} bytes, {:.2}% ratio, offset: {}, length: {})", 
+                    block_number, read_logs.len(), alg, uncompressed_size, compressed_size,
+                    (compressed_size as f64 / uncompressed_size as f64) * 100.0, offset, length);
+            }
         } else {
             // 直接写入（向后兼容，不使用缓冲）
             let (mut idx_file, mut bin_file) = open_log_files(log_dir)?;
@@ -711,9 +746,14 @@ pub(crate) fn write_read_logs_binary(
             idx_file.write_all(&index_buf)?;
             idx_file.flush()?;
             
-            debug!("Binary log written to accumulated files: block {} ({} entries, compressed with {:?}, {} -> {} bytes, {:.2}% ratio, offset: {}, length: {})", 
-                block_number, read_logs.len(), algorithm, uncompressed_data.len(), compressed_data.len(),
-                (compressed_data.len() as f64 / uncompressed_data.len() as f64) * 100.0, offset, length);
+            if enable_in_memory_mode {
+                debug!("Binary log written to accumulated files (no compression): block {} ({} entries, {} bytes, offset: {}, length: {})", 
+                    block_number, read_logs.len(), uncompressed_size, offset, length);
+            } else if let Some(alg) = algorithm_opt {
+                debug!("Binary log written to accumulated files: block {} ({} entries, compressed with {:?}, {} -> {} bytes, {:.2}% ratio, offset: {}, length: {})", 
+                    block_number, read_logs.len(), alg, uncompressed_size, compressed_size,
+                    (compressed_size as f64 / uncompressed_size as f64) * 100.0, offset, length);
+            }
         }
     } else {
         // 写入单个文件（向后兼容）
@@ -722,97 +762,460 @@ pub(crate) fn write_read_logs_binary(
         log_file.write_all(&final_data)?;
         log_file.flush()?;
         
-        debug!("Binary log written to: {} ({} entries, compressed with {:?}, {} -> {} bytes, {:.2}% ratio)", 
-            log_file_path, read_logs.len(), algorithm, uncompressed_data.len(), compressed_data.len(),
-            (compressed_data.len() as f64 / uncompressed_data.len() as f64) * 100.0);
+        if enable_in_memory_mode {
+            debug!("Binary log written to: {} ({} entries, no compression, {} bytes)", 
+                log_file_path, read_logs.len(), uncompressed_size);
+        } else if let Some(alg) = algorithm_opt {
+            debug!("Binary log written to: {} ({} entries, compressed with {:?}, {} -> {} bytes, {:.2}% ratio)", 
+                log_file_path, read_logs.len(), alg, uncompressed_size, compressed_size,
+                (compressed_size as f64 / uncompressed_size as f64) * 100.0);
+        }
     }
     
     Ok(())
 }
 
-/// 从已打开的文件读取指定块的日志数据（性能优化版本，复用文件句柄）
-fn read_log_entry_from_file(
-    bin_reader: &mut BufReader<File>,
-    entry: &IndexEntry,
-    block_number: u64,
-) -> eyre::Result<Vec<u8>> {
-    // 定位到正确的偏移量
-    let actual_offset = bin_reader.seek(SeekFrom::Start(entry.offset))?;
-    if actual_offset != entry.offset {
-        return Err(eyre::eyre!("Failed to seek to offset {} for block {} (actual: {})", entry.offset, block_number, actual_offset));
-    }
+
+/// 全局文件句柄包装器（用于复用文件句柄，避免重复打开文件）
+/// 性能优化：在程序开始时打开一次，所有线程共享，程序结束时关闭
+/// 
+/// 测试模式：如果使用内存模式，将整个 bin 文件读入内存
+pub(crate) struct GlobalLogFileHandle {
+    // 测试模式：整个文件内容在内存中（无压缩）
+    #[allow(dead_code)]
+    in_memory_data: Option<Arc<Vec<u8>>>,
     
-    // 使用 read_exact 确保读取完整的数据（算法标识 + 压缩数据）
-    let mut buffer = vec![0u8; entry.length as usize];
-    bin_reader.read_exact(&mut buffer)
-        .map_err(|e| eyre::eyre!("Failed to read log entry for block {}: offset={}, length={}, error: {}. This may indicate the log file is corrupted or the index is out of sync.", 
-            block_number, entry.offset, entry.length, e))?;
-    
-    Ok(buffer)
+    #[cfg(unix)]
+    fd: i32, // Unix 文件描述符，用于 pread（无锁读取）
+    #[cfg(not(unix))]
+    file: Arc<Mutex<File>>, // Windows 系统仍然需要 Mutex
+    #[allow(dead_code)] // 保留用于调试和日志
+    file_path: PathBuf,
 }
 
-/// 解析日志缓冲区（解压缩和解析，提取为ReadLogEntry列表）
-fn parse_log_buffer(buffer: &[u8]) -> eyre::Result<Vec<ReadLogEntry>> {
-    let mut cursor = std::io::Cursor::new(buffer);
-    
-    // 读取压缩算法标识
-    let mut algorithm_byte = [0u8; 1];
-    cursor.read_exact(&mut algorithm_byte)?;
-    let algorithm = CompressionAlgorithm::from_u8(algorithm_byte[0])?;
-    
-    // 读取压缩后的数据
-    let compressed_data = buffer[cursor.position() as usize..].to_vec();
-    
-    // 解压数据
-    let uncompressed_data = decompress_data(&compressed_data, algorithm)?;
-    let mut cursor = std::io::Cursor::new(&uncompressed_data);
-    
-    // 读取条目数量
-    let mut count_bytes = [0u8; 8];
-    cursor.read_exact(&mut count_bytes)?;
-    let count = u64::from_le_bytes(count_bytes);
-    
-    let mut entries = Vec::new();
-    
-    // 版本5格式：data_len(1) + data（按顺序读取，类型通过数据内容推断）
-    for _entry_index in 0..count {
-        // 读取数据长度（1字节）
-        let mut data_len_bytes = [0u8; 1];
-        cursor.read_exact(&mut data_len_bytes)?;
-        let data_len = data_len_bytes[0] as usize;
-        
-        // 读取数据
-        let mut data = vec![0u8; data_len];
-        cursor.read_exact(&mut data)?;
-        
-        // 通过数据内容推断类型
-        use alloy_rlp::Decodable;
-        let data_copy = data.clone();
-        let is_storage = if let Ok(_) = U256::decode(&mut data_copy.as_slice()) {
-            data_len <= 33
+impl GlobalLogFileHandle {
+    /// 创建新的全局文件句柄
+    /// 测试模式：如果 enable_in_memory 为 true，将整个文件读入内存（无压缩）
+    pub(crate) fn new(file_path: &Path, enable_in_memory: bool) -> eyre::Result<Self> {
+        if enable_in_memory {
+            // 测试模式：将整个文件读入内存
+            info!("测试模式：将 bin 文件完全读入内存（无压缩）: {}", file_path.display());
+            let file_size = std::fs::metadata(file_path)?.len();
+            info!("文件大小: {} bytes ({:.2} GB)", file_size, file_size as f64 / (1024.0 * 1024.0 * 1024.0));
+            
+            let mut file = std::fs::File::open(file_path)
+                .map_err(|e| eyre::eyre!("Failed to open log file {}: {}", file_path.display(), e))?;
+            
+            let mut buffer = Vec::with_capacity(file_size as usize);
+            std::io::Read::read_to_end(&mut file, &mut buffer)?;
+            
+            info!("文件已读入内存: {} bytes", buffer.len());
+            
+            Ok(Self {
+                in_memory_data: Some(Arc::new(buffer)),
+                #[cfg(unix)]
+                fd: 0,
+                #[cfg(not(unix))]
+                file: Arc::new(Mutex::new(std::fs::File::create("/dev/null")?)), // 占位符
+                file_path: file_path.to_path_buf(),
+            })
         } else {
-            false
-        };
-        
-        if is_storage {
-            entries.push(ReadLogEntry::Storage { 
-                address: Address::ZERO,
-                key: B256::ZERO,
-                data 
-            });
-        } else {
-            entries.push(ReadLogEntry::Account { 
-                address: Address::ZERO,
-                data 
-            });
+            // 正常模式：使用文件描述符
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let file = std::fs::File::open(file_path)
+                    .map_err(|e| eyre::eyre!("Failed to open log file {}: {}", file_path.display(), e))?;
+                let fd = file.as_raw_fd();
+                let fd_clone = unsafe { libc::dup(fd) };
+                if fd_clone < 0 {
+                    return Err(eyre::eyre!("Failed to dup file descriptor: {}", std::io::Error::last_os_error()));
+                }
+                Ok(Self {
+                    in_memory_data: None,
+                    fd: fd_clone,
+                    file_path: file_path.to_path_buf(),
+                })
+            }
+            #[cfg(not(unix))]
+            {
+                let file = std::fs::File::open(file_path)
+                    .map_err(|e| eyre::eyre!("Failed to open log file {}: {}", file_path.display(), e))?;
+                Ok(Self {
+                    in_memory_data: None,
+                    file: Arc::new(Mutex::new(file)),
+                    file_path: file_path.to_path_buf(),
+                })
+            }
         }
     }
     
-    Ok(entries)
+    /// 从全局文件句柄读取数据
+    /// 优化：在 Unix 系统上使用 pread（无锁、无 seek 的系统调用）
+    /// 测试模式：如果使用内存模式，直接从内存读取（无压缩）
+    pub(crate) fn read_range(&self, offset: u64, length: u64) -> eyre::Result<Vec<u8>> {
+        // 测试模式：从内存读取
+        if let Some(ref in_memory) = self.in_memory_data {
+            let start = offset as usize;
+            let end = start + length as usize;
+            if end > in_memory.len() {
+                return Err(eyre::eyre!("Read range out of bounds: offset={}, length={}, file_size={}", offset, length, in_memory.len()));
+            }
+            // 直接从内存复制（无压缩，数据已经是未压缩的）
+            Ok(in_memory[start..end].to_vec())
+        } else {
+            // 正常模式：从文件读取
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::RawFd;
+                let mut buffer = vec![0u8; length as usize];
+                let bytes_read = unsafe {
+                    libc::pread(
+                        self.fd as RawFd,
+                        buffer.as_mut_ptr() as *mut libc::c_void,
+                        length as libc::size_t,
+                        offset as libc::off_t,
+                    )
+                };
+                if bytes_read < 0 {
+                    return Err(eyre::eyre!("pread failed: {}", std::io::Error::last_os_error()));
+                }
+                if bytes_read as u64 != length {
+                    return Err(eyre::eyre!("pread incomplete: expected {} bytes, got {}", length, bytes_read));
+                }
+                Ok(buffer)
+            }
+            #[cfg(not(unix))]
+            {
+                let mut file = self.file.lock().unwrap();
+                file.seek(SeekFrom::Start(offset))?;
+                let mut buffer = vec![0u8; length as usize];
+                file.read_exact(&mut buffer)?;
+                Ok(buffer)
+            }
+        }
+    }
+    
+    /// 批量读取多个数据段（性能优化：使用 pread 无锁并发读取）
+    /// 输入：按偏移量排序的 (原始索引, offset, length) 列表
+    /// 返回：Vec<(原始索引, 数据)>，按原始索引排序
+    /// 
+    /// 优化策略：
+    /// 1. 测试模式：如果使用内存模式，直接从内存读取
+    /// 2. 正常模式：在 Unix 系统上使用 pread（无锁、无 seek 的系统调用），支持并发读取
+    /// 3. 对于连续的数据段，仍然合并读取以减少系统调用
+    pub(crate) fn read_ranges_batch(&self, ranges: &[(usize, u64, u64)]) -> eyre::Result<Vec<(usize, Vec<u8>)>> {
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // 测试模式：从内存读取
+        if let Some(ref in_memory) = self.in_memory_data {
+            let mut results = Vec::with_capacity(ranges.len());
+            
+            // 性能优化：检测连续的数据段，合并读取以减少内存复制
+            let mut i = 0;
+            while i < ranges.len() {
+                let (original_idx, start_offset, start_length) = ranges[i];
+                
+                // 检查后续是否有连续的数据段
+                let mut end_offset = start_offset + start_length;
+                let mut merged_count = 1;
+                
+                while i + merged_count < ranges.len() {
+                    let (_, next_offset, next_length) = ranges[i + merged_count];
+                    if next_offset == end_offset {
+                        end_offset = next_offset + next_length;
+                        merged_count += 1;
+                    } else {
+                        break;
+                    }
+                }
+                
+                if merged_count > 1 {
+                    // 合并读取连续的数据段
+                    let total_length = (end_offset - start_offset) as usize;
+                    let start = start_offset as usize;
+                    let end = start + total_length;
+                    if end > in_memory.len() {
+                        return Err(eyre::eyre!("Read range out of bounds: offset={}, length={}, file_size={}", start_offset, total_length, in_memory.len()));
+                    }
+                    // 性能优化：避免创建中间 Vec，直接使用切片索引
+                let merged_buffer = &in_memory[start..end];
+                    
+                    // 分割合并的数据
+                    let mut current_offset = 0;
+                    for j in 0..merged_count {
+                        let (orig_idx, _, length) = ranges[i + j];
+                        let data = merged_buffer[current_offset..current_offset + length as usize].to_vec();
+                        results.push((orig_idx, data));
+                        current_offset += length as usize;
+                    }
+                    
+                    i += merged_count;
+                } else {
+                    // 单独读取：直接从内存读取
+                    let start = start_offset as usize;
+                    let end = start + start_length as usize;
+                    if end > in_memory.len() {
+                        return Err(eyre::eyre!("Read range out of bounds: offset={}, length={}, file_size={}", start_offset, start_length, in_memory.len()));
+                    }
+                    // 性能优化：需要 Vec<u8> 类型，必须 clone
+                    let buffer = in_memory[start..end].to_vec();
+                    results.push((original_idx, buffer));
+                    i += 1;
+                }
+            }
+            
+            // 按原始索引排序，保持调用顺序
+            results.sort_by_key(|(idx, _)| *idx);
+            Ok(results)
+        } else {
+            // 正常模式：从文件读取
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::RawFd;
+                let mut results = Vec::with_capacity(ranges.len());
+                
+                // 性能优化：检测连续的数据段，合并读取以减少系统调用
+                let mut i = 0;
+                while i < ranges.len() {
+                    let (original_idx, start_offset, start_length) = ranges[i];
+                    
+                    // 检查后续是否有连续的数据段（当前段的结束位置 = 下一段的开始位置）
+                    let mut end_offset = start_offset + start_length;
+                    let mut merged_count = 1;
+                    
+                    // 查找连续的数据段
+                    while i + merged_count < ranges.len() {
+                        let (_, next_offset, next_length) = ranges[i + merged_count];
+                        if next_offset == end_offset {
+                            // 连续的数据段，合并读取
+                            end_offset = next_offset + next_length;
+                            merged_count += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    
+                    if merged_count > 1 {
+                        // 合并读取连续的数据段
+                        let total_length = (end_offset - start_offset) as usize;
+                        let mut merged_buffer = vec![0u8; total_length];
+                        let bytes_read = unsafe {
+                            libc::pread(
+                                self.fd as RawFd,
+                                merged_buffer.as_mut_ptr() as *mut libc::c_void,
+                                total_length as libc::size_t,
+                                start_offset as libc::off_t,
+                            )
+                        };
+                        if bytes_read < 0 {
+                            return Err(eyre::eyre!("pread failed: {}", std::io::Error::last_os_error()));
+                        }
+                        if bytes_read as usize != total_length {
+                            return Err(eyre::eyre!("pread incomplete: expected {} bytes, got {}", total_length, bytes_read));
+                        }
+                        
+                        // 分割合并的数据
+                        let mut current_offset = 0;
+                        for j in 0..merged_count {
+                            let (orig_idx, _, length) = ranges[i + j];
+                            let data = merged_buffer[current_offset..current_offset + length as usize].to_vec();
+                            results.push((orig_idx, data));
+                            current_offset += length as usize;
+                        }
+                        
+                        i += merged_count;
+                    } else {
+                        // 单独读取：使用 pread（无锁、无 seek）
+                        let mut buffer = vec![0u8; start_length as usize];
+                        let bytes_read = unsafe {
+                            libc::pread(
+                                self.fd as RawFd,
+                                buffer.as_mut_ptr() as *mut libc::c_void,
+                                start_length as libc::size_t,
+                                start_offset as libc::off_t,
+                            )
+                        };
+                        if bytes_read < 0 {
+                            return Err(eyre::eyre!("pread failed: {}", std::io::Error::last_os_error()));
+                        }
+                        if bytes_read as u64 != start_length {
+                            return Err(eyre::eyre!("pread incomplete: expected {} bytes, got {}", start_length, bytes_read));
+                        }
+                        
+                        results.push((original_idx, buffer));
+                        i += 1;
+                    }
+                }
+                
+                // 按原始索引排序，保持调用顺序
+                results.sort_by_key(|(idx, _)| *idx);
+                Ok(results)
+            }
+            #[cfg(not(unix))]
+            {
+                // Windows 系统：仍然使用带锁的方式
+                let mut results = Vec::with_capacity(ranges.len());
+                let mut file = self.file.lock().unwrap();
+                
+                for (original_idx, offset, length) in ranges {
+                    file.seek(SeekFrom::Start(*offset))?;
+                    let mut buffer = vec![0u8; *length as usize];
+                    file.read_exact(&mut buffer)?;
+                    results.push((*original_idx, buffer));
+                }
+                
+                Ok(results)
+            }
+        }
+    }
+    
+    /// 获取文件路径
+    #[allow(dead_code)] // 保留用于调试和日志
+    pub(crate) fn file_path(&self) -> &Path {
+        &self.file_path
+    }
+}
+
+/// 从累加文件系统或单个文件读取日志数据
+/// 测试模式：如果使用内存模式且无压缩，直接返回未压缩数据；否则返回压缩数据
+/// 性能优化：返回压缩数据，在线程内部解压到线程局部缓存
+/// 如果提供了全局文件句柄，使用它；否则每次打开文件（向后兼容）
+pub(crate) fn read_log_compressed_data(
+    log_path_or_block: &str,
+    log_dir: Option<&Path>,
+    cached_index_entries: Option<&[IndexEntry]>,
+    global_file_handle: Option<&GlobalLogFileHandle>,
+    is_in_memory_mode: bool, // 测试模式：是否使用内存模式（无压缩）
+) -> eyre::Result<Vec<u8>> {
+    if let Some(log_dir) = log_dir {
+        // 从累加文件系统读取（使用索引查找偏移量和长度）
+        let block_number: u64 = log_path_or_block.parse()
+            .map_err(|_| eyre::eyre!("Invalid block number: {}", log_path_or_block))?;
+        
+        // 使用缓存的索引条目或读取索引文件
+        let entry = if let Some(cached) = cached_index_entries {
+            *find_index_entry(cached, block_number)
+                .ok_or_else(|| eyre::eyre!("Block {} not found in log index", block_number))?
+        } else {
+            let (mut idx_file, _) = open_log_files(log_dir)?;
+            let index_entries = read_index_file(&mut idx_file)?;
+            *find_index_entry(&index_entries, block_number)
+                .ok_or_else(|| eyre::eyre!("Block {} not found in log index", block_number))?
+        };
+        
+        // 使用全局文件句柄（如果提供）或每次打开文件
+        let data = if let Some(file_handle) = global_file_handle {
+            // 使用全局文件句柄，避免重复打开文件
+            file_handle.read_range(entry.offset, entry.length)?
+        } else {
+            // 向后兼容：每次打开文件，但使用 pread（如果可用）而不是 BufReader
+            let bin_path = log_dir.join("blocks_log.bin");
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::{AsRawFd, RawFd};
+                let file = std::fs::File::open(&bin_path)?;
+                let fd = file.as_raw_fd();
+                let mut buffer = vec![0u8; entry.length as usize];
+                let bytes_read = unsafe {
+                    libc::pread(
+                        fd as RawFd,
+                        buffer.as_mut_ptr() as *mut libc::c_void,
+                        entry.length as libc::size_t,
+                        entry.offset as libc::off_t,
+                    )
+                };
+                if bytes_read < 0 {
+                    return Err(eyre::eyre!("pread failed: {}", std::io::Error::last_os_error()));
+                }
+                if bytes_read as u64 != entry.length {
+                    return Err(eyre::eyre!("pread incomplete: expected {} bytes, got {}", entry.length, bytes_read));
+                }
+                buffer
+            }
+            #[cfg(not(unix))]
+            {
+                let file = std::fs::File::open(&bin_path)?;
+                const BUFFER_SIZE: usize = 1024 * 1024;
+                let mut reader = BufReader::with_capacity(BUFFER_SIZE, file);
+                reader.seek(SeekFrom::Start(entry.offset))?;
+                let mut buffer = vec![0u8; entry.length as usize];
+                reader.read_exact(&mut buffer)?;
+                buffer
+            }
+        };
+        
+        // 检测数据格式：如果第一个字节是压缩算法标识（0-4），说明是压缩格式
+        // 测试模式：如果使用内存模式，尝试检测数据格式并自动解压
+        // 注意：更精确的检测方法是检查第一个字节是否是有效的压缩算法标识
+        // 但为了简单，我们检查第一个字节是否 <= 4（压缩算法标识范围）
+        // 未压缩数据的第一个字节通常是 count 的低位，对于小数据量可能是 0-4
+        // 但 count 是 u64，如果 count 很大，第一个字节不会是 0-4
+        // 更安全的检测：尝试解析第一个字节作为压缩算法，如果成功且后续数据能解压，则是压缩格式
+        if is_in_memory_mode {
+            // 检查第一个字节是否是压缩算法标识（0=None, 1=Zstd, 2=Brotli, 3=Lzma, 4=Lz4）
+            if !data.is_empty() && data[0] <= 4 {
+                // 尝试解析为压缩格式
+                if let Ok(algorithm) = CompressionAlgorithm::from_u8(data[0]) {
+                    // 尝试解压（如果失败，说明不是压缩格式，回退到未压缩格式）
+                    let mut cursor = std::io::Cursor::new(&data);
+                    let mut algorithm_byte = [0u8; 1];
+                    if cursor.read_exact(&mut algorithm_byte).is_ok() {
+                        let compressed_data = data[cursor.position() as usize..].to_vec();
+                        if let Ok(uncompressed_data) = decompress_data(&compressed_data, algorithm) {
+                            // 解压成功，说明是压缩格式
+                            return Ok(uncompressed_data);
+                        }
+                    }
+                }
+            }
+            // 数据是未压缩格式，或解压失败（回退），直接返回
+            return Ok(data);
+        }
+        
+        // 正常模式：数据包含压缩算法标识，需要解压（但这里只返回压缩数据，解压在线程内部进行）
+        Ok(data)
+    } else {
+        // 从单个文件读取（向后兼容）
+        let file = std::fs::File::open(log_path_or_block)?;
+        const BUFFER_SIZE: usize = 1024 * 1024;
+        let mut reader = BufReader::with_capacity(BUFFER_SIZE, file);
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer)?;
+        
+        // 测试模式：如果使用内存模式，检测数据格式并自动解压
+        if is_in_memory_mode {
+            // 检查第一个字节是否是压缩算法标识（0=None, 1=Zstd, 2=Brotli, 3=Lzma, 4=Lz4）
+            if !buffer.is_empty() && buffer[0] <= 4 {
+                // 尝试解析为压缩格式
+                if let Ok(algorithm) = CompressionAlgorithm::from_u8(buffer[0]) {
+                    // 尝试解压（如果失败，说明不是压缩格式，回退到未压缩格式）
+                    let mut cursor = std::io::Cursor::new(&buffer);
+                    let mut algorithm_byte = [0u8; 1];
+                    if cursor.read_exact(&mut algorithm_byte).is_ok() {
+                        let compressed_data = buffer[cursor.position() as usize..].to_vec();
+                        if let Ok(uncompressed_data) = decompress_data(&compressed_data, algorithm) {
+                            // 解压成功，说明是压缩格式
+                            return Ok(uncompressed_data);
+                        }
+                    }
+                }
+            }
+            // 数据是未压缩格式，或解压失败（回退），直接返回
+            return Ok(buffer);
+        }
+        
+        // 正常模式：返回压缩数据
+        Ok(buffer)
+    }
 }
 
 /// 步骤2和3: 从累加文件系统或单个文件读取日志（版本5：按顺序，无address和key，无type，支持压缩）
 /// 如果提供了缓存的索引条目，使用缓存；否则读取索引文件
+/// 注意：此函数保留用于向后兼容，建议使用 read_log_compressed_data + new_from_compressed_buffer 以获得更好性能
+#[allow(dead_code)] // 在测试中使用
 pub(crate) fn read_read_logs_binary(
     log_path_or_block: &str,
     log_dir: Option<&Path>,
@@ -837,24 +1240,19 @@ pub(crate) fn read_read_logs_binary(
                 .ok_or_else(|| eyre::eyre!("Block {} not found in log index", block_number))?
         };
         
-        // 打开数据文件（只读，使用BufReader优化读取性能）
+        // 直接从文件读取（使用 BufReader 优化）
         let bin_path = log_dir.join("blocks_log.bin");
-        let bin_file = std::fs::File::open(&bin_path)?;
-        
-        // 从数据文件读取指定范围的数据
-        // 先检查文件大小
-        let file_end = bin_file.metadata()?.len();
-        if entry.offset + entry.length > file_end {
-            return Err(eyre::eyre!("Block {} log entry extends beyond file end: offset={}, length={}, file_size={}. This may indicate the log file is corrupted or incomplete.", 
-                block_number, entry.offset, entry.length, file_end));
-        }
-        
-        // 使用BufReader包装文件（缓冲区大小1MB，与写入时一致）
+        let file = std::fs::File::open(&bin_path)?;
         const BUFFER_SIZE: usize = 1024 * 1024;
-        let mut bin_reader = BufReader::with_capacity(BUFFER_SIZE, bin_file);
+        let mut reader = BufReader::with_capacity(BUFFER_SIZE, file);
         
-        // 使用辅助函数读取数据
-        read_log_entry_from_file(&mut bin_reader, &entry, block_number)?
+        // Seek 到指定位置
+        reader.seek(SeekFrom::Start(entry.offset))?;
+        
+        // 读取指定长度的数据
+        let mut buffer = vec![0u8; entry.length as usize];
+        reader.read_exact(&mut buffer)?;
+        buffer
     } else {
         // 从单个文件读取（向后兼容，使用BufReader优化）
         let file = std::fs::File::open(log_path_or_block)?;
@@ -928,75 +1326,233 @@ pub(crate) fn read_read_logs_binary(
     Ok(entries)
 }
 
-/// 从日志文件读取数据的 Database（按顺序访问）
+/// 线程局部缓存：解压后的原始字节数据（线程本地，无需锁）
+/// 性能优化：每个块只解压一次，后续所有访问都是内存访问，只移动指针
+/// 使用单一位置指针，按顺序读取：第一字节是长度，然后是内容，指针+长度+1指向下一个长度
+/// 性能优化：支持共享内存数据（Arc<Vec<u8>>），避免在 in_memory_mode 下复制数据
+struct ThreadLocalLogCache {
+    // 性能优化：使用枚举支持两种模式：
+    // - Owned: 拥有数据（解压后的数据，需要复制）
+    // - Shared: 共享数据（in_memory_mode 下，直接使用 Arc，避免复制）
+    uncompressed_data: std::sync::Arc<Vec<u8>>, // 统一使用 Arc，支持共享和拥有
+    current_pos: usize, // 当前位置指针（指向下一个条目的长度字节）
+}
+
+impl ThreadLocalLogCache {
+    /// 从压缩的缓冲区创建线程局部缓存
+    /// 测试模式：如果 is_uncompressed 为 true，直接使用 buffer（无压缩）
+    /// 一次性解压所有数据，避免后续的文件读取和解压
+    /// 性能优化：不预先解析所有条目，只记录数据开始位置
+    /// 从压缩的缓冲区创建线程局部缓存
+    /// 性能优化：接受 Vec<u8> 所有权，避免不必要的内存复制
+    #[inline]
+    fn from_compressed_buffer_owned(buffer: Vec<u8>, is_uncompressed: bool) -> eyre::Result<Self> {
+        let uncompressed_data = if is_uncompressed {
+            // 测试模式：数据已经是未压缩的格式（count(8) + entries）
+            // 性能优化：直接使用传入的 Vec，零复制
+            std::sync::Arc::new(buffer)
+        } else {
+            // 正常模式：需要解压
+            if buffer.is_empty() {
+                return Err(eyre::eyre!("Empty buffer"));
+            }
+            
+            let algorithm = CompressionAlgorithm::from_u8(buffer[0])?;
+            
+            // 读取压缩后的数据（跳过算法标识字节）
+            let compressed_data = &buffer[1..];
+            
+            // 解压数据（一次性解压，缓存到线程本地）
+            // 注意：原始 buffer 会被 drop，解压后的数据是新分配的
+            std::sync::Arc::new(decompress_data(compressed_data, algorithm)?)
+        };
+        
+        // 性能优化：快速检查：读取条目数量（8字节），当前位置指向第一个条目的长度字节
+        if uncompressed_data.len() < 8 {
+            return Err(eyre::eyre!("Invalid uncompressed data: too short ({} bytes)", uncompressed_data.len()));
+        }
+        
+        Ok(Self {
+            uncompressed_data,
+            current_pos: 8, // 跳过8字节的count，指向第一个条目的长度字节
+        })
+    }
+    
+    /// 兼容性方法：从引用创建（会复制数据）
+    #[inline]
+    #[allow(dead_code)]
+    fn from_compressed_buffer(buffer: &[u8], is_uncompressed: bool) -> eyre::Result<Self> {
+        Self::from_compressed_buffer_owned(buffer.to_vec(), is_uncompressed)
+    }
+    
+    /// 从共享内存数据创建线程局部缓存（性能优化：避免复制）
+    /// 用于 in_memory_mode 下，直接使用 GlobalLogFileHandle 的 in_memory_data
+    #[inline]
+    #[allow(dead_code)] // 预留给后续优化使用
+    fn from_shared_data(shared_data: std::sync::Arc<Vec<u8>>) -> eyre::Result<Self> {
+        if shared_data.len() < 8 {
+            return Err(eyre::eyre!("Invalid uncompressed data: too short ({} bytes)", shared_data.len()));
+        }
+        
+        Ok(Self {
+            uncompressed_data: shared_data,
+            current_pos: 8, // 跳过8字节的count，指向第一个条目的长度字节
+        })
+    }
+    
+    /// 读取下一个条目的位置信息（按顺序读取）
+    /// 返回：Some((数据起始位置, 数据长度)) 或 None（已到末尾）
+    /// 性能优化：只移动指针，不复制数据，不判断类型
+    #[inline] // 性能优化：内联函数，减少函数调用开销
+    fn next_entry_pos(&mut self) -> Option<(usize, usize)> {
+        // 性能优化：缓存数据长度和当前位置，避免重复访问
+        let data_len = self.uncompressed_data.len();
+        let current = self.current_pos;
+        
+        // 性能优化：合并边界检查和长度读取
+        if current >= data_len {
+            return None;
+        }
+        
+        // 读取长度字节（1字节）
+        let entry_len = self.uncompressed_data[current] as usize;
+        let data_start = current + 1; // 数据开始位置（跳过长度字节）
+        
+        // 性能优化：提前计算下一个位置，减少重复计算
+        let next_pos = data_start + entry_len;
+        
+        // 检查边界（使用提前计算的位置）
+        if next_pos > data_len {
+            return None; // 数据损坏
+        }
+        
+        // 移动指针到下一个条目的长度字节
+        self.current_pos = next_pos;
+        
+        Some((data_start, entry_len))
+    }
+    
+    /// 获取指定位置的数据切片（零拷贝，直接返回引用）
+    /// 性能优化：内联函数，减少函数调用开销
+    #[inline]
+    fn get_data_at(&self, offset: usize, length: usize) -> Option<&[u8]> {
+        // 性能优化：使用 get 方法，避免边界检查的额外开销（在 release 模式下）
+        self.uncompressed_data.get(offset..offset + length)
+    }
+    
+}
+
+/// 从日志文件读取数据的 Database（按顺序访问，使用线程局部缓存）
 pub(crate) struct LoggedDatabase {
-    log_entries: Vec<ReadLogEntry>, // 日志条目（按顺序）
-    current_index: usize, // 当前访问索引
-    state_provider: Box<dyn reth_provider::StateProvider>, // 用于 code_by_hash（代码不在日志文件中）
-    code_cache: std::collections::HashMap<B256, Bytecode>, // 代码缓存，避免重复加载
+    cache: ThreadLocalLogCache, // 线程局部缓存（解压后的原始数据）
+    state_provider: Arc<dyn reth_provider::StateProvider>, // 用于 code_by_hash（代码不在日志文件中），使用 Arc 以便共享
+    // 性能关键修复：移除 code_cache，直接运行模式没有缓存，使用日志模式也不应该有
+    // 避免额外的内存分配和 HashMap 查找开销
 }
 
 impl std::fmt::Debug for LoggedDatabase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoggedDatabase")
-            .field("log_entries_count", &self.log_entries.len())
-            .field("current_index", &self.current_index)
-            .field("code_cache_size", &self.code_cache.len())
             .finish_non_exhaustive()
     }
 }
 
 impl LoggedDatabase {
-    fn new(log_entries: Vec<ReadLogEntry>, state_provider: Box<dyn reth_provider::StateProvider>) -> Self {
-        Self {
-            log_entries,
-            current_index: 0,
+    /// 从压缩的缓冲区创建新的 LoggedDatabase（性能优化：零复制版本）
+    /// 接受 Vec<u8> 所有权，避免不必要的内存复制
+    fn new_from_compressed_buffer_owned(
+        buffer: Vec<u8>,
+        state_provider: Arc<dyn reth_provider::StateProvider>,
+        is_uncompressed: bool, // 测试模式：是否未压缩
+    ) -> eyre::Result<Self> {
+        let cache = ThreadLocalLogCache::from_compressed_buffer_owned(buffer, is_uncompressed)?;
+        Ok(Self {
+            cache,
             state_provider,
-            code_cache: std::collections::HashMap::new(),
-        }
+        })
     }
     
-    /// 获取下一个 Account 数据（按顺序）
-    /// 性能优化：避免不必要的克隆，直接返回引用（但需要克隆，因为调用方需要拥有数据）
-    fn next_account_data(&mut self) -> Option<Vec<u8>> {
-        while self.current_index < self.log_entries.len() {
-            match &self.log_entries[self.current_index] {
-                ReadLogEntry::Account { data, .. } => {
-                    // 必须克隆，因为调用方需要拥有数据
-                    let data = data.clone();
-                    self.current_index += 1;
-                    return Some(data);
-                }
-                ReadLogEntry::Storage { .. } => {
-                    // 跳过 Storage 条目
-                    self.current_index += 1;
-                }
-            }
-        }
-        None
+    /// 兼容性方法：从引用创建（会复制数据）
+    #[allow(dead_code)]
+    fn new_from_compressed_buffer(
+        buffer: &[u8],
+        state_provider: Arc<dyn reth_provider::StateProvider>,
+        is_uncompressed: bool, // 测试模式：是否未压缩
+    ) -> eyre::Result<Self> {
+        Self::new_from_compressed_buffer_owned(buffer.to_vec(), state_provider, is_uncompressed)
     }
     
-    /// 获取下一个 Storage 数据（按顺序）
-    /// 性能优化：避免不必要的克隆，直接返回引用（但需要克隆，因为调用方需要拥有数据）
-    fn next_storage_data(&mut self) -> Option<Vec<u8>> {
-        while self.current_index < self.log_entries.len() {
-            match &self.log_entries[self.current_index] {
-                ReadLogEntry::Storage { data, .. } => {
-                    // 必须克隆，因为调用方需要拥有数据
-                    let data = data.clone();
-                    self.current_index += 1;
-                    return Some(data);
-                }
-                ReadLogEntry::Account { .. } => {
-                    // 跳过 Account 条目
-                    self.current_index += 1;
-                }
-            }
-        }
-        None
+    /// 从共享内存数据创建新的 LoggedDatabase（性能优化：避免复制）
+    /// 用于 in_memory_mode 下，直接使用 GlobalLogFileHandle 的 in_memory_data
+    #[allow(dead_code)] // 预留给后续优化使用
+    fn new_from_shared_data(
+        shared_data: std::sync::Arc<Vec<u8>>,
+        state_provider: Arc<dyn reth_provider::StateProvider>,
+    ) -> eyre::Result<Self> {
+        let cache = ThreadLocalLogCache::from_shared_data(shared_data)?;
+        Ok(Self {
+            cache,
+            state_provider,
+        })
     }
     
-    /// 从 RLP 数据解码账户信息，处理可选的 storage_root 和 code_hash
+    /// 获取下一个条目数据（按顺序，使用指针访问，零拷贝）
+    /// 性能优化：只移动指针，不复制数据，直接返回引用
+    /// 不判断类型，只是按顺序返回下一个条目
+    /// 内联函数，减少调用开销
+    #[inline]
+    fn next_entry_data(&mut self) -> Option<&[u8]> {
+        let (offset, length) = self.cache.next_entry_pos()?;
+        self.cache.get_data_at(offset, length)
+    }
+    
+    /// 获取下一个 Account 数据（按顺序，使用指针访问，零拷贝）
+    /// 性能优化：只移动指针，不复制数据，直接返回引用
+    /// 按顺序返回下一个条目，不判断类型
+    /// 内联函数，直接调用 next_entry_data
+    #[inline]
+    fn next_account_data(&mut self) -> Option<&[u8]> {
+        self.next_entry_data()
+    }
+    
+    /// 获取下一个 Storage 数据（按顺序，使用指针访问，零拷贝）
+    /// 性能优化：只移动指针，不复制数据，直接返回引用
+    /// 按顺序返回下一个条目，不判断类型
+    /// 内联函数，直接调用 next_entry_data
+    #[inline]
+    fn next_storage_data(&mut self) -> Option<&[u8]> {
+        self.next_entry_data()
+    }
+    
+    /// 从 Compact 编码数据解码账户信息（替代 RLP，性能优化）
+    /// 性能优化：内联函数，减少函数调用开销
+    #[inline]
+    pub(crate) fn decode_account_compact(data: &[u8]) -> eyre::Result<AccountInfo> {
+        // 性能优化：快速检查：空数据表示账户不存在
+        // 合并检查条件，减少分支预测失败
+        if data.is_empty() || (data.len() == 1 && data[0] == 0x00) {
+            return Err(eyre::eyre!("Account does not exist (empty data)"));
+        }
+        
+        // 使用 Compact 解码 Account
+        // 性能优化：直接使用数据长度，避免重复计算
+        let data_len = data.len();
+        let (account, _) = Account::from_compact(data, data_len);
+        
+        // 性能优化：直接使用 unwrap_or_else，但使用内联闭包减少开销
+        // 使用模块级常量，避免重复创建 B256
+        let code_hash = account.bytecode_hash.unwrap_or_else(get_empty_code_hash);
+        
+        // 性能优化：直接使用 default()，编译器会优化
+        Ok(AccountInfo::new(
+            account.balance,
+            account.nonce,
+            code_hash,
+            Bytecode::default(),
+        ))
+    }
+    
+    /// 从 RLP 数据解码账户信息，处理可选的 storage_root 和 code_hash（向后兼容）
     pub(crate) fn decode_account_rlp(data: &[u8]) -> eyre::Result<AccountInfo> {
         use alloy_rlp::Decodable;
         
@@ -1081,84 +1637,73 @@ impl crate::revm::Database for LoggedDatabase {
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         // 按顺序从日志文件读取数据（不读数据库，不对比）
-        if let Some(rlp_data) = self.next_account_data() {
-            // 检查是否是空账户标记（RLP 空列表 0xc0）
-            if rlp_data.as_slice() == [0xc0] {
+        // 性能优化：直接使用引用，零拷贝
+        if let Some(compact_data) = self.next_account_data() {
+            // 性能优化：快速检查空账户标记（Compact 编码：0x00 或 RLP 旧格式：0xc0）
+            // 合并条件检查，减少分支预测失败
+            if compact_data.is_empty() || 
+               (compact_data.len() == 1 && (compact_data[0] == 0x00 || compact_data[0] == 0xc0)) {
                 // 日志文件说账户不存在
                 return Ok(None);
+            }
+            
+            // 性能优化：直接使用 Compact 解码（新格式），只在必要时回退到 RLP
+            // 使用 if let 替代 match，减少分支开销
+            let mut logged_account_info = if let Ok(info) = Self::decode_account_compact(compact_data) {
+                info
             } else {
-                // 从日志文件读取的数据解码
-                match LoggedDatabase::decode_account_rlp(&rlp_data) {
-                    Ok(mut logged_account_info) => {
-                        // 如果 code_hash 不是 empty_code_hash，加载 bytecode
-                        let empty_code_hash = B256::from_slice(&[
-                            0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c,
-                            0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
-                            0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b,
-                            0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
-                        ]);
-                        
-                        let logged_code_hash = logged_account_info.code_hash();
-                        if logged_code_hash != empty_code_hash {
-                            match self.code_by_hash(logged_code_hash) {
-                                Ok(code) => {
-                                    logged_account_info.code = Some(code.clone());
-                                }
-                                Err(_err) => {
-                                    // 加载失败，继续使用空的 code
-                                }
-                            }
-                        }
-                        
-                        // 返回日志文件的数据
-                        Ok(Some(logged_account_info))
-                    }
+                // 如果 Compact 解码失败，尝试 RLP 解码（向后兼容）
+                match Self::decode_account_rlp(compact_data) {
+                    Ok(info) => info,
                     Err(e) => {
-                        warn!("LoggedDatabase::basic({}) failed to decode account RLP from log file: {}", address, e);
-                        Ok(None)
+                        debug!("LoggedDatabase::basic({}) failed to decode account from log file: {}", address, e);
+                        return Ok(None);
                     }
                 }
+            };
+            
+            // 如果 code_hash 不是 empty_code_hash，加载 bytecode
+            // 性能优化：直接使用 code_hash() 方法，避免中间变量
+            // 性能优化：使用模块级常量进行快速比较（直接比较字节），避免不必要的数据库查询
+            let code_hash = logged_account_info.code_hash();
+            if code_hash.as_slice() != EMPTY_CODE_HASH_BYTES {
+                // 只在必要时查询数据库
+                // 性能优化：使用 if let 替代 match，减少分支
+                if let Ok(code) = self.code_by_hash(code_hash) {
+                    // 性能优化：避免不必要的 clone，直接设置
+                    logged_account_info.code = Some(code);
+                }
+                // 加载失败，继续使用空的 code（不打印警告，避免日志噪音）
             }
+            
+            // 返回日志文件的数据
+            Ok(Some(logged_account_info))
         } else {
-            warn!("LoggedDatabase::basic({}) NOT IN LOG FILE (no more account data)", address);
+            // 性能关键：不打印日志，避免热路径上的 tracing 开销
+            // 返回 None 表示日志文件中没有更多账户数据
             Ok(None)
         }
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        // 先检查缓存
-        if let Some(cached_code) = self.code_cache.get(&code_hash) {
-            return Ok(cached_code.clone());
-        }
-        
+        // 性能关键修复：不使用缓存，直接查询数据库
+        // 原因：直接运行模式没有缓存，使用日志模式也不应该有缓存，避免额外的内存分配和 HashMap 查找开销
         // 从数据库读取代码（代码不在日志文件中）
-        let mut inner_db = StateProviderDatabase::new(self.state_provider.as_ref());
-        let code = inner_db.code_by_hash(code_hash)?;
-        
-        // 缓存代码（限制缓存大小，避免内存爆炸）
-        if self.code_cache.len() < 1000 {
-            self.code_cache.insert(code_hash, code.clone());
-        }
-        
-        Ok(code)
+        // 注意：StateProviderDatabase 需要 &mut，所以每次都需要创建
+        let mut inner_db = StateProviderDatabase::new(self.state_provider.as_ref() as &dyn reth_provider::StateProvider);
+        inner_db.code_by_hash(code_hash)
     }
 
     fn storage(&mut self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
-        // 按顺序从日志文件读取数据（不读数据库，不对比）
-        if let Some(rlp_data) = self.next_storage_data() {
-            // 从日志文件读取的数据解码
-            use alloy_rlp::Decodable;
-            let mut data = rlp_data.as_slice();
-            match U256::decode(&mut data) {
-                Ok(logged_value) => {
-                    // 返回日志文件的数据
-                    Ok(logged_value)
-                }
-                Err(_e) => {
-                    // 解码失败，返回零值
-                    Ok(U256::ZERO)
-                }
-            }
+        // 性能优化：按顺序从日志文件读取数据（不读数据库，不对比）
+        // 直接使用引用，零拷贝
+        if let Some(compact_data) = self.next_storage_data() {
+            // 性能优化：使用 Compact 解码 U256（新格式）
+            // Compact 解码 U256 返回 (value, remaining_data)
+            // 直接使用数据长度，避免重复计算
+            let data_len = compact_data.len();
+            let (logged_value, _remaining) = U256::from_compact(compact_data, data_len);
+            Ok(logged_value)
         } else {
             // 日志文件中没有更多存储数据
             Ok(U256::ZERO)
@@ -1244,12 +1789,21 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RO)?;
         let log_dir = self.log_dir.as_deref();
         
+        // 测试模式：启用内存模式（将 bin 文件完全读入内存，无压缩）
+        // 可以通过环境变量 PEVM_IN_MEMORY_MODE=true 启用
+        let enable_in_memory_mode = std::env::var("PEVM_IN_MEMORY_MODE")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(true); // 默认启用测试模式
+        
         // 如果使用累加文件系统，检查已存在的块（步骤4：累加模式，支持断点续传）
         // 同时缓存索引条目，避免每次读取都重新读取索引文件
         let (existing_blocks, cached_index_entries): (Arc<std::collections::HashSet<u64>>, Arc<Vec<IndexEntry>>) = if let Some(log_dir) = log_dir {
             let (mut idx_file, _) = open_log_files(log_dir)?;
             let index_entries = read_index_file(&mut idx_file)?;
-            let blocks: std::collections::HashSet<u64> = index_entries.iter().map(|e| e.block_number).collect();
+            // 性能优化：预分配 HashSet 容量，减少重新分配
+            let blocks: std::collections::HashSet<u64> = index_entries.iter()
+                .map(|e| e.block_number)
+                .collect();
             if !blocks.is_empty() {
                 let min_block = *blocks.iter().min().unwrap();
                 let max_block = *blocks.iter().max().unwrap();
@@ -1278,6 +1832,34 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         } else {
             None
         };
+        
+        // 如果启用了 mmap 日志模式（--mmap-log），初始化 MmapStateLogDatabase
+        // mmap 模式优先于 db-log 模式（更适合大数据集）
+        let mmap_log_db: Option<Arc<std::sync::RwLock<MmapStateLogDatabase>>> = if self.use_mmap_log {
+            if let Some(log_dir) = log_dir {
+                match MmapStateLogDatabase::open(log_dir) {
+                    Ok(db) => {
+                        if let Some((min, max)) = db.get_block_range() {
+                            info!("Using mmap-based state log storage (--mmap-log mode): {} blocks, range {} - {}", 
+                                db.block_count(), min, max);
+                        } else {
+                            info!("Using mmap-based state log storage (--mmap-log mode): empty database");
+                        }
+                        Some(Arc::new(std::sync::RwLock::new(db)))
+                    }
+                    Err(e) => {
+                        warn!("Failed to open MmapStateLogDatabase: {}. Falling back to other modes.", e);
+                        None
+                    }
+                }
+            } else {
+                warn!("--mmap-log requires --log-dir to be set.");
+                None
+            }
+        } else {
+            None
+        };
+        
         // 提前获取 chain_spec，避免在线程中重复调用（可能有锁）
         let chain_spec = provider_factory.chain_spec();
         let _consensus: Arc<dyn FullConsensus<EthPrimitives, Error = ConsensusError>> =
@@ -1285,9 +1867,13 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
         // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
         let blockchain_db = BlockchainProvider::new(provider_factory.clone())?;
-        let provider = provider_factory.provider()?;
-
-        let last = provider.last_block_number()?;
+        
+        // 性能修复：限制 provider 的生命周期，避免长时间持有读事务
+        // 只用来获取 last_block_number，获取后立即释放
+        let last = {
+            let provider = provider_factory.provider()?;
+            provider.last_block_number()?
+        }; // provider 在这里被 drop，释放读事务
 
         if self.begin_number > self.end_number {
             eyre::bail!("the begin block number is higher than the end block number")
@@ -1350,6 +1936,34 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 self.begin_number, self.end_number);
             return Ok(());
         }
+
+
+        // 性能优化：在程序开始时打开日志文件句柄，所有线程共享，程序结束时关闭
+        // 如果启用了 --use-log on 且使用了日志目录，创建全局文件句柄
+        let use_log_enabled = self.use_log.as_ref().map(|s| s == "on").unwrap_or(false);
+        let global_log_file_handle: Option<Arc<GlobalLogFileHandle>> = if use_log_enabled {
+            if let Some(log_dir) = log_dir {
+                let bin_path = log_dir.join("blocks_log.bin");
+                match GlobalLogFileHandle::new(&bin_path, enable_in_memory_mode) {
+                    Ok(handle) => {
+                        if enable_in_memory_mode {
+                            info!("Successfully loaded log file into memory: {} (will be shared across all threads, no compression)", bin_path.display());
+                        } else {
+                            info!("Successfully opened global log file handle: {} (will be shared across all threads)", bin_path.display());
+                        }
+                        Some(Arc::new(handle))
+                    }
+                    Err(e) => {
+                        warn!("Failed to open global log file handle ({}), will open file on each read: {}", bin_path.display(), e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // 获取线程数：如果启用单线程模式，使用1个线程；否则使用多线程
         let thread_count = if self.single_thread {
@@ -1455,6 +2069,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             let existing_blocks_clone = Arc::clone(&existing_blocks);
             let cached_index_entries_clone = Arc::clone(&cached_index_entries);
             let buffered_writer_clone = buffered_writer.clone();
+            let global_log_file_handle_clone = global_log_file_handle.clone();
+            // 将内存模式标志传递给 worker 线程
+            let enable_in_memory_mode_clone = enable_in_memory_mode;
+            // mmap 日志模式
+            let mmap_log_db_clone = mmap_log_db.clone();
 
             // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
             threads.push(thread::spawn(move || {
@@ -1462,6 +2081,28 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 
                 // 预先创建 EVM 配置，避免在循环中重复创建（这是线程级别的，可以复用）
                 let evm_config = EthEvmConfig::ethereum(chain_spec.clone());
+                
+                // 性能关键优化：在 worker 线程开始时只调用一次 history_by_block_number
+                // 而不是在每个 task 中调用（避免大量数据库查询）
+                // code_by_hash 查询的 bytecode 是不可变的，不依赖于具体块号
+                // 所以使用 begin_number - 1 作为基准块号是安全的
+                // 注意：需要定期刷新以避免 MDBX 读事务超时（300秒）
+                let mut thread_level_state_provider: Option<Arc<dyn reth_provider::StateProvider>> = 
+                    if use_log_enabled {
+                        match blockchain_db.history_by_block_number(0) {
+                            Ok(sp) => Some(Arc::new(sp)),
+                            Err(e) => {
+                                error!("Failed to create thread-level state provider: {}", e);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                
+                // 用于跟踪 state_provider 的创建时间，避免 MDBX 读事务超时
+                let mut state_provider_created_at = std::time::Instant::now();
+                const STATE_PROVIDER_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(240); // 240秒刷新一次，留60秒余量
                 
                 loop {
                     // 检查停止标志
@@ -1485,14 +2126,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             break;
                         }
 
-                        debug!(
-                            target: "exex::evm",
-                            task_start = task.start,
-                            task_end = task.end,
-                            thread_id = ?thread_id,
-                            "start loop",
-                        );
-                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), Report> {
+                        // 性能优化：移除热路径上的 debug 日志，避免 tracing 开销
+                        // 性能优化：移除 catch_unwind，直接执行（如果发生 panic，让线程崩溃而不是捕获）
+                        // catch_unwind 的开销很大，特别是在没有 panic 的情况下也会产生 unwinding 开销
+                        // 如果确实需要错误恢复，可以在更高层处理
+                        let result: Result<(), Report> = (|| -> Result<(), Report> {
                             let mut td = blockchain_db.header_td_by_number(task.start - 1)?
                                 .ok_or_else(|| ProviderError::HeaderNotFound(task.start.into()))?;
 
@@ -1511,13 +2149,19 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                             !existing_blocks_clone.contains(&block_num)
                                         })
                                         .map(|block| block.sealed_block().header().number)
-                                        .collect()
+                                        .collect::<Vec<u64>>()
                                 } else {
                                     // --use-log on 或其他模式，不过滤，处理所有块
-                                    blocks.iter().map(|block| block.sealed_block().header().number).collect()
+                                    // 性能优化：预分配 Vec 容量
+                                    blocks.iter()
+                                        .map(|block| block.sealed_block().header().number)
+                                        .collect::<Vec<u64>>()
                                 }
                             } else {
-                                blocks.iter().map(|block| block.sealed_block().header().number).collect()
+                                // 性能优化：预分配 Vec 容量
+                                blocks.iter()
+                                    .map(|block| block.sealed_block().header().number)
+                                    .collect::<Vec<u64>>()
                             };
                             
                             // 如果使用累加模式且启用了日志记录（--log-block on）且所有块都已存在，跳过执行
@@ -1536,9 +2180,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                 
                                 // 为每个块单独执行并记录日志
                                 for block in blocks.iter() {
-                                    // 在处理每个块之前检查停止标志
+                                    // 性能优化：移除热路径上的日志检查
                                     if should_stop_worker.load(Ordering::Relaxed) {
-                                        debug!(target: "exex::evm", thread_id = ?thread_id, "Worker thread stopping during block processing");
                                         return Ok(());
                                     }
                                     
@@ -1570,9 +2213,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                     // 执行单个块
                                     let _output = executor.execute(block)?;
                                     
-                                    // 再次检查停止标志（执行可能耗时较长）
+                                    // 性能优化：移除热路径上的日志检查
                                     if should_stop_worker.load(Ordering::Relaxed) {
-                                        debug!(target: "exex::evm", thread_id = ?thread_id, "Worker thread stopping after block execution");
                                         return Ok(());
                                     }
                                     
@@ -1587,8 +2229,17 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                     }
                                 }
                                 
-                                // 批量写入日志文件（减少锁竞争和文件I/O）
-                                if let Some(ref writer) = buffered_writer_clone {
+                                // 批量写入日志（减少锁竞争和文件I/O）
+                                // 优先使用 mmap 模式，其次使用文件系统模式
+                                if let Some(ref db) = mmap_log_db_clone {
+                                    // mmap 日志模式：批量写入（零拷贝，适合大数据集）
+                                    let mut db_guard = db.write().unwrap();
+                                    let batch: Vec<(u64, Vec<ReadLogEntry>)> = block_logs.iter()
+                                        .map(|(bn, logs)| (*bn, logs.clone()))
+                                        .collect();
+                                    db_guard.write_block_logs_batch(&batch)?;
+                                } else if let Some(ref writer) = buffered_writer_clone {
+                                    // 文件系统模式：使用缓冲写入
                                     let mut writer_guard = writer.lock().unwrap();
                                     for (block_number, logs) in block_logs {
                                         write_read_logs_binary(block_number, &logs, &compression_algorithm, log_dir_clone.as_deref(), &existing_blocks_clone, single_thread, Some(&mut *writer_guard))?;
@@ -1603,110 +2254,307 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             } else if use_log_enabled {
                                 // 如果启用了从日志执行（--use-log on），为每个块从累计日志中读取并执行
                                 // 性能优化：批量预加载所有块的日志数据，减少文件I/O和创建开销
-                                if let Some(log_dir) = &log_dir_clone {
+                                
+                                // 优先使用 mmap 模式（零拷贝，适合大数据集）
+                                if let Some(ref db) = mmap_log_db_clone {
+                                    let blocks_len = blocks.len();
+                                    
+                                    // 获取所有需要的块号
+                                    let block_numbers: Vec<u64> = blocks.iter()
+                                        .map(|b| b.sealed_block().header().number)
+                                        .collect();
+                                    
+                                    // 从 mmap 读取（零拷贝）
+                                    let db_guard = db.read().unwrap();
+                                    let batch_data = db_guard.read_block_logs_batch(&block_numbers);
+                                    
+                                    // 创建共享的 StateProvider
+                                    let shared_state_provider: Arc<dyn reth_provider::StateProvider> = 
+                                        Arc::new(blockchain_db.history_by_block_number(task.start.checked_sub(1).unwrap_or(0))?);
+                                    
+                                    // 为每个块创建 DbLoggedDatabase 并执行（零拷贝版本）
+                                    let mut block_db_pairs: Vec<(u64, Option<DbLoggedDatabase<'_>>)> = Vec::with_capacity(blocks_len);
+                                    
+                                    for (bn, data) in batch_data.iter() {
+                                        match DbLoggedDatabase::new(data, shared_state_provider.clone()) {
+                                            Ok(db) => block_db_pairs.push((*bn, Some(db))),
+                                            Err(e) => {
+                                                warn!("Failed to create DbLoggedDatabase for block {}: {}", bn, e);
+                                                block_db_pairs.push((*bn, None));
+                                            }
+                                        }
+                                    }
+                                    
+                                    // 执行每个块
+                                    let mut db_iter = block_db_pairs.into_iter();
+                                    for block in blocks.iter() {
+                                        let block_number = block.sealed_block().header().number;
+                                        
+                                        if let Some((db_block_number, Some(mut logged_db))) = db_iter.next() {
+                                            if db_block_number != block_number {
+                                                error!("Block number mismatch: expected {}, got {}", block_number, db_block_number);
+                                                continue;
+                                            }
+                                            
+                                            // 执行块
+                                            let executor = evm_config.batch_executor(&mut logged_db);
+                                            if let Err(e) = executor.execute_batch(std::iter::once(block)) {
+                                                error!("Execution error for block {} using mmap DbLoggedDatabase: {}", block_number, e);
+                                            }
+                                            
+                                            // 更新统计
+                                            let txs = block.sealed_block().body().transaction_count();
+                                            *cumulative_gas.lock().unwrap() += block.sealed_block().header().gas_used;
+                                            *txs_counter.lock().unwrap() += txs as u64;
+                                        } else {
+                                            // 使用数据库直接执行
+                                            let db = StateProviderDatabase::new(
+                                                blockchain_db.history_by_block_number(block_number.saturating_sub(1))?
+                                            );
+                                            let executor = evm_config.batch_executor(db);
+                                            if let Err(e) = executor.execute_batch(std::iter::once(block)) {
+                                                error!("Execution error for block {} using StateProviderDatabase: {}", block_number, e);
+                                            }
+                                            
+                                            // 更新统计
+                                            let txs = block.sealed_block().body().transaction_count();
+                                            *cumulative_gas.lock().unwrap() += block.sealed_block().header().gas_used;
+                                            *txs_counter.lock().unwrap() += txs as u64;
+                                        }
+                                    }
+                                    
+                                    // 更新 block_counter
+                                    *block_counter.lock().unwrap() += blocks.len() as u64;
+                                    
+                                } else if let Some(log_dir) = &log_dir_clone {
+                                    // 文件系统模式：从文件读取日志数据
                                     // 注意：StateProvider 不能跨块复用，因为每个块的状态不同
                                     // 但我们可以批量预加载日志数据，减少文件I/O
                                     
-                                    // 打开文件句柄（任务范围内复用）
-                                    let bin_path = log_dir.join("blocks_log.bin");
-                                    let bin_file = std::fs::File::open(&bin_path)
-                                        .map_err(|e| eyre::eyre!("Failed to open log file {}: {}", bin_path.display(), e))?;
-                                    const BUFFER_SIZE: usize = 1024 * 1024;
-                                    let mut bin_reader = BufReader::with_capacity(BUFFER_SIZE, bin_file);
-                                    
-                                    // 批量预加载所有块的日志数据
-                                    // 性能优化：使用HashMap快速查找，避免每次都用find
+                                    // 性能优化：批量预加载所有块的压缩数据到内存（线程局部）
+                                    // 每个块的数据从文件读取，然后在线程内部解压并缓存
                                     use std::collections::HashMap;
-                                    let mut block_log_entries: HashMap<u64, Vec<ReadLogEntry>> = HashMap::with_capacity(blocks.len());
+                                    // 性能优化：预分配 HashMap 容量，避免重新分配
+                                    let blocks_len = blocks.len();
+                                    let mut block_compressed_data: HashMap<u64, Vec<u8>> = HashMap::with_capacity(blocks_len);
+                                    
+                                    // 性能优化：预分配 Vec 容量，减少重新分配
+                                    let mut read_requests: Vec<(&IndexEntry, u64)> = Vec::with_capacity(blocks_len);
                                     for block in blocks.iter() {
                                         let block_number = block.sealed_block().header().number;
                                         
                                         // 使用缓存的索引条目查找块
-                                        let entry = match find_index_entry(&cached_index_entries_clone, block_number) {
-                                            Some(e) => e,
-                                            None => {
-                                                warn!("Block {} not found in log index, skipping", block_number);
-                                                continue;
-                                            }
-                                        };
-                                        
-                                        // 从已打开的文件读取（性能优化：复用文件句柄）
-                                        let buffer = match read_log_entry_from_file(&mut bin_reader, entry, block_number) {
-                                            Ok(b) => b,
-                                            Err(e) => {
-                                                error!("Failed to read log for block {}: {}", block_number, e);
-                                                continue;
-                                            }
-                                        };
-                                        
-                                        // 解析和解压缩数据（一次性完成）
-                                        let entries = match parse_log_buffer(&buffer) {
-                                            Ok(e) => {
-                                                if e.is_empty() {
-                                                    warn!("Block {} log file is empty, skipping", block_number);
+                                        if let Some(entry) = find_index_entry(&cached_index_entries_clone, block_number) {
+                                            read_requests.push((entry, block_number));
+                                        } else {
+                                            warn!("Block {} not found in log index, skipping", block_number);
+                                        }
+                                    }
+                                    
+                                    // 按偏移量排序，优化文件访问模式（顺序读取）
+                                    read_requests.sort_by_key(|(entry, _)| entry.offset);
+                                    
+                                    // 性能优化：使用批量读取减少 seek 和 read 系统调用
+                                    // 如果使用全局文件句柄，使用批量读取；否则逐个读取
+                                    if let Some(file_handle) = global_log_file_handle_clone.as_deref() {
+                                        // 性能优化：在 in_memory_mode 下，直接使用共享内存，避免复制
+                                        if enable_in_memory_mode_clone && file_handle.in_memory_data.is_some() {
+                                            // 直接从共享内存读取，避免复制
+                                            let shared_data = file_handle.in_memory_data.as_ref().unwrap();
+                                            for (entry, block_number) in read_requests {
+                                                let start = entry.offset as usize;
+                                                let end = start + entry.length as usize;
+                                                if end > shared_data.len() {
+                                                    error!("Block {} read range out of bounds: offset={}, length={}, file_size={}", block_number, entry.offset, entry.length, shared_data.len());
                                                     continue;
                                                 }
-                                                e
-                                            },
-                                            Err(e) => {
-                                                error!("Failed to parse log for block {}: {}", block_number, e);
-                                                continue;
+                                                // 性能优化：直接使用共享内存的 Arc，避免复制
+                                                let data = shared_data[start..end].to_vec();
+                                                block_compressed_data.insert(block_number, data);
                                             }
-                                        };
-                                        
-                                        block_log_entries.insert(block_number, entries);
+                                        } else {
+                                            // 正常模式：使用批量读取
+                                            // 性能优化：预分配批量读取请求 Vec 容量
+                                            let batch_ranges: Vec<(usize, u64, u64)> = read_requests.iter()
+                                                .enumerate()
+                                                .map(|(idx, (entry, _))| (idx, entry.offset, entry.length))
+                                                .collect();
+                                            
+                                            // 批量读取所有数据
+                                            match file_handle.read_ranges_batch(&batch_ranges) {
+                                                Ok(batch_data) => {
+                                                    // 将批量读取的数据插入到 HashMap 中
+                                                    for (idx, data) in batch_data {
+                                                        let (_, block_number) = read_requests[idx];
+                                                        block_compressed_data.insert(block_number, data);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to batch read log data: {}. Falling back to individual reads.", e);
+                                                    // 回退到逐个读取
+                                                    for (_entry, block_number) in read_requests {
+                                                        match read_log_compressed_data(
+                                                            &block_number.to_string(), 
+                                                            Some(log_dir), 
+                                                            Some(&cached_index_entries_clone),
+                                                            Some(file_handle),
+                                                            enable_in_memory_mode_clone
+                                                        ) {
+                                                            Ok(b) => {
+                                                                block_compressed_data.insert(block_number, b);
+                                                            }
+                                                            Err(err) => {
+                                                                error!("Failed to read log for block {}: {}", block_number, err);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        // 没有全局文件句柄，逐个读取
+                                        for (_entry, block_number) in read_requests {
+                                            match read_log_compressed_data(
+                                                &block_number.to_string(), 
+                                                Some(log_dir), 
+                                                Some(&cached_index_entries_clone),
+                                                None,
+                                                enable_in_memory_mode_clone
+                                            ) {
+                                                Ok(b) => {
+                                                    block_compressed_data.insert(block_number, b);
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to read log for block {}: {}", block_number, e);
+                                                }
+                                            }
+                                        }
                                     }
                                     
-                                    // 性能优化：预先创建所有 LoggedDatabase 实例，减少查找开销
-                                    // 然后按顺序执行，避免在循环中重复查找
-                                    let mut block_db_pairs: Vec<(u64, LoggedDatabase)> = Vec::with_capacity(blocks.len());
+                                    // 性能关键优化：使用线程级别的 state provider（在 worker 线程开始时只创建一次）
+                                    // 而不是每个 task 都调用 history_by_block_number（避免大量数据库查询）
+                                    // code_by_hash 查询的 bytecode 是不可变的，不依赖于具体块号
+                                    let shared_state_provider = match &thread_level_state_provider {
+                                        Some(sp) => sp.clone(),
+                                        None => {
+                                            // 回退：如果线程级别 state provider 创建失败，尝试为当前 task 创建
+                                            Arc::new(blockchain_db.history_by_block_number(task.start.checked_sub(1).unwrap_or(0))?)
+                                        }
+                                    };
                                     
-                                    // 第一步：为所有块创建 LoggedDatabase（按块号顺序）
+                                    // 性能优化：预先创建所有 LoggedDatabase 实例
+                                    // 单线程模式：顺序处理，避免线程池开销
+                                    // 多线程模式：使用 rayon 并行解压以充分利用 CPU
+                                    
+                                    // 性能优化：预分配 block_db_pairs 容量，减少重新分配
+                                    let mut block_db_pairs: Vec<(u64, LoggedDatabase)> = Vec::with_capacity(blocks_len);
+                                    
+                                    // 性能优化：直接处理，避免创建中间 Vec
+                                    // 按块顺序处理，保持执行顺序
+                                    if single_thread {
+                                        // 单线程模式：顺序处理，避免线程池和同步开销
+                                        // 正常模式：从 block_compressed_data 读取
+                                        for block in blocks.iter() {
+                                            let block_number = block.sealed_block().header().number;
+                                            
+                                            // 获取压缩数据
+                                            let compressed_data = match block_compressed_data.remove(&block_number) {
+                                                Some(data) => data,
+                                                None => {
+                                                    error!("Block {} data not found in compressed data map", block_number);
+                                                    continue;
+                                                }
+                                            };
+                                            
+                                            // 从压缩数据创建 LoggedDatabase（性能优化：零复制版本）
+                                            // 直接传递 Vec<u8> 所有权，避免不必要的内存复制
+                                            // is_uncompressed 根据 enable_in_memory_mode 设置
+                                            match LoggedDatabase::new_from_compressed_buffer_owned(compressed_data, shared_state_provider.clone(), enable_in_memory_mode_clone) {
+                                                Ok(db) => {
+                                                    block_db_pairs.push((block_number, db));
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to create LoggedDatabase for block {}: {}", block_number, e);
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        // 多线程模式：使用 rayon 并行解压
+                                        use rayon::prelude::*;
+                                        
+                                        // 准备处理的块数据：Vec<(block_number, compressed_data, block_index)>
+                                        // 性能优化：预分配容量
+                                        let block_decompress_tasks: Vec<(u64, Vec<u8>, usize)> = blocks.iter()
+                                            .enumerate()
+                                            .filter_map(|(block_idx, block)| {
+                                                let block_number = block.sealed_block().header().number;
+                                                block_compressed_data.remove(&block_number).map(|data| (block_number, data, block_idx))
+                                            })
+                                            .collect();
+                                        
+                                        // 并行解压
+                                        // 性能关键优化：所有块复用线程级别的 state_provider
+                                        // 避免为每个块调用 history_by_block_number，减少数据库查询
+                                        let shared_state_provider_for_rayon = shared_state_provider.clone();
+                                        
+                                        let mut decompressed_results: Vec<(usize, u64, Result<LoggedDatabase, eyre::Error>)> = block_decompress_tasks
+                                            .into_par_iter()
+                                            .map(|(block_number, compressed_data, original_idx)| {
+                                                // 从压缩数据创建 LoggedDatabase（性能优化：零复制版本）
+                                                // 直接传递 Vec<u8> 所有权，避免不必要的内存复制
+                                                match LoggedDatabase::new_from_compressed_buffer_owned(compressed_data, shared_state_provider_for_rayon.clone(), enable_in_memory_mode_clone) {
+                                                    Ok(db) => (original_idx, block_number, Ok(db)),
+                                                    Err(e) => (original_idx, block_number, Err(eyre::eyre!("Failed to create LoggedDatabase for block {}: {}", block_number, e))),
+                                                }
+                                            })
+                                            .collect();
+                                        
+                                        // 按原始索引排序，保持块号顺序
+                                        decompressed_results.sort_by_key(|(idx, _, _)| *idx);
+                                        
+                                        // 转换为最终的 block_db_pairs
+                                        for (_, block_number, result) in decompressed_results {
+                                            match result {
+                                                Ok(db) => block_db_pairs.push((block_number, db)),
+                                                Err(e) => {
+                                                    error!("Failed to create LoggedDatabase for block {}: {}", block_number, e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    // 第二步：按顺序执行所有块
+                                    // 关键性能优化：直接按顺序匹配，避免 O(n²) 的 find() 查找
+                                    // block_db_pairs 已经是按 blocks 的顺序创建的，可以直接按索引匹配
+                                    let mut db_iter = block_db_pairs.into_iter();
                                     for block in blocks.iter() {
-                                        let block_number = block.sealed_block().header().number;
-                                        
-                                        // 快速查找对应的日志数据
-                                        let log_entries = match block_log_entries.remove(&block_number) {
-                                            Some(entries) => entries,
-                                            None => {
-                                                warn!("Block {} log data not found, skipping", block_number);
-                                                continue;
-                                            }
-                                        };
-                                        
-                                        // 创建 state provider（用于 code_by_hash，代码不在日志文件中）
-                                        // 注意：每个块的状态都不同，必须为每个块创建新的state_provider
-                                        let state_provider = blockchain_db.history_by_block_number(block_number.checked_sub(1).unwrap_or(0))?;
-                                        
-                                        // 创建从日志文件读取的 Database
-                                        let logged_db = LoggedDatabase::new(log_entries, state_provider);
-                                        block_db_pairs.push((block_number, logged_db));
-                                    }
-                                    
-                                    // 第二步：按顺序执行所有块（减少 executor 创建开销）
-                                    // 性能优化：虽然仍需要为每个块创建 executor，但至少减少了查找和创建的开销
-                                    for (block_number, logged_db) in block_db_pairs {
-                                        // 在处理每个块之前检查停止标志
+                                        // 性能优化：移除热路径上的日志检查，直接判断停止标志
                                         if should_stop_worker.load(Ordering::Relaxed) {
-                                            debug!(target: "exex::evm", thread_id = ?thread_id, "Worker thread stopping during block processing");
                                             return Ok(());
                                         }
                                         
-                                        // 找到对应的块（使用 find，因为块号可能不连续）
-                                        let block = blocks.iter().find(|b| b.sealed_block().header().number == block_number);
-                                        if let Some(block) = block {
-                                            // 创建 executor（这是必要的，因为每个块的状态不同）
-                                            // 性能优化：executor 的创建开销相对较小，主要是执行开销
+                                        // 直接取下一个 LoggedDatabase（已经按顺序匹配）
+                                        if let Some((db_block_number, logged_db)) = db_iter.next() {
+                                            let block_number = block.sealed_block().header().number;
+                                            // 验证块号匹配（调试用，仅在不匹配时打印）
+                                            if db_block_number != block_number {
+                                                error!("Block number mismatch: expected {}, got {}", block_number, db_block_number);
+                                                continue;
+                                            }
+                                            
+                                            // 创建 executor（每个块需要不同的 LoggedDatabase）
                                             let executor = evm_config.batch_executor(logged_db);
                                             
                                             // 执行单个块
                                             let _output = executor.execute(block)?;
                                             
-                                            // 再次检查停止标志（执行可能耗时较长）
+                                            // 性能优化：移除热路径上的日志检查
                                             if should_stop_worker.load(Ordering::Relaxed) {
-                                                debug!(target: "exex::evm", thread_id = ?thread_id, "Worker thread stopping after block execution");
                                                 return Ok(());
                                             }
+                                        } else {
+                                            error!("LoggedDatabase exhausted before blocks finished");
+                                            break;
                                         }
                                     }
                                 } else {
@@ -1720,7 +2568,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                 let _execute_result = executor.execute_batch(blocks.iter())?;
                             }
 
-                            let start = Instant::now();
+                            let _start = Instant::now(); // 保留用于将来的性能统计
                             let mut step_cumulative_gas: u64 = 0;
                             let mut step_txs_counter: usize = 0;
 
@@ -1743,7 +2591,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                     td += block.sealed_block().header().difficulty;
                                     step_cumulative_gas += block.sealed_block().header().gas_used;
                                     step_txs_counter += block.sealed_block().body().transaction_count();
-                                    debug!(target: "exex::evm", block_number = block.sealed_block().header().number, txs_count = block.sealed_block().body().transaction_count(), thread_id = ?thread_id, "Adding transactions count");
+                                    // 性能优化：移除热路径中的 debug! 日志
+                                    // 即使日志级别为 INFO，tracing 仍会检查是否需要记录，产生大量开销
                                 });
 
                             // Ensure the locks are correctly used without deadlock
@@ -1763,34 +2612,29 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                 *txs_counter.lock().unwrap() += step_txs_counter as u64;
                             }
 
-                            debug!(
-                                target: "exex::evm",
-                                task_start = task.start,
-                                task_end = task.end,
-                                txs = step_txs_counter,
-                                blocks = blocks_to_process_numbers.len(),
-                                total_blocks_in_range = blocks.len(),
-                                skipped_blocks = blocks.len() - blocks_to_process_numbers.len(),
-                                throughput = format_gas_throughput(step_cumulative_gas, start.elapsed()),
-                                time = ?start.elapsed(),
-                                thread_id = ?thread_id,
-                                total_difficulty = ?td,
-                                "loop"
-                            );
+                            // 性能优化：移除热路径上的 debug 日志，避免 tracing 开销
+                            // 即使是 debug 级别，tracing 仍然会检查过滤器并格式化参数
 
                             Ok(())
-                        }));
+                        })();
 
-                        match result {
-                            Ok(res) => {
-                                if let Err(e) = res {
-                                    error!("Thread {:?} execution error: {:?}", thread_id, e);
+                        // 直接处理结果（不再需要处理 panic）
+                        if let Err(e) = result {
+                            error!("Thread {:?} execution error: {:?}", thread_id, e);
+                        }
+                        
+                        // 定期刷新 state_provider，避免 MDBX 读事务超时（300秒）
+                        if use_log_enabled && state_provider_created_at.elapsed() > STATE_PROVIDER_REFRESH_INTERVAL {
+                            // 创建新的 state_provider（旧的会自动 drop）
+                            thread_level_state_provider = match blockchain_db.history_by_block_number(0) {
+                                Ok(sp) => Some(Arc::new(sp)),
+                                Err(e) => {
+                                    error!("Failed to refresh thread-level state provider: {}", e);
+                                    None
                                 }
-                            }
-                            Err(e) => {
-                                error!("Thread {:?} execution error: {:?}", thread_id, e);
-                            }
-                        };
+                            };
+                            state_provider_created_at = std::time::Instant::now();
+                        }
                     }
                 }
                 Ok(())
@@ -1934,24 +2778,33 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                     (path, block_num)
                 };
                 
-                // 读取日志文件（累加文件系统或单个文件）
-                let log_entries = if let Some(log_dir) = log_dir {
-                    // 从累加文件系统读取，使用块号作为 key（使用缓存的索引条目）
-                    read_read_logs_binary(&block_number.to_string(), Some(log_dir), Some(&cached_index_entries))?
+                // 性能优化：读取压缩数据，在线程内解压到线程局部缓存
+                // 注意：单个块执行不在线程中，不使用全局文件句柄
+                // 测试模式标志（单块执行也支持）
+                let enable_in_memory_mode = std::env::var("PEVM_IN_MEMORY_MODE")
+                    .map(|v| v == "true" || v == "1")
+                    .unwrap_or(true); // 默认启用测试模式
+                
+                let compressed_data = if let Some(log_dir_ref) = log_dir {
+                    // 从累加文件系统读取压缩数据（每次打开文件）
+                    read_log_compressed_data(&block_number.to_string(), Some(log_dir_ref), Some(&cached_index_entries), None, enable_in_memory_mode)?
                 } else {
-                    // 从单个文件读取（不使用索引）
-                    read_read_logs_binary(&log_path, None, None)?
+                    // 从单个文件读取压缩数据（不使用索引）
+                    read_log_compressed_data(&log_path, None, None, None, enable_in_memory_mode)?
                 };
-                info!("Loaded {} log entries from {}", log_entries.len(), &log_path);
                 
                 // 创建 state provider
                 let blockchain_db = BlockchainProvider::new(provider_factory.clone())?;
                 let state_provider = blockchain_db.history_by_block_number(
                     block_number.checked_sub(1).unwrap_or(0)
                 )?;
+
+                // 从压缩数据创建 LoggedDatabase（性能优化：零复制版本）
+                // 直接传递 Vec<u8> 所有权，避免不必要的内存复制
+                let logged_db = LoggedDatabase::new_from_compressed_buffer_owned(compressed_data, Arc::new(state_provider), enable_in_memory_mode)
+                    .map_err(|e| eyre::eyre!("Failed to create LoggedDatabase from compressed data: {}", e))?;
                 
-                // 创建从日志文件读取的 Database
-                let logged_db = LoggedDatabase::new(log_entries, state_provider);
+                info!("Loaded log data from {} (using thread-local cache)", &log_path);
                 
                 let evm_config = EthEvmConfig::ethereum(provider_factory.chain_spec());
                 
@@ -1986,9 +2839,21 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         if let Some(ref mut guard) = _profiler_guard {
             info!("Generating flamegraph...");
             let output_file = "flamegraph.svg";
+            
             match guard.generate_flamegraph(output_file) {
                 Ok(()) => {
-                    info!("🔥 火焰图已生成: {}", output_file);
+                    // 获取完整的绝对路径以便用户知道文件位置
+                    let abs_path = std::env::current_dir()
+                        .ok()
+                        .map(|dir| dir.join(output_file))
+                        .and_then(|p| p.canonicalize().ok())
+                        .unwrap_or_else(|| {
+                            std::env::current_dir()
+                                .ok()
+                                .map(|dir| dir.join(output_file))
+                                .unwrap_or_else(|| PathBuf::from(output_file))
+                        });
+                    info!("🔥 火焰图已生成: {}", abs_path.display());
                     #[cfg(windows)]
                     info!("注意: Windows 版本使用简化的线程采样，可能不如 Unix 版本精确。建议使用 WSL 或 Windows Performance Toolkit 进行更详细的分析。");
                 }

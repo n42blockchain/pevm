@@ -4,9 +4,11 @@
 
 ## 快速开始
 
-### 1. 使用 PowerShell 脚本进行基准测试
+### 1. 使用脚本进行基准测试
 
-最简单的性能测试方法是使用提供的 PowerShell 脚本：
+#### Windows 版本（PowerShell）
+
+在 Windows 上使用 PowerShell 脚本：
 
 ```powershell
 # 设置环境变量
@@ -16,6 +18,29 @@ $env:PEVM_LOG_DIR = ".\bench_logs"
 # 运行基准测试（测试块 1000-2000）
 .\scripts\benchmark_performance.ps1 -BeginBlock 1000 -EndBlock 2000
 ```
+
+#### macOS/Linux 版本（Bash）
+
+在 macOS 或 Linux 上使用 Bash 脚本：
+
+```bash
+# 设置环境变量
+export PEVM_DATADIR="/path/to/reth2k"
+export PEVM_LOG_DIR="./bench_logs"
+
+# 运行基准测试（测试块 1000-2000）
+./scripts/benchmark_performance.sh -b 1000 -e 2000 -d "/path/to/reth2k" -l "./bench_logs"
+```
+
+或者使用环境变量：
+
+```bash
+export PEVM_DATADIR="/path/to/reth2k"
+export PEVM_LOG_DIR="./bench_logs"
+./scripts/benchmark_performance.sh -b 1000 -e 2000
+```
+
+**注意**：macOS 需要安装 `bc` 计算器（通常已预装，如果没有可以使用 `brew install bc`）。
 
 脚本会自动：
 1. 检查并生成日志文件（如果不存在）
@@ -39,28 +64,54 @@ Windows 上推荐使用 WPT 进行性能分析：
 
 然后使用 Windows Performance Analyzer (WPA) 打开 `.etl` 文件进行分析。
 
-#### 选项 B: 火焰图（仅限 Linux/macOS 或 WSL）
+#### 选项 B: 火焰图（Linux/macOS 推荐，Windows 需要 WSL）
 
 **注意**：`cargo flamegraph` 在 Windows 上**无法正常工作**，因为它需要 Linux 的 `perf` 工具或 macOS 的 `dtrace`。
 
-如果需要在 Windows 上使用火焰图，可以：
+##### macOS/Linux 版本（推荐）
 
-1. **使用 WSL (Windows Subsystem for Linux)**：
+在 macOS 或 Linux 上使用 Bash 脚本：
+
 ```bash
-# 在 WSL 中安装
-cargo install flamegraph
+# 分析不使用日志的执行
+./scripts/profile_with_flamegraph.sh -b 1000 -e 2000 -d "/path/to/reth2k" -u false -o "flamegraph_without_log.svg"
 
-# 在 WSL 中运行（注意路径转换）
-cargo flamegraph --bin pevm -- evm -b 1000 -e 2000 --datadir /mnt/d/reth2k
+# 分析使用日志 bin 的执行
+./scripts/profile_with_flamegraph.sh -b 1000 -e 2000 -d "/path/to/reth2k" -u true -l "./bench_logs" -o "flamegraph_with_log.svg"
 ```
 
-2. **在 Linux 或 macOS 上运行**：
+或者使用环境变量：
+
+```bash
+export PEVM_DATADIR="/path/to/reth2k"
+export PEVM_LOG_DIR="./bench_logs"
+./scripts/profile_with_flamegraph.sh -b 1000 -e 2000 -u true
+```
+
+##### Windows 版本
+
+在 Windows 上使用 PowerShell 脚本：
+
 ```powershell
 # 分析不使用日志的执行
 .\scripts\profile_with_flamegraph.ps1 -BeginBlock 1000 -EndBlock 2000 -UseLog $false -OutputFile "flamegraph_without_log.svg"
 
 # 分析使用日志 bin 的执行
 .\scripts\profile_with_flamegraph.ps1 -BeginBlock 1000 -EndBlock 2000 -UseLog $true -OutputFile "flamegraph_with_log.svg"
+```
+
+**注意**：在 Windows 上，flamegraph 可能无法正常工作，建议使用 WSL 或 WPT。
+
+##### 使用 WSL (Windows Subsystem for Linux)
+
+如果需要在 Windows 上使用火焰图，可以在 WSL 中运行：
+
+```bash
+# 在 WSL 中安装
+cargo install flamegraph
+
+# 在 WSL 中运行（注意路径转换）
+cargo flamegraph --bin pevm -- evm -b 1000 -e 2000 --datadir /mnt/d/reth2k
 ```
 
 **在 Windows 上安装火焰图工具（不推荐，会失败）**：
@@ -87,12 +138,24 @@ cargo install flamegraph
 
 ### 方法 1: 使用命令行工具直接测试
 
+#### Windows (PowerShell)
+
 ```powershell
 # 测试不使用日志
 Measure-Command { .\target\release\pevm.exe evm -b 1000 -e 2000 --datadir d:\reth2k }
 
 # 测试使用日志 bin
 Measure-Command { .\target\release\pevm.exe evm -b 1000 -e 2000 --use-log on --log-dir .\bench_logs --datadir d:\reth2k }
+```
+
+#### macOS/Linux (Bash)
+
+```bash
+# 测试不使用日志
+time ./target/release/pevm evm -b 1000 -e 2000 --datadir /path/to/reth2k
+
+# 测试使用日志 bin
+time ./target/release/pevm evm -b 1000 -e 2000 --use-log on --log-dir ./bench_logs --datadir /path/to/reth2k
 ```
 
 ### 方法 2: 使用 Criterion 基准测试框架

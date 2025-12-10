@@ -183,6 +183,7 @@ lto = "fat"
 
 [dependencies]
 num_cpus = "1.17"
+memmap2 = "0.9.4"
 
 reth = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.8.4" }
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.8.4" }
@@ -387,6 +388,7 @@ byteorder = "1"
 mini-moka = "0.10"
 tar-no-std = { version = "0.3.2", default-features = false }
 miniz_oxide = { version = "0.8.4", default-features = false }
+similar-asserts = { version = "1.5.0", features = ["serde"] }
 
 # metrics
 metrics = "0.24.0"
@@ -401,17 +403,19 @@ quote = "1.0"
 
 # tokio
 tokio = { version = "1.44", default-features = false }
+tokio-stream = "0.1"
+lz4_flex = { version = "0.11", default-features = false }
 
 # performance profiling
 # Unix: 使用 pprof-rs (基于 POSIX 信号)
 [target.'cfg(unix)'.dependencies]
 pprof = { version = "0.14", features = ["flamegraph"] }
+libc = "0.2"
 
 # Windows: 使用基于线程的采样（简化版，不依赖 POSIX）
 [target.'cfg(windows)'.dependencies]
 inferno = { version = "0.12", default-features = false }
 backtrace = "0.3"
-tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
 
 # async
@@ -465,7 +469,6 @@ assert_matches = "1.5.0"
 criterion = { package = "codspeed-criterion-compat", version = "2.7" }
 proptest = "1.9"
 proptest-derive = "0.5"
-similar-asserts = { version = "1.5.0", features = ["serde"] }
 tempfile = "3.23"
 test-fuzz = "7"
 rstest = "0.24.0"
@@ -509,7 +512,7 @@ hmac = "0.12.1"
 human_bytes = "0.4.1"
 indexmap = "2"
 interprocess = "2.2.0"
-lz4_flex = { version = "0.11", default-features = false }
+lz4_flex = "0.11"
 memmap2 = "0.9.4"
 mev-share-sse = { version = "0.5.0", default-features = false }
 num-traits = "0.2.15"

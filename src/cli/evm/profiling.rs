@@ -6,11 +6,11 @@
 mod unix_profiler {
     use pprof::ProfilerGuard;
     
-    pub(crate) struct ProfilerGuardWrapper {
-        guard: Option<ProfilerGuard>,
+    pub(crate) struct ProfilerGuardWrapper<'a> {
+        guard: Option<ProfilerGuard<'a>>,
     }
     
-    impl ProfilerGuardWrapper {
+    impl<'a> ProfilerGuardWrapper<'a> {
         pub(crate) fn new(frequency: i32) -> Result<Self, String> {
             match ProfilerGuard::new(frequency) {
                 Ok(guard) => Ok(Self { guard: Some(guard) }),

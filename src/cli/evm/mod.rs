@@ -1795,46 +1795,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(true); // 默认启用测试模式
         
-        // 如果使用累加文件系统，检查已存在的块（步骤4：累加模式，支持断点续传）
-        // 同时缓存索引条目，避免每次读取都重新读取索引文件
-        let (existing_blocks, cached_index_entries): (Arc<std::collections::HashSet<u64>>, Arc<Vec<IndexEntry>>) = if let Some(log_dir) = log_dir {
-            let (mut idx_file, _) = open_log_files(log_dir)?;
-            let index_entries = read_index_file(&mut idx_file)?;
-            // 性能优化：预分配 HashSet 容量，减少重新分配
-            let blocks: std::collections::HashSet<u64> = index_entries.iter()
-                .map(|e| e.block_number)
-                .collect();
-            if !blocks.is_empty() {
-                let min_block = *blocks.iter().min().unwrap();
-                let max_block = *blocks.iter().max().unwrap();
-                info!("Using accumulated log files in directory: {} ({} blocks already indexed, range: {} - {})", 
-                    log_dir.display(), blocks.len(), min_block, max_block);
-            } else {
-                info!("Using accumulated log files in directory: {} (no blocks indexed yet)", 
-                    log_dir.display());
-            }
-            (Arc::new(blocks), Arc::new(index_entries))
-        } else {
-            (Arc::new(std::collections::HashSet::new()), Arc::new(Vec::new()))
-        };
-
         // 检查是否启用日志记录模式（用于决定是否跳过已存在的块）
         let log_block_enabled = self.log_block.as_ref().map(|s| s == "on").unwrap_or(false);
         
-        // 创建全局缓冲写入器（如果使用累加文件系统且启用日志记录）
-        let buffered_writer: Option<Arc<Mutex<BufferedLogWriter>>> = if let Some(log_dir) = log_dir {
-            if log_block_enabled {
-                // 创建缓冲写入器，缓冲区大小为 1MB
-                Some(Arc::new(Mutex::new(BufferedLogWriter::new(log_dir)?)))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        
         // 如果启用了 mmap 日志模式（--mmap-log），初始化 MmapStateLogDatabase
-        // mmap 模式优先于 db-log 模式（更适合大数据集）
+        // mmap 模式优先于文件系统模式（更适合大数据集，支持断点续传）
         let mmap_log_db: Option<Arc<std::sync::RwLock<MmapStateLogDatabase>>> = if self.use_mmap_log {
             if let Some(log_dir) = log_dir {
                 match MmapStateLogDatabase::open(log_dir) {
@@ -1858,6 +1823,59 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             }
         } else {
             None
+        };
+        
+        // 检查已存在的块（支持断点续传）
+        // 优先从 mmap 数据库获取，否则从文件系统索引获取
+        let (existing_blocks, cached_index_entries): (Arc<std::collections::HashSet<u64>>, Arc<Vec<IndexEntry>>) = 
+            if let Some(ref mmap_db) = mmap_log_db {
+                // mmap 模式：从数据库索引获取已存在的块
+                let db_guard = mmap_db.read().unwrap();
+                let blocks = db_guard.get_existing_blocks();
+                if !blocks.is_empty() {
+                    let min_block = *blocks.iter().min().unwrap();
+                    let max_block = *blocks.iter().max().unwrap();
+                    info!("Resuming from mmap log: {} blocks already exist (range: {} - {})", 
+                        blocks.len(), min_block, max_block);
+                }
+                drop(db_guard);
+                (Arc::new(blocks), Arc::new(Vec::new())) // mmap 模式不使用 cached_index_entries
+            } else if let Some(log_dir) = log_dir {
+                // 文件系统模式：从索引文件获取已存在的块
+                let (mut idx_file, _) = open_log_files(log_dir)?;
+                let index_entries = read_index_file(&mut idx_file)?;
+                // 性能优化：预分配 HashSet 容量，减少重新分配
+                let blocks: std::collections::HashSet<u64> = index_entries.iter()
+                    .map(|e| e.block_number)
+                    .collect();
+                if !blocks.is_empty() {
+                    let min_block = *blocks.iter().min().unwrap();
+                    let max_block = *blocks.iter().max().unwrap();
+                    info!("Using accumulated log files in directory: {} ({} blocks already indexed, range: {} - {})", 
+                        log_dir.display(), blocks.len(), min_block, max_block);
+                } else {
+                    info!("Using accumulated log files in directory: {} (no blocks indexed yet)", 
+                        log_dir.display());
+                }
+                (Arc::new(blocks), Arc::new(index_entries))
+            } else {
+                (Arc::new(std::collections::HashSet::new()), Arc::new(Vec::new()))
+            };
+        
+        // 创建全局缓冲写入器（仅在文件系统模式下使用，mmap 模式不需要）
+        let buffered_writer: Option<Arc<Mutex<BufferedLogWriter>>> = if mmap_log_db.is_none() {
+            if let Some(log_dir) = log_dir {
+                if log_block_enabled {
+                    // 创建缓冲写入器，缓冲区大小为 1MB
+                    Some(Arc::new(Mutex::new(BufferedLogWriter::new(log_dir)?)))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None // mmap 模式不使用 buffered_writer
         };
         
         // 提前获取 chain_spec，避免在线程中重复调用（可能有锁）

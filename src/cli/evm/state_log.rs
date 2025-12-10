@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use tracing::{info, warn, error};
+use tracing::{info, error};
 
 use super::ReadLogEntry;
 
@@ -344,7 +344,7 @@ impl MmapStateLogDatabase {
         let pending_count = self.pending_writes.len();
         
         // 计算新数据大小
-        let new_data_size: u64 = self.pending_writes.iter()
+        let _new_data_size: u64 = self.pending_writes.iter()
             .map(|(_, data)| data.len() as u64)
             .sum();
         
@@ -445,6 +445,11 @@ impl MmapStateLogDatabase {
         let min = *self.index.keys().min().unwrap();
         let max = *self.index.keys().max().unwrap();
         Some((min, max))
+    }
+    
+    /// 获取所有已存在的块号（用于断点续传）
+    pub fn get_existing_blocks(&self) -> std::collections::HashSet<u64> {
+        self.index.keys().copied().collect()
     }
     
     /// 序列化 entries 为未压缩的二进制格式

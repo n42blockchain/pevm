@@ -95,6 +95,9 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// Use single thread for execution (useful for log generation to avoid file locking)
     #[arg(long, alias = "single-thread")]
     single_thread: bool,
+    /// Number of worker threads (default: CPU_COUNT * 2 - 1, use lower value on Windows to avoid mmap issues)
+    #[arg(long, alias = "threads", short = 't')]
+    thread_count: Option<usize>,
     /// Enable CPU profiling and generate flamegraph (output: flamegraph.svg)
     #[arg(long, alias = "profile")]
     enable_profiling: bool,
@@ -1992,12 +1995,19 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             None
         };
 
-        // 获取线程数：如果启用单线程模式，使用1个线程；否则使用多线程
+        // 获取线程数：
+        // 1. 如果启用单线程模式，使用 1 个线程
+        // 2. 如果指定了 --threads，使用指定的值
+        // 3. 否则使用默认值（CPU_COUNT * 2 - 1）
+        // 注意：在 Windows 上运行 --log-block on 时，建议使用较少的线程（如 4-8）以避免 mmap 问题
         let thread_count = if self.single_thread {
             1
+        } else if let Some(tc) = self.thread_count {
+            std::cmp::max(1, tc) // 至少 1 个线程
         } else {
             self.get_cpu_count() * 2 - 1
         };
+        info!("Using {} worker threads", thread_count);
         let mut threads: Vec<JoinHandle<Result<()>>> = Vec::with_capacity(thread_count);
 
         // 创建共享 gas 计数器和停止标志
@@ -2222,9 +2232,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                     }
                                     
                                     // 为每个块创建独立的 state provider 和日志记录器
-                                    // 优化：使用任务范围的 state provider（如果块号接近）
+                                    // 注意：必须使用 block_number - 1 的状态，否则执行结果不正确
                                     let state_provider = blockchain_db.history_by_block_number(
-                                        std::cmp::max(task.start.checked_sub(1).unwrap_or(0), block_number.checked_sub(1).unwrap_or(0))
+                                        block_number.checked_sub(1).unwrap_or(0)
                                     )?;
                                     let inner_db = StateProviderDatabase::new(&state_provider);
                                     
@@ -2239,6 +2249,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                     
                                     // 执行单个块
                                     let _output = executor.execute(block)?;
+                                    
+                                    // 立即释放 state_provider，减少 MDBX mmap 压力
+                                    drop(state_provider);
                                     
                                     // 性能优化：移除热路径上的日志检查
                                     if should_stop_worker.load(Ordering::Relaxed) {

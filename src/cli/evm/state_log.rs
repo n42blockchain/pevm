@@ -595,20 +595,70 @@ impl MmapStateLogDatabase {
         Ok(())
     }
     
-    /// 检查块是否存在且数据有效（用于断点续传的精确检查）
+    /// 检查块是否存在且数据有效（用于补齐模式的精确检查）
     /// 如果块存在但数据损坏，返回 false（允许重新生成）
+    /// 检查项目：
+    /// 1. 块是否在索引中
+    /// 2. offset 和 length 是否在有效范围内
+    /// 3. 数据内容格式是否正确（如果有 mmap）
     pub fn block_exists(&self, block_number: u64) -> bool {
         if let Some((offset, length)) = self.index.get(&block_number) {
-            // 验证数据范围是否有效
-            let is_valid = *offset >= Self::HEADER_SIZE 
+            // 验证索引数据范围是否有效
+            let is_index_valid = *offset >= Self::HEADER_SIZE 
                 && *length > 0 
                 && *length < 10_000_000  // 单块数据不应超过 10MB
                 && (*offset + *length as u64) <= self.data_end;
             
-            if !is_valid {
-                // 数据损坏，返回 false 允许重新生成
+            if !is_index_valid {
+                // 索引数据损坏，返回 false 允许重新生成
                 return false;
             }
+            
+            // 如果有 mmap，进一步验证数据内容
+            if let Some(ref mmap) = self.mmap_data {
+                let start = *offset as usize;
+                let end = start + *length as usize;
+                
+                // 检查数据是否超出文件范围
+                if end > mmap.len() {
+                    return false;
+                }
+                
+                // 验证数据格式：前 8 字节是条目数量
+                if *length >= 8 {
+                    let data = &mmap[start..end];
+                    let entry_count = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0u8; 8]));
+                    
+                    // 条目数量应该合理（不超过 100 万）
+                    if entry_count > 1_000_000 {
+                        return false;
+                    }
+                    
+                    // 遍历条目验证格式
+                    let mut pos = 8usize;
+                    let mut count = 0u64;
+                    while pos < data.len() && count < entry_count {
+                        if pos >= data.len() {
+                            return false; // 数据不完整
+                        }
+                        let entry_len = data[pos] as usize;
+                        pos += 1;
+                        if pos + entry_len > data.len() {
+                            return false; // 条目数据不完整
+                        }
+                        pos += entry_len;
+                        count += 1;
+                    }
+                    
+                    // 验证读取的条目数是否与声明的一致
+                    if count != entry_count {
+                        return false;
+                    }
+                } else {
+                    return false; // 数据太短
+                }
+            }
+            
             true
         } else {
             false
@@ -973,6 +1023,93 @@ impl MmapStateLogDatabase {
         info!("Unique entries: {}, block range: {:?} - {:?}", 
             unique_entries.len(), min_block, max_block);
         
+        // 在检查连续性之前，先验证数据有效性（检测损坏的块）
+        info!("Validating data integrity for {} blocks...", unique_entries.len());
+        
+        // 打开数据文件用于验证
+        let data_file_for_validation = File::open(&data_file_path)?;
+        let data_mmap_for_validation = unsafe { memmap2::Mmap::map(&data_file_for_validation)? };
+        
+        let mut valid_entries: Vec<(u64, u64, u32)> = Vec::with_capacity(unique_entries.len());
+        let mut corrupted_blocks: Vec<u64> = Vec::new();
+        
+        for (block_number, offset, length) in unique_entries.iter() {
+            // 检查数据范围
+            let start = *offset as usize;
+            let end = start + *length as usize;
+            
+            if end > data_mmap_for_validation.len() {
+                corrupted_blocks.push(*block_number);
+                if corrupted_blocks.len() <= 20 {
+                    warn!("Corrupted block {} (data extends beyond file: offset={}, length={}, file_size={})", 
+                        block_number, offset, length, data_mmap_for_validation.len());
+                }
+                continue;
+            }
+            
+            let data = &data_mmap_for_validation[start..end];
+            
+            // 验证数据内容格式
+            let is_data_valid = if *length >= 8 {
+                let entry_count = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0u8; 8]));
+                // 条目数量应该合理（不超过 100 万）
+                if entry_count > 1_000_000 {
+                    false
+                } else {
+                    // 遍历条目验证格式
+                    let mut pos = 8usize;
+                    let mut valid = true;
+                    let mut count = 0u64;
+                    while pos < data.len() && count < entry_count {
+                        if pos >= data.len() {
+                            valid = false;
+                            break;
+                        }
+                        let entry_len = data[pos] as usize;
+                        pos += 1;
+                        if pos + entry_len > data.len() {
+                            valid = false;
+                            break;
+                        }
+                        pos += entry_len;
+                        count += 1;
+                    }
+                    valid && count == entry_count
+                }
+            } else {
+                false // 数据太短
+            };
+            
+            if is_data_valid {
+                valid_entries.push((*block_number, *offset, *length));
+            } else {
+                corrupted_blocks.push(*block_number);
+                if corrupted_blocks.len() <= 20 {
+                    warn!("Corrupted block {} (invalid data format)", block_number);
+                }
+            }
+        }
+        
+        drop(data_mmap_for_validation);
+        drop(data_file_for_validation);
+        
+        if !corrupted_blocks.is_empty() {
+            warn!("Found {} corrupted blocks with invalid data", corrupted_blocks.len());
+            if corrupted_blocks.len() > 20 {
+                warn!("... and {} more corrupted blocks", corrupted_blocks.len() - 20);
+            }
+        }
+        
+        info!("Data validation complete: {} valid, {} corrupted", 
+            valid_entries.len(), corrupted_blocks.len());
+        
+        // 使用验证后的有效条目替换原条目
+        let unique_entries = valid_entries;
+        
+        // 重新计算范围
+        let min_block = unique_entries.first().map(|(bn, _, _)| *bn);
+        let max_block = unique_entries.last().map(|(bn, _, _)| *bn);
+        
         // 检查块号连续性（在期望范围内）
         info!("Checking block continuity in range {} - {}...", expected_start, expected_end);
         let mut missing_blocks: Vec<u64> = Vec::new();
@@ -988,19 +1125,32 @@ impl MmapStateLogDatabase {
             if !block_set.contains(&block_num) {
                 missing_blocks.push(block_num);
                 if missing_blocks.len() <= 100 {
-                    warn!("Missing block: {}", block_num);
+                    // 区分是损坏还是缺失
+                    if corrupted_blocks.contains(&block_num) {
+                        warn!("Corrupted block: {}", block_num);
+                    } else {
+                        warn!("Missing block: {}", block_num);
+                    }
                 }
                 if missing_blocks.len() >= 1000 {
-                    warn!("Found {} missing blocks, stopping check...", missing_blocks.len());
+                    warn!("Found {} missing/corrupted blocks, stopping check...", missing_blocks.len());
                     break;
                 }
             }
         }
         
+        // 将损坏的块也添加到缺失列表（如果还没有）
+        for block_num in corrupted_blocks.iter() {
+            if !missing_blocks.contains(block_num) && *block_num >= expected_start && *block_num <= expected_end {
+                missing_blocks.push(*block_num);
+            }
+        }
+        missing_blocks.sort();
+        
         let has_missing_blocks = !missing_blocks.is_empty();
         if has_missing_blocks {
             let missing_count = missing_blocks.len();
-            warn!("Found {} missing blocks in range {} - {}", 
+            warn!("Found {} missing/corrupted blocks in range {} - {}", 
                 missing_count, check_start, check_end);
             warn!("Will continue repair with existing data. Missing blocks can be regenerated with --log-block on");
         }
@@ -1156,13 +1306,19 @@ impl MmapStateLogDatabase {
         let final_min_block = valid_entries_for_write.first().map(|(bn, _, _)| *bn);
         let final_max_block = valid_entries_for_write.last().map(|(bn, _, _)| *bn);
         
+        // 统计损坏块数量（前面验证阶段检测到的）
+        let corrupted_count = corrupted_blocks.len();
+        
         info!("=== Repair completed successfully! ===");
         info!("  - Total index entries read: {}", total_entries);
-        info!("  - Invalid index entries: {}", invalid_entries);
-        info!("  - Valid index entries: {}", unique_entries.len());
+        info!("  - Invalid index entries (bad offset/length): {}", invalid_entries);
+        info!("  - Corrupted data blocks (bad content): {}", corrupted_count);
+        info!("  - Valid entries after validation: {}", unique_entries.len());
         info!("  - Duplicate entries removed: {}", duplicate_entries);
         info!("  - Truncated entries (> {}): {}", expected_end, truncated_entries);
-        info!("  - Corrupted data blocks skipped: {}", skipped_corrupted);
+        if skipped_corrupted > 0 {
+            info!("  - Additional corrupted blocks during compaction: {}", skipped_corrupted);
+        }
         info!("  - Final valid blocks written: {}", final_valid_entries);
         info!("  - Block range: {} - {}", final_min_block.unwrap_or(0), final_max_block.unwrap_or(0));
         info!("  - Original size: {:.2} GB", data_end as f64 / 1024.0 / 1024.0 / 1024.0);
@@ -1172,16 +1328,22 @@ impl MmapStateLogDatabase {
             saved_bytes as f64 / data_end as f64 * 100.0);
         info!("  - Backup files: {:?}, {:?}", backup_data_path, backup_index_path);
         
-        // 添加损坏的块到缺失列表
-        let total_missing = missing_blocks.len() + skipped_corrupted as usize;
+        // 报告需要重新生成的块
+        let total_missing = missing_blocks.len();
         if total_missing > 0 {
-            warn!("  - Missing/corrupted blocks: {} (run with --log-block on to regenerate)", total_missing);
+            warn!("  - Missing/corrupted blocks to regenerate: {} (run with --log-block on --begin <first_missing>)", total_missing);
+            if let Some(first_missing) = missing_blocks.first() {
+                warn!("    First missing block: {}", first_missing);
+            }
+            if let Some(last_missing) = missing_blocks.last() {
+                warn!("    Last missing block: {}", last_missing);
+            }
         }
         
         Ok(RepairResult {
             total_entries,
             valid_entries: final_valid_entries,
-            invalid_entries: invalid_entries + skipped_corrupted,
+            invalid_entries: invalid_entries + corrupted_count as u64 + skipped_corrupted,
             duplicate_entries,
             truncated_entries,
             min_block: final_min_block,

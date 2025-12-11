@@ -503,8 +503,25 @@ impl MmapStateLogDatabase {
     }
     
     /// 获取所有已存在的块号（用于断点续传）
+    /// 警告：对于大数据集（>100万块），此方法会占用大量内存
+    /// 考虑使用 get_block_range() + block_exists() 代替
     pub fn get_existing_blocks(&self) -> std::collections::HashSet<u64> {
         self.index.keys().copied().collect()
+    }
+    
+    /// 获取已存在的最大块号（用于快速断点续传检查）
+    pub fn get_max_existing_block(&self) -> Option<u64> {
+        self.index.keys().max().copied()
+    }
+    
+    /// 检查块号是否在已存在的范围内
+    /// 这是一个快速的 O(1) 检查，假设块号是连续的
+    pub fn is_block_in_range(&self, block_number: u64) -> bool {
+        if let Some((min, max)) = self.get_block_range() {
+            block_number >= min && block_number <= max
+        } else {
+            false
+        }
     }
     
     /// 序列化 entries 为未压缩的二进制格式

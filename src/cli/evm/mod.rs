@@ -1839,19 +1839,22 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         
         // 检查已存在的块（支持断点续传）
         // 优先从 mmap 数据库获取，否则从文件系统索引获取
-        let (existing_blocks, cached_index_entries): (Arc<std::collections::HashSet<u64>>, Arc<Vec<IndexEntry>>) = 
+        // 内存优化：对于 mmap 模式，只保存范围信息而不是完整的 HashSet
+        let (existing_blocks_range, existing_blocks, cached_index_entries): (Option<(u64, u64)>, Arc<std::collections::HashSet<u64>>, Arc<Vec<IndexEntry>>) = 
             if let Some(ref mmap_db) = mmap_log_db {
-                // mmap 模式：从数据库索引获取已存在的块
+                // mmap 模式：使用范围检查，避免创建大 HashSet（节省数百 MB 内存）
                 let db_guard = mmap_db.read().unwrap();
-                let blocks = db_guard.get_existing_blocks();
-                if !blocks.is_empty() {
-                    let min_block = *blocks.iter().min().unwrap();
-                    let max_block = *blocks.iter().max().unwrap();
-                    info!("Resuming from mmap log: {} blocks already exist (range: {} - {})", 
-                        blocks.len(), min_block, max_block);
-                }
+                let range = db_guard.get_block_range();
+                let block_count = db_guard.block_count();
                 drop(db_guard);
-                (Arc::new(blocks), Arc::new(Vec::new())) // mmap 模式不使用 cached_index_entries
+                
+                if let Some((min_block, max_block)) = range {
+                    info!("Resuming from mmap log: {} blocks already exist (range: {} - {})", 
+                        block_count, min_block, max_block);
+                    (Some((min_block, max_block)), Arc::new(std::collections::HashSet::new()), Arc::new(Vec::new()))
+                } else {
+                    (None, Arc::new(std::collections::HashSet::new()), Arc::new(Vec::new()))
+                }
             } else if let Some(log_dir) = log_dir {
                 // 文件系统模式：从索引文件获取已存在的块
                 let (mut idx_file, _) = open_log_files(log_dir)?;
@@ -1865,14 +1868,20 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                     let max_block = *blocks.iter().max().unwrap();
                     info!("Using accumulated log files in directory: {} ({} blocks already indexed, range: {} - {})", 
                         log_dir.display(), blocks.len(), min_block, max_block);
+                    // 文件系统模式使用完整的 HashSet（块可能不连续）
+                    (Some((min_block, max_block)), Arc::new(blocks), Arc::new(index_entries))
                 } else {
                     info!("Using accumulated log files in directory: {} (no blocks indexed yet)", 
                         log_dir.display());
+                    (None, Arc::new(std::collections::HashSet::new()), Arc::new(index_entries))
                 }
-                (Arc::new(blocks), Arc::new(index_entries))
             } else {
-                (Arc::new(std::collections::HashSet::new()), Arc::new(Vec::new()))
+                (None, Arc::new(std::collections::HashSet::new()), Arc::new(Vec::new()))
             };
+        
+        // 内存优化：对于 mmap 模式，使用范围检查而不是 HashSet
+        // 这假设块号是连续的，对于日志记录模式通常成立
+        let use_range_check = mmap_log_db.is_some() && existing_blocks_range.is_some();
         
         // 创建全局缓冲写入器（仅在文件系统模式下使用，mmap 模式不需要）
         let buffered_writer: Option<Arc<Mutex<BufferedLogWriter>>> = if mmap_log_db.is_none() {
@@ -1918,6 +1927,22 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         // 步骤4: 创建任务池
         // 只有在 --log-block on 模式下才跳过已存在的块（断点续传）
         // --use-log on 模式下不跳过，因为要执行所有块
+        
+        // 内存优化：定义块存在检查函数
+        // 对于 mmap 模式使用范围检查（O(1)，内存友好）
+        // 对于文件系统模式使用 HashSet 检查（支持非连续块）
+        let block_exists = |block_num: u64| -> bool {
+            if use_range_check {
+                if let Some((min, max)) = existing_blocks_range {
+                    block_num >= min && block_num <= max
+                } else {
+                    false
+                }
+            } else {
+                existing_blocks.contains(&block_num)
+            }
+        };
+        
         let mut tasks = VecDeque::new();
         let mut current_start = self.begin_number;
         while current_start <= self.end_number {
@@ -1925,7 +1950,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             if let Some(_log_dir) = log_dir {
                 if log_block_enabled {
                     // 找到下一个不存在的块
-                    while current_start <= self.end_number && existing_blocks.contains(&current_start) {
+                    while current_start <= self.end_number && block_exists(current_start) {
                         current_start += 1;
                     }
                     if current_start > self.end_number {
@@ -1943,7 +1968,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             if let Some(_log_dir) = log_dir {
                 if log_block_enabled {
                     // 调整 end，确保不包含已存在的块
-                    while current_end >= current_start && existing_blocks.contains(&current_end) {
+                    while current_end >= current_start && block_exists(current_end) {
                         current_end -= 1;
                     }
                     if current_end < current_start {
@@ -2103,7 +2128,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             let log_block_enabled = self.log_block.as_ref().map(|s| s == "on").unwrap_or(false);
             let use_log_enabled = self.use_log.as_ref().map(|s| s == "on").unwrap_or(false);
             let single_thread = self.single_thread;
+            // 内存优化：对于 mmap 模式，传递范围信息而不是完整的 HashSet
             let existing_blocks_clone = Arc::clone(&existing_blocks);
+            let existing_blocks_range_clone = existing_blocks_range;
+            let use_range_check_clone = use_range_check;
             let cached_index_entries_clone = Arc::clone(&cached_index_entries);
             let buffered_writer_clone = buffered_writer.clone();
             let global_log_file_handle_clone = global_log_file_handle.clone();
@@ -2176,6 +2204,19 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             let blocks = blockchain_db.block_with_senders_range(task.start..=task.end).unwrap();
 
                             // 步骤4: 如果使用累加模式且启用了日志记录（--log-block on），过滤掉已存在的块（断点续传）
+                            // 内存优化：使用范围检查或 HashSet 检查
+                            let worker_block_exists = |block_num: u64| -> bool {
+                                if use_range_check_clone {
+                                    if let Some((min, max)) = existing_blocks_range_clone {
+                                        block_num >= min && block_num <= max
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    existing_blocks_clone.contains(&block_num)
+                                }
+                            };
+                            
                             // 先收集需要处理的块号，用于统计
                             let blocks_to_process_numbers: Vec<u64> = if let Some(_log_dir) = &log_dir_clone {
                                 if log_block_enabled {
@@ -2183,7 +2224,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                     blocks.iter()
                                         .filter(|block| {
                                             let block_num = block.sealed_block().header().number;
-                                            !existing_blocks_clone.contains(&block_num)
+                                            !worker_block_exists(block_num)
                                         })
                                         .map(|block| block.sealed_block().header().number)
                                         .collect::<Vec<u64>>()
@@ -2226,7 +2267,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                     
                                     // 如果使用累加模式且块已存在，跳过
                                     if let Some(_log_dir) = &log_dir_clone {
-                                        if existing_blocks_clone.contains(&block_number) {
+                                        if worker_block_exists(block_number) {
                                             continue;
                                         }
                                     }
@@ -2274,10 +2315,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                 if let Some(ref db) = mmap_log_db_clone {
                                     // mmap 日志模式：批量写入（零拷贝，适合大数据集）
                                     let mut db_guard = db.write().unwrap();
-                                    let batch: Vec<(u64, Vec<ReadLogEntry>)> = block_logs.iter()
-                                        .map(|(bn, logs)| (*bn, logs.clone()))
-                                        .collect();
-                                    db_guard.write_block_logs_batch(&batch)?;
+                                    // 直接传递引用，避免不必要的 clone
+                                    db_guard.write_block_logs_batch(&block_logs)?;
                                 } else if let Some(ref writer) = buffered_writer_clone {
                                     // 文件系统模式：使用缓冲写入
                                     let mut writer_guard = writer.lock().unwrap();
@@ -2635,7 +2674,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         let block_num = block.sealed_block().header().number;
                                         if let Some(_log_dir) = &log_dir_clone {
                                             if log_block_enabled {
-                                                !existing_blocks_clone.contains(&block_num)
+                                                !worker_block_exists(block_num)
                                             } else {
                                                 true // 其他模式，统计所有块
                                             }
@@ -2748,8 +2787,19 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 // 尝试解析为块号
                 if let Ok(log_block) = log_block_str.parse::<u64>() {
                     // 如果使用累加模式，检查块是否已存在（断点续传）
+                    // 内存优化：使用范围检查或 HashSet 检查
+                    let single_block_exists = if use_range_check {
+                        if let Some((min, max)) = existing_blocks_range {
+                            log_block >= min && log_block <= max
+                        } else {
+                            false
+                        }
+                    } else {
+                        existing_blocks.contains(&log_block)
+                    };
+                    
                     if let Some(_log_dir) = log_dir {
-                        if existing_blocks.contains(&log_block) {
+                        if single_block_exists {
                             info!("Block {} already exists in log files, skipping log recording", log_block);
                             return Ok(());
                         } else {

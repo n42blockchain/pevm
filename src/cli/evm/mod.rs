@@ -1965,11 +1965,16 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         // 只有在 --log-block on 模式下才跳过已存在的块（断点续传）
         // --use-log on 模式下不跳过，因为要执行所有块
         
-        // 内存优化：定义块存在检查函数
-        // 对于 mmap 模式使用范围检查（O(1)，内存友好）
-        // 对于文件系统模式使用 HashSet 检查（支持非连续块）
+        // 定义块存在检查函数
+        // 优先使用 mmap_log_db 的精确检查（支持检测损坏块）
+        // 对于文件系统模式使用 HashSet 检查
         let block_exists = |block_num: u64| -> bool {
-            if use_range_check {
+            if let Some(ref mmap_db) = mmap_log_db {
+                // mmap 模式：精确检查块是否存在且数据有效
+                let db_guard = mmap_db.read().unwrap();
+                db_guard.block_exists(block_num)
+            } else if use_range_check {
+                // 回退到范围检查（不应该发生，因为 use_range_check 需要 mmap_log_db）
                 if let Some((min, max)) = existing_blocks_range {
                     block_num >= min && block_num <= max
                 } else {
@@ -2248,9 +2253,14 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             // 这样可以正确处理不连续的块（有缺失块的情况）
                             let worker_block_exists = |block_num: u64| -> bool {
                                 if let Some(ref db) = mmap_log_db_clone {
-                                    // mmap 模式：精确检查块是否存在
+                                    // mmap 模式：精确检查块是否存在且数据有效
                                     let db_guard = db.read().unwrap();
-                                    db_guard.block_exists(block_num)
+                                    let exists = db_guard.block_exists(block_num);
+                                    // 调试：如果块不存在，记录日志（只记录任务范围内的第一个）
+                                    if !exists && block_num == task.start {
+                                        debug!(target: "exex::evm", "Block {} does not exist or is corrupted, will process", block_num);
+                                    }
+                                    exists
                                 } else if use_range_check_clone {
                                     // 回退到范围检查（不应该发生）
                                     if let Some((min, max)) = existing_blocks_range_clone {

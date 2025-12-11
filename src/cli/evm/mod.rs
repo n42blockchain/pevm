@@ -2144,7 +2144,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                         );
                     }
 
-                    if *current_block_counter >= (end_number - begin_number + 1) {
+                    // 检查是否已经处理完所有块
+                    // current_block_counter 存储的是实际块号，所以要与 end_number 比较
+                    if *current_block_counter >= end_number {
+                        info!("All blocks processed, status thread exiting");
                         break;
                     }
                 }

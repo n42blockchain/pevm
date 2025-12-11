@@ -1958,66 +1958,19 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             eyre::bail!("The end block number is higher than the latest block number")
         }
 
-        // 检查是否启用日志记录模式（用于决定是否跳过已存在的块）
-        let log_block_enabled = self.log_block.as_ref().map(|s| s == "on").unwrap_or(false);
-        
         // 步骤4: 创建任务池
-        // 只有在 --log-block on 模式下才跳过已存在的块（断点续传）
-        // --use-log on 模式下不跳过，因为要执行所有块
-        
-        // 定义块存在检查函数
-        // 优先使用 mmap_log_db 的精确检查（支持检测损坏块）
-        // 对于文件系统模式使用 HashSet 检查
-        let block_exists = |block_num: u64| -> bool {
-            if let Some(ref mmap_db) = mmap_log_db {
-                // mmap 模式：精确检查块是否存在且数据有效
-                let db_guard = mmap_db.read().unwrap();
-                db_guard.block_exists(block_num)
-            } else if use_range_check {
-                // 回退到范围检查（不应该发生，因为 use_range_check 需要 mmap_log_db）
-                if let Some((min, max)) = existing_blocks_range {
-                    block_num >= min && block_num <= max
-                } else {
-                    false
-                }
-            } else {
-                existing_blocks.contains(&block_num)
-            }
-        };
+        // 取消续传逻辑：从 --begin 开始创建所有任务
+        // 块级别的过滤在 worker 线程中进行（只处理不存在的块，补齐模式）
         
         let mut tasks = VecDeque::new();
         let mut current_start = self.begin_number;
         while current_start <= self.end_number {
-            // 如果使用累加模式且启用了日志记录（--log-block on），跳过已存在的块（断点续传）
-            if let Some(_log_dir) = log_dir {
-                if log_block_enabled {
-                    // 找到下一个不存在的块
-                    while current_start <= self.end_number && block_exists(current_start) {
-                        current_start += 1;
-                    }
-                    if current_start > self.end_number {
-                        break; // 所有块都已存在
-                    }
-                }
-            }
+            // 取消续传逻辑：从 --begin 开始创建所有任务，不跳过已存在的块
+            // 实际的块级别过滤在 worker 线程中进行（只处理不存在的块，补齐模式）
             
             let mut current_end = std::cmp::min(current_start + self.step_size as u64 - 1, self.end_number);
             if current_end == self.end_number - 1 {
                 current_end += 1;
-            }
-            
-            // 如果使用累加模式且启用了日志记录（--log-block on），确保任务范围不包含已存在的块
-            if let Some(_log_dir) = log_dir {
-                if log_block_enabled {
-                    // 调整 end，确保不包含已存在的块
-                    while current_end >= current_start && block_exists(current_end) {
-                        current_end -= 1;
-                    }
-                    if current_end < current_start {
-                        current_start = current_end + 1;
-                        continue;
-                    }
-                }
             }
             
             tasks.push_back(Task {
@@ -2025,13 +1978,6 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 end: current_end,
             });
             current_start = current_end + 1;
-        }
-        
-        // 只有在 --log-block on 模式下，如果所有块都已存在才返回
-        if tasks.is_empty() && log_dir.is_some() && log_block_enabled {
-            info!("All blocks from {} to {} already exist in log files, nothing to do", 
-                self.begin_number, self.end_number);
-            return Ok(());
         }
 
 

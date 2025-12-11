@@ -587,6 +587,7 @@ pub struct RepairResult {
     pub valid_entries: u64,
     pub invalid_entries: u64,
     pub duplicate_entries: u64,
+    pub truncated_entries: u64,
     pub min_block: Option<u64>,
     pub max_block: Option<u64>,
     pub missing_blocks: Vec<u64>,
@@ -684,6 +685,7 @@ impl MmapStateLogDatabase {
                 valid_entries: 0,
                 invalid_entries,
                 duplicate_entries: 0,
+                truncated_entries: 0,
                 min_block: None,
                 max_block: None,
                 missing_blocks: Vec::new(),
@@ -697,12 +699,19 @@ impl MmapStateLogDatabase {
         all_entries.sort_by_key(|(bn, _, _)| *bn);
         
         // 检查重复并构建去重后的索引
-        info!("Checking for duplicates...");
+        info!("Checking for duplicates and filtering by range...");
         let mut unique_entries: Vec<(u64, u64, u32)> = Vec::with_capacity(all_entries.len());
         let mut duplicate_entries = 0u64;
+        let mut truncated_entries = 0u64;
         let mut last_block: Option<u64> = None;
         
         for (block_number, offset, length) in all_entries.iter() {
+            // 截断：忽略大于 expected_end 的块
+            if *block_number > expected_end {
+                truncated_entries += 1;
+                continue;
+            }
+            
             if last_block == Some(*block_number) {
                 duplicate_entries += 1;
                 // 保留后一个（可能是更新的数据）
@@ -710,6 +719,10 @@ impl MmapStateLogDatabase {
             }
             unique_entries.push((*block_number, *offset, *length));
             last_block = Some(*block_number);
+        }
+        
+        if truncated_entries > 0 {
+            info!("Truncated {} entries with block number > {}", truncated_entries, expected_end);
         }
         
         if duplicate_entries > 0 {
@@ -757,6 +770,7 @@ impl MmapStateLogDatabase {
                 valid_entries: unique_entries.len() as u64,
                 invalid_entries,
                 duplicate_entries,
+                truncated_entries,
                 min_block,
                 max_block,
                 missing_blocks,
@@ -809,6 +823,7 @@ impl MmapStateLogDatabase {
                     valid_entries: processed,
                     invalid_entries,
                     duplicate_entries,
+                    truncated_entries,
                     min_block,
                     max_block,
                     missing_blocks: vec![*block_number],
@@ -867,6 +882,7 @@ impl MmapStateLogDatabase {
         info!("  - Valid entries: {}", unique_entries.len());
         info!("  - Invalid entries removed: {}", invalid_entries);
         info!("  - Duplicate entries removed: {}", duplicate_entries);
+        info!("  - Truncated entries (> {}): {}", expected_end, truncated_entries);
         info!("  - Block range: {} - {}", min_block.unwrap_or(0), max_block.unwrap_or(0));
         info!("  - Original size: {:.2} GB", data_end as f64 / 1024.0 / 1024.0 / 1024.0);
         info!("  - Compacted size: {:.2} GB", new_data_size as f64 / 1024.0 / 1024.0 / 1024.0);
@@ -880,6 +896,7 @@ impl MmapStateLogDatabase {
             valid_entries: unique_entries.len() as u64,
             invalid_entries,
             duplicate_entries,
+            truncated_entries,
             min_block,
             max_block,
             missing_blocks: Vec::new(),

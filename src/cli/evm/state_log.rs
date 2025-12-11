@@ -884,24 +884,12 @@ impl MmapStateLogDatabase {
             }
         }
         
-        if !missing_blocks.is_empty() {
+        let has_missing_blocks = !missing_blocks.is_empty();
+        if has_missing_blocks {
             let missing_count = missing_blocks.len();
-            error!("Found {} missing blocks in range {} - {}", 
+            warn!("Found {} missing blocks in range {} - {}", 
                 missing_count, check_start, check_end);
-            error!("Repair aborted. Please re-run log generation for missing blocks.");
-            
-            return Ok(RepairResult {
-                total_entries,
-                valid_entries: unique_entries.len() as u64,
-                invalid_entries,
-                duplicate_entries,
-                truncated_entries,
-                min_block,
-                max_block,
-                missing_blocks,
-                repaired: false,
-                error_message: Some(format!("Found {} missing blocks", missing_count)),
-            });
+            warn!("Will continue repair with existing data. Missing blocks can be regenerated with --log-block on");
         }
         
         // 开始整理：按块号顺序紧密排列数据
@@ -1016,6 +1004,11 @@ impl MmapStateLogDatabase {
             saved_bytes as f64 / data_end as f64 * 100.0);
         info!("  - Backup files: {:?}, {:?}", backup_data_path, backup_index_path);
         
+        let missing_count = missing_blocks.len();
+        if has_missing_blocks {
+            warn!("  - Missing blocks: {} (run with --log-block on to regenerate)", missing_count);
+        }
+        
         Ok(RepairResult {
             total_entries,
             valid_entries: unique_entries.len() as u64,
@@ -1024,9 +1017,13 @@ impl MmapStateLogDatabase {
             truncated_entries,
             min_block,
             max_block,
-            missing_blocks: Vec::new(),
+            missing_blocks,
             repaired: true,
-            error_message: None,
+            error_message: if has_missing_blocks { 
+                Some(format!("{} missing blocks need to be regenerated", missing_count))
+            } else { 
+                None 
+            },
         })
     }
 }

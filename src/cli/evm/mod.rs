@@ -1874,24 +1874,25 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             None
         };
         
-        // 检查已存在的块（支持断点续传）
-        // 优先从 mmap 数据库获取，否则从文件系统索引获取
-        // 内存优化：对于 mmap 模式，只保存范围信息而不是完整的 HashSet
-        let (existing_blocks_range, existing_blocks, cached_index_entries): (Option<(u64, u64)>, Arc<std::collections::HashSet<u64>>, Arc<Vec<IndexEntry>>) = 
+        // 检查已存在的块（用于补齐模式：只生成不存在或损坏的块）
+        // mmap 模式：使用 block_exists() 精确检查（包括损坏检测）
+        // 文件系统模式：使用 HashSet 检查
+        let (existing_blocks, cached_index_entries): (Arc<std::collections::HashSet<u64>>, Arc<Vec<IndexEntry>>) = 
             if let Some(ref mmap_db) = mmap_log_db {
-                // mmap 模式：使用范围检查，避免创建大 HashSet（节省数百 MB 内存）
+                // mmap 模式：显示范围信息（实际检查使用 block_exists()）
                 let db_guard = mmap_db.read().unwrap();
                 let range = db_guard.get_block_range();
                 let block_count = db_guard.block_count();
                 drop(db_guard);
                 
                 if let Some((min_block, max_block)) = range {
-                    info!("Resuming from mmap log: {} blocks already exist (range: {} - {})", 
+                    info!("Found mmap log: {} blocks indexed (range: {} - {}), will fill in missing/corrupted blocks", 
                         block_count, min_block, max_block);
-                    (Some((min_block, max_block)), Arc::new(std::collections::HashSet::new()), Arc::new(Vec::new()))
                 } else {
-                    (None, Arc::new(std::collections::HashSet::new()), Arc::new(Vec::new()))
+                    info!("Mmap log is empty, will generate all blocks from --begin");
                 }
+                // mmap 模式不需要 HashSet，使用 block_exists() 精确检查
+                (Arc::new(std::collections::HashSet::new()), Arc::new(Vec::new()))
             } else if let Some(log_dir) = log_dir {
                 // 文件系统模式：从索引文件获取已存在的块
                 let (mut idx_file, _) = open_log_files(log_dir)?;
@@ -1903,22 +1904,17 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 if !blocks.is_empty() {
                     let min_block = *blocks.iter().min().unwrap();
                     let max_block = *blocks.iter().max().unwrap();
-                    info!("Using accumulated log files in directory: {} ({} blocks already indexed, range: {} - {})", 
+                    info!("Found log files: {} ({} blocks indexed, range: {} - {}), will fill in missing blocks", 
                         log_dir.display(), blocks.len(), min_block, max_block);
-                    // 文件系统模式使用完整的 HashSet（块可能不连续）
-                    (Some((min_block, max_block)), Arc::new(blocks), Arc::new(index_entries))
                 } else {
-                    info!("Using accumulated log files in directory: {} (no blocks indexed yet)", 
+                    info!("Log directory is empty: {}, will generate all blocks from --begin", 
                         log_dir.display());
-                    (None, Arc::new(std::collections::HashSet::new()), Arc::new(index_entries))
                 }
+                // 文件系统模式使用完整的 HashSet（块可能不连续）
+                (Arc::new(blocks), Arc::new(index_entries))
             } else {
-                (None, Arc::new(std::collections::HashSet::new()), Arc::new(Vec::new()))
+                (Arc::new(std::collections::HashSet::new()), Arc::new(Vec::new()))
             };
-        
-        // 内存优化：对于 mmap 模式，使用范围检查而不是 HashSet
-        // 这假设块号是连续的，对于日志记录模式通常成立
-        let use_range_check = mmap_log_db.is_some() && existing_blocks_range.is_some();
         
         // 创建全局缓冲写入器（仅在文件系统模式下使用，mmap 模式不需要）
         let buffered_writer: Option<Arc<Mutex<BufferedLogWriter>>> = if mmap_log_db.is_none() {
@@ -2119,10 +2115,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             let log_block_enabled = self.log_block.as_ref().map(|s| s == "on").unwrap_or(false);
             let use_log_enabled = self.use_log.as_ref().map(|s| s == "on").unwrap_or(false);
             let single_thread = self.single_thread;
-            // 内存优化：对于 mmap 模式，传递范围信息而不是完整的 HashSet
+            // 传递已存在块的 HashSet（用于文件系统模式的块存在检查）
             let existing_blocks_clone = Arc::clone(&existing_blocks);
-            let existing_blocks_range_clone = existing_blocks_range;
-            let use_range_check_clone = use_range_check;
             let cached_index_entries_clone = Arc::clone(&cached_index_entries);
             let buffered_writer_clone = buffered_writer.clone();
             let global_log_file_handle_clone = global_log_file_handle.clone();
@@ -2197,24 +2191,21 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             // 步骤4: 如果使用累加模式且启用了日志记录（--log-block on），过滤掉已存在的块（断点续传）
                             // 精确检查：使用 mmap_log_db 的 block_exists() 方法
                             // 这样可以正确处理不连续的块（有缺失块的情况）
+                            // 块存在检查函数（用于补齐模式：跳过已存在且有效的块）
+                            // mmap 模式：使用 block_exists() 精确检查（包括损坏检测）
+                            // 文件系统模式：使用 HashSet 检查
                             let worker_block_exists = |block_num: u64| -> bool {
                                 if let Some(ref db) = mmap_log_db_clone {
-                                    // mmap 模式：精确检查块是否存在且数据有效
+                                    // mmap 模式：精确检查块是否存在且数据有效（包括损坏检测）
                                     let db_guard = db.read().unwrap();
                                     let exists = db_guard.block_exists(block_num);
-                                    // 调试：如果块不存在，记录日志（只记录任务范围内的第一个）
+                                    // 调试：如果块不存在或损坏，记录日志
                                     if !exists && block_num == task.start {
-                                        debug!(target: "exex::evm", "Block {} does not exist or is corrupted, will process", block_num);
+                                        debug!(target: "exex::evm", "Block {} does not exist or is corrupted in mmap log, will process", block_num);
                                     }
                                     exists
-                                } else if use_range_check_clone {
-                                    // 回退到范围检查（不应该发生）
-                                    if let Some((min, max)) = existing_blocks_range_clone {
-                                        block_num >= min && block_num <= max
-                                    } else {
-                                        false
-                                    }
                                 } else {
+                                    // 文件系统模式：使用 HashSet 检查
                                     existing_blocks_clone.contains(&block_num)
                                 }
                             };
@@ -2788,24 +2779,22 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             if log_block_str != "on" {
                 // 尝试解析为块号
                 if let Ok(log_block) = log_block_str.parse::<u64>() {
-                    // 如果使用累加模式，检查块是否已存在（断点续传）
-                    // 内存优化：使用范围检查或 HashSet 检查
-                    let single_block_exists = if use_range_check {
-                        if let Some((min, max)) = existing_blocks_range {
-                            log_block >= min && log_block <= max
-                        } else {
-                            false
-                        }
+                    // 检查块是否已存在且数据有效（用于补齐模式）
+                    // mmap 模式：使用 block_exists() 精确检查（包括损坏检测）
+                    // 文件系统模式：使用 HashSet 检查
+                    let single_block_exists = if let Some(ref mmap_db) = mmap_log_db {
+                        let db_guard = mmap_db.read().unwrap();
+                        db_guard.block_exists(log_block)
                     } else {
                         existing_blocks.contains(&log_block)
                     };
                     
                     if let Some(_log_dir) = log_dir {
                         if single_block_exists {
-                            info!("Block {} already exists in log files, skipping log recording", log_block);
+                            info!("Block {} already exists in log files (valid data), skipping log recording", log_block);
                             return Ok(());
                         } else {
-                            info!("Starting log recording for block {} (will be added to accumulated log files)", log_block);
+                            info!("Starting log recording for block {} (will fill in missing/corrupted block)", log_block);
                         }
                     } else {
                         info!("Starting log recording for block {}", log_block);

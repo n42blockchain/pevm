@@ -36,8 +36,9 @@ use super::ReadLogEntry;
 /// - 索引文件独立存储，追加写入
 /// - 只读时使用 mmap，写入时使用普通文件 I/O
 /// - 避免 Windows mmap 扩展文件的问题
+/// - 写入模式下不重新映射，避免 Windows STATUS_IN_PAGE_ERROR
 pub struct MmapStateLogDatabase {
-    /// 数据文件的内存映射（只读）
+    /// 数据文件的内存映射（只读，写入模式下可能为 None）
     mmap_data: Option<memmap2::Mmap>,
     /// 索引：block_number -> (offset, length)
     index: HashMap<u64, (u64, u32)>,
@@ -53,6 +54,8 @@ pub struct MmapStateLogDatabase {
     pending_writes: Vec<(u64, Vec<u8>)>,
     /// 是否为只读模式
     read_only: bool,
+    /// 是否为写入模式（写入模式下 flush 后不重新映射）
+    write_mode: bool,
 }
 
 impl std::fmt::Debug for MmapStateLogDatabase {
@@ -229,6 +232,7 @@ impl MmapStateLogDatabase {
             dirty: false,
             pending_writes: Vec::new(),
             read_only: false,
+            write_mode: false,
         })
     }
     
@@ -272,7 +276,18 @@ impl MmapStateLogDatabase {
             dirty: false,
             pending_writes: Vec::new(),
             read_only: false,
+            write_mode: false,
         })
+    }
+    
+    /// 设置写入模式（写入模式下 flush 后不重新映射，避免 Windows STATUS_IN_PAGE_ERROR）
+    pub fn set_write_mode(&mut self, write_mode: bool) {
+        self.write_mode = write_mode;
+        if write_mode {
+            // 写入模式下释放 mmap，避免文件锁冲突
+            self.mmap_data = None;
+            info!("MmapStateLogDatabase: write mode enabled, mmap released");
+        }
     }
     
     /// 读取块的日志数据（零拷贝）
@@ -401,11 +416,15 @@ impl MmapStateLogDatabase {
         self.data_end = current_offset;
         self.dirty = false;
         
-        // 重新打开 mmap（只读）
-        // 注意：这里我们先 drop 旧的 mmap，再创建新的，避免文件锁冲突
-        self.mmap_data = None;
-        let data_file = File::open(&self.data_file_path)?;
-        self.mmap_data = Some(unsafe { memmap2::Mmap::map(&data_file)? });
+        // 写入模式下不重新映射（避免 Windows STATUS_IN_PAGE_ERROR）
+        // 只有在需要读取数据时才重新映射
+        if !self.write_mode {
+            // 重新打开 mmap（只读）
+            // 注意：这里我们先 drop 旧的 mmap，再创建新的，避免文件锁冲突
+            self.mmap_data = None;
+            let data_file = File::open(&self.data_file_path)?;
+            self.mmap_data = Some(unsafe { memmap2::Mmap::map(&data_file)? });
+        }
         
         info!("MmapStateLogDatabase flushed (v2): {} new blocks, {} total blocks, data_end={}", 
             pending_count, self.index.len(), self.data_end);

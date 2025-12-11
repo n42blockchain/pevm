@@ -138,7 +138,6 @@ mod windows_profiler {
             }
             
             // 使用 inferno 生成火焰图
-            use inferno::flamegraph;
             use std::io::Write;
             
             // 创建堆栈数据（inferno 格式：func1;func2;func3 count）

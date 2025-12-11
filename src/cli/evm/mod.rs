@@ -1802,18 +1802,22 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         // mmap 模式优先于文件系统模式（更适合大数据集，支持断点续传）
         let mmap_log_db: Option<Arc<std::sync::RwLock<MmapStateLogDatabase>>> = if self.use_mmap_log {
             if let Some(log_dir) = log_dir {
-                match MmapStateLogDatabase::open(log_dir) {
-                    Ok(mut db) => {
+                // 根据模式选择不同的打开方式：
+                // - 写入模式（--log-block on）：不创建 mmap，避免 Windows 大文件 mmap 问题
+                // - 读取模式（--use-log on）：创建 mmap 用于快速读取
+                let db_result = if log_block_enabled {
+                    MmapStateLogDatabase::open_for_write(log_dir)
+                } else {
+                    MmapStateLogDatabase::open(log_dir)
+                };
+                
+                match db_result {
+                    Ok(db) => {
                         if let Some((min, max)) = db.get_block_range() {
                             info!("Using mmap-based state log storage (--mmap-log mode): {} blocks, range {} - {}", 
                                 db.block_count(), min, max);
                         } else {
                             info!("Using mmap-based state log storage (--mmap-log mode): empty database");
-                        }
-                        // 如果是日志生成模式（--log-block on），启用写入模式
-                        // 写入模式下 flush 后不重新映射，避免 Windows STATUS_IN_PAGE_ERROR
-                        if log_block_enabled {
-                            db.set_write_mode(true);
                         }
                         Some(Arc::new(std::sync::RwLock::new(db)))
                     }

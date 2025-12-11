@@ -83,8 +83,18 @@ impl MmapStateLogDatabase {
     /// 索引条目大小
     const INDEX_ENTRY_SIZE: u64 = 20;
     
-    /// 打开或创建内存映射状态日志数据库
+    /// 打开或创建内存映射状态日志数据库（读取模式，会创建 mmap）
     pub fn open(log_dir: &Path) -> eyre::Result<Self> {
+        Self::open_internal(log_dir, false)
+    }
+    
+    /// 打开或创建内存映射状态日志数据库（写入模式，不创建 mmap，避免 Windows 大文件 mmap 问题）
+    pub fn open_for_write(log_dir: &Path) -> eyre::Result<Self> {
+        Self::open_internal(log_dir, true)
+    }
+    
+    /// 内部打开方法
+    fn open_internal(log_dir: &Path, write_mode: bool) -> eyre::Result<Self> {
         let data_file_path = log_dir.join("state_logs_data.bin");
         let index_file_path = log_dir.join("state_logs_index.bin");
         std::fs::create_dir_all(log_dir)?;
@@ -97,9 +107,9 @@ impl MmapStateLogDatabase {
         }
         
         if data_file_path.exists() && index_file_path.exists() {
-            Self::open_existing(&data_file_path, &index_file_path)
+            Self::open_existing(&data_file_path, &index_file_path, write_mode)
         } else {
-            Self::create_new(&data_file_path, &index_file_path)
+            Self::create_new(&data_file_path, &index_file_path, write_mode)
         }
     }
     
@@ -168,27 +178,26 @@ impl MmapStateLogDatabase {
     }
     
     /// 打开已存在的文件
-    fn open_existing(data_path: &Path, index_path: &Path) -> eyre::Result<Self> {
-        // 打开数据文件
-        let data_file = File::open(data_path)?;
-        let data_mmap = unsafe { memmap2::Mmap::map(&data_file)? };
+    fn open_existing(data_path: &Path, index_path: &Path, write_mode: bool) -> eyre::Result<Self> {
+        // 获取数据文件大小（不需要 mmap）
+        let data_file_metadata = std::fs::metadata(data_path)?;
+        let data_end = data_file_metadata.len();
         
-        // 验证数据文件头部
-        if data_mmap.len() < Self::HEADER_SIZE as usize {
-            return Err(eyre::eyre!("Data file too small"));
-        }
+        // 验证数据文件头部（读取前 32 字节即可）
+        let mut data_file = File::open(data_path)?;
+        let mut header_buf = [0u8; 32];
+        data_file.read_exact(&mut header_buf)?;
         
-        let magic = &data_mmap[0..8];
+        let magic = &header_buf[0..8];
         if magic != Self::MAGIC_DATA {
             return Err(eyre::eyre!("Invalid data file format (magic mismatch)"));
         }
         
-        let version = u32::from_le_bytes(data_mmap[8..12].try_into().unwrap());
+        let version = u32::from_le_bytes(header_buf[8..12].try_into().unwrap());
         if version != Self::VERSION {
             return Err(eyre::eyre!("Unsupported version: {}", version));
         }
-        
-        let data_end = data_mmap.len() as u64;
+        drop(data_file); // 关闭文件
         
         // 读取索引文件
         let mut index_file = File::open(index_path)?;
@@ -235,16 +244,27 @@ impl MmapStateLogDatabase {
             }
         }
         
-        // 如果实际读取的条目数与头部不一致，更新头部
+        // 如果实际读取的条目数与头部不一致，记录日志
         if index.len() as u64 != header_block_count {
             info!("Index recovery: found {} entries (header said {}), will update header on next flush", 
                 index.len(), header_block_count);
         }
         
-        info!("MmapStateLogDatabase opened (v2): {} blocks, data_end={}", index.len(), data_end);
+        // 只有在读取模式下才创建 mmap（避免 Windows 大文件 mmap 问题）
+        let mmap_data = if write_mode {
+            info!("MmapStateLogDatabase opened in WRITE mode (v2): {} blocks, data_end={} (no mmap)", 
+                index.len(), data_end);
+            None
+        } else {
+            let data_file = File::open(data_path)?;
+            let mmap = unsafe { memmap2::Mmap::map(&data_file)? };
+            info!("MmapStateLogDatabase opened in READ mode (v2): {} blocks, data_end={}", 
+                index.len(), data_end);
+            Some(mmap)
+        };
         
         Ok(Self {
-            mmap_data: Some(data_mmap),
+            mmap_data,
             index,
             data_file_path: data_path.to_path_buf(),
             index_file_path: index_path.to_path_buf(),
@@ -252,12 +272,12 @@ impl MmapStateLogDatabase {
             dirty: false,
             pending_writes: Vec::new(),
             read_only: false,
-            write_mode: false,
+            write_mode,
         })
     }
     
     /// 创建新文件
-    fn create_new(data_path: &Path, index_path: &Path) -> eyre::Result<Self> {
+    fn create_new(data_path: &Path, index_path: &Path, write_mode: bool) -> eyre::Result<Self> {
         // 创建数据文件
         let mut data_file = File::create(data_path)?;
         
@@ -281,14 +301,19 @@ impl MmapStateLogDatabase {
         index_file.flush()?;
         drop(index_file);
         
-        // 打开数据文件用于 mmap
-        let data_file = File::open(data_path)?;
-        let mmap_data = unsafe { memmap2::Mmap::map(&data_file)? };
-        
-        info!("MmapStateLogDatabase created (v2)");
+        // 只有在读取模式下才创建 mmap
+        let mmap_data = if write_mode {
+            info!("MmapStateLogDatabase created in WRITE mode (v2, no mmap)");
+            None
+        } else {
+            let data_file = File::open(data_path)?;
+            let mmap = unsafe { memmap2::Mmap::map(&data_file)? };
+            info!("MmapStateLogDatabase created in READ mode (v2)");
+            Some(mmap)
+        };
         
         Ok(Self {
-            mmap_data: Some(mmap_data),
+            mmap_data,
             index: HashMap::new(),
             data_file_path: data_path.to_path_buf(),
             index_file_path: index_path.to_path_buf(),
@@ -296,18 +321,8 @@ impl MmapStateLogDatabase {
             dirty: false,
             pending_writes: Vec::new(),
             read_only: false,
-            write_mode: false,
+            write_mode,
         })
-    }
-    
-    /// 设置写入模式（写入模式下 flush 后不重新映射，避免 Windows STATUS_IN_PAGE_ERROR）
-    pub fn set_write_mode(&mut self, write_mode: bool) {
-        self.write_mode = write_mode;
-        if write_mode {
-            // 写入模式下释放 mmap，避免文件锁冲突
-            self.mmap_data = None;
-            info!("MmapStateLogDatabase: write mode enabled, mmap released");
-        }
     }
     
     /// 读取块的日志数据（零拷贝）

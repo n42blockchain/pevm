@@ -478,58 +478,88 @@ impl MmapStateLogDatabase {
         
         let pending_count = self.pending_writes.len();
         
-        // 计算新数据大小
-        let _new_data_size: u64 = self.pending_writes.iter()
-            .map(|(_, data)| data.len() as u64)
-            .sum();
+        // 同步写入策略：使用缓冲写入提高效率，每 1000 个块同步刷盘
+        // 每 10000 个块更新头部，确保崩溃时头部信息也是最新的
         
-        // 打开数据文件进行追加写入（使用 BufWriter 提高性能）
+        // 打开数据文件进行追加写入（使用 BufWriter 提高效率）
         let data_file = OpenOptions::new()
             .write(true)
             .append(true)
             .open(&self.data_file_path)?;
-        let mut data_writer = BufWriter::with_capacity(1024 * 1024, data_file); // 1MB buffer
+        let mut data_writer = BufWriter::with_capacity(4 * 1024 * 1024, data_file); // 4MB buffer
         
-        // 准备索引条目
-        let mut new_index_entries: Vec<(u64, u64, u32)> = Vec::with_capacity(pending_count);
+        // 打开索引文件进行追加写入（需要同时支持追加和 seek 更新头部）
+        let mut index_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.index_file_path)?;
+        // 移动到文件末尾准备追加
+        let index_end = index_file.seek(SeekFrom::End(0))?;
+        let mut index_writer = BufWriter::with_capacity(1024 * 1024, index_file); // 1MB buffer
+        
         let mut current_offset = self.data_end;
+        let sync_interval = 1000; // 每 1000 个块同步刷盘
+        let header_update_interval = 10000; // 每 10000 个块更新头部
+        let mut batch_count = 0;
+        let mut total_written = 0u64;
         
-        // 写入新数据
+        // 批量写入：数据和索引一起写入缓冲，定期同步
         for (block_number, data) in self.pending_writes.drain(..) {
             let data_len = data.len() as u32;
             
-            // 写入数据
+            // 写入数据到缓冲
             data_writer.write_all(&data)?;
             
-            // 记录索引
-            new_index_entries.push((block_number, current_offset, data_len));
-            self.index.insert(block_number, (current_offset, data_len));
+            // 写入索引条目到缓冲
+            let mut entry_buf = [0u8; 20];
+            entry_buf[0..8].copy_from_slice(&block_number.to_le_bytes());
+            entry_buf[8..16].copy_from_slice(&current_offset.to_le_bytes());
+            entry_buf[16..20].copy_from_slice(&data_len.to_le_bytes());
+            index_writer.write_all(&entry_buf)?;
             
+            // 更新内存索引
+            self.index.insert(block_number, (current_offset, data_len));
             current_offset += data.len() as u64;
+            batch_count += 1;
+            total_written += 1;
+            
+            // 每 1000 个块同步刷盘（先 flush 缓冲，再 sync 到磁盘）
+            if batch_count >= sync_interval {
+                data_writer.flush()?;
+                index_writer.flush()?;
+                data_writer.get_ref().sync_all()?;
+                index_writer.get_ref().sync_all()?;
+                batch_count = 0;
+            }
+            
+            // 每 10000 个块更新头部
+            if total_written % header_update_interval == 0 {
+                // 临时获取内部文件来更新头部
+                let inner = index_writer.get_mut();
+                let current_pos = inner.stream_position()?;
+                inner.seek(SeekFrom::Start(12))?;
+                inner.write_all(&(self.index.len() as u64).to_le_bytes())?;
+                inner.seek(SeekFrom::Start(current_pos))?;
+                inner.sync_all()?;
+            }
         }
         
+        // 最后一批：flush 缓冲并 sync 到磁盘
         data_writer.flush()?;
-        drop(data_writer);
+        index_writer.flush()?;
+        data_writer.get_ref().sync_all()?;
+        index_writer.get_ref().sync_all()?;
         
-        // 打开索引文件进行追加写入
-        let mut index_file = OpenOptions::new()
-            .write(true)
-            .append(true)
-            .open(&self.index_file_path)?;
-        
-        // 追加新索引条目
-        let mut index_buf = Vec::with_capacity(pending_count * Self::INDEX_ENTRY_SIZE as usize);
-        for (block_number, offset, length) in new_index_entries {
-            index_buf.extend_from_slice(&block_number.to_le_bytes());
-            index_buf.extend_from_slice(&offset.to_le_bytes());
-            index_buf.extend_from_slice(&length.to_le_bytes());
-        }
-        index_file.write_all(&index_buf)?;
-        
-        // 更新索引文件头部的 block_count
+        // 最终更新索引文件头部的 block_count
+        let mut index_file = index_writer.into_inner()?;
         index_file.seek(SeekFrom::Start(12))?;
         index_file.write_all(&(self.index.len() as u64).to_le_bytes())?;
-        index_file.flush()?;
+        index_file.sync_all()?;
+        
+        // 抑制未使用变量警告
+        let _ = index_end;
+        
+        drop(data_writer);
         drop(index_file);
         
         // 更新状态
@@ -1004,33 +1034,70 @@ impl MmapStateLogDatabase {
         new_index_file.write_all(&index_header)?;
         
         // 按块号顺序复制数据并生成新索引
+        // 同时验证数据内容，跳过损坏的数据
         let mut new_offset = Self::HEADER_SIZE;
         let mut processed = 0u64;
+        let mut skipped_corrupted = 0u64;
+        let mut valid_entries_for_write: Vec<(u64, u64, u32)> = Vec::with_capacity(unique_entries.len());
+        
+        info!("Validating and copying {} blocks...", unique_entries.len());
         
         for (block_number, old_offset, length) in unique_entries.iter() {
             // 从原文件读取数据
             let start = *old_offset as usize;
             let end = start + *length as usize;
             
+            // 检查数据范围
             if end > data_mmap.len() {
-                error!("Data corruption: block {} points beyond file end", block_number);
-                return Ok(RepairResult {
-                    total_entries,
-                    valid_entries: processed,
-                    invalid_entries,
-                    duplicate_entries,
-                    truncated_entries,
-                    min_block,
-                    max_block,
-                    missing_blocks: vec![*block_number],
-                    repaired: false,
-                    error_message: Some(format!("Block {} data extends beyond file end", block_number)),
-                });
+                warn!("Block {} data extends beyond file end (offset={}, length={}, file_size={}), skipping", 
+                    block_number, old_offset, length, data_mmap.len());
+                skipped_corrupted += 1;
+                continue;
             }
             
             let data = &data_mmap[start..end];
             
-            // 写入新数据文件
+            // 验证数据内容格式
+            // 数据格式：[entry_count: u64][entries...]
+            // 每个 entry: [length: u8][data: bytes]
+            let is_data_valid = if *length >= 8 {
+                let entry_count = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0u8; 8]));
+                // 条目数量应该合理（不超过 100 万）且不为 0（除非是空块）
+                if entry_count > 1_000_000 {
+                    false
+                } else {
+                    // 简单验证：尝试遍历条目
+                    let mut pos = 8usize;
+                    let mut valid = true;
+                    let mut count = 0u64;
+                    while pos < data.len() && count < entry_count {
+                        if pos >= data.len() {
+                            valid = false;
+                            break;
+                        }
+                        let entry_len = data[pos] as usize;
+                        pos += 1;
+                        if pos + entry_len > data.len() {
+                            valid = false;
+                            break;
+                        }
+                        pos += entry_len;
+                        count += 1;
+                    }
+                    // 验证读取的条目数是否与声明的一致
+                    valid && count == entry_count
+                }
+            } else {
+                false // 数据太短
+            };
+            
+            if !is_data_valid {
+                warn!("Block {} data is corrupted (invalid format), skipping", block_number);
+                skipped_corrupted += 1;
+                continue;
+            }
+            
+            // 数据有效，写入新文件
             new_data_file.write_all(data)?;
             
             // 写入新索引条目
@@ -1040,6 +1107,7 @@ impl MmapStateLogDatabase {
             entry_buf[16..20].copy_from_slice(&length.to_le_bytes());
             new_index_file.write_all(&entry_buf)?;
             
+            valid_entries_for_write.push((*block_number, new_offset, *length));
             new_offset += *length as u64;
             processed += 1;
             
@@ -1051,10 +1119,20 @@ impl MmapStateLogDatabase {
             }
         }
         
-        new_data_file.flush()?;
+        if skipped_corrupted > 0 {
+            warn!("Skipped {} corrupted blocks during compaction", skipped_corrupted);
+        }
+        
+        // 更新索引文件头部的正确 block_count
         new_index_file.flush()?;
+        let mut new_index_raw = new_index_file.into_inner()?;
+        new_index_raw.seek(SeekFrom::Start(12))?;
+        new_index_raw.write_all(&(valid_entries_for_write.len() as u64).to_le_bytes())?;
+        new_index_raw.flush()?;
+        drop(new_index_raw);
+        
+        new_data_file.flush()?;
         drop(new_data_file);
-        drop(new_index_file);
         drop(data_mmap);
         drop(data_file);
         
@@ -1073,13 +1151,20 @@ impl MmapStateLogDatabase {
         let new_data_size = std::fs::metadata(&data_file_path)?.len();
         let saved_bytes = data_end.saturating_sub(new_data_size);
         
+        // 更新统计：加入跳过的损坏块
+        let final_valid_entries = valid_entries_for_write.len() as u64;
+        let final_min_block = valid_entries_for_write.first().map(|(bn, _, _)| *bn);
+        let final_max_block = valid_entries_for_write.last().map(|(bn, _, _)| *bn);
+        
         info!("=== Repair completed successfully! ===");
-        info!("  - Total entries processed: {}", total_entries);
-        info!("  - Valid entries: {}", unique_entries.len());
-        info!("  - Invalid entries removed: {}", invalid_entries);
+        info!("  - Total index entries read: {}", total_entries);
+        info!("  - Invalid index entries: {}", invalid_entries);
+        info!("  - Valid index entries: {}", unique_entries.len());
         info!("  - Duplicate entries removed: {}", duplicate_entries);
         info!("  - Truncated entries (> {}): {}", expected_end, truncated_entries);
-        info!("  - Block range: {} - {}", min_block.unwrap_or(0), max_block.unwrap_or(0));
+        info!("  - Corrupted data blocks skipped: {}", skipped_corrupted);
+        info!("  - Final valid blocks written: {}", final_valid_entries);
+        info!("  - Block range: {} - {}", final_min_block.unwrap_or(0), final_max_block.unwrap_or(0));
         info!("  - Original size: {:.2} GB", data_end as f64 / 1024.0 / 1024.0 / 1024.0);
         info!("  - Compacted size: {:.2} GB", new_data_size as f64 / 1024.0 / 1024.0 / 1024.0);
         info!("  - Space saved: {:.2} GB ({:.1}%)", 
@@ -1087,23 +1172,24 @@ impl MmapStateLogDatabase {
             saved_bytes as f64 / data_end as f64 * 100.0);
         info!("  - Backup files: {:?}, {:?}", backup_data_path, backup_index_path);
         
-        let missing_count = missing_blocks.len();
-        if has_missing_blocks {
-            warn!("  - Missing blocks: {} (run with --log-block on to regenerate)", missing_count);
+        // 添加损坏的块到缺失列表
+        let total_missing = missing_blocks.len() + skipped_corrupted as usize;
+        if total_missing > 0 {
+            warn!("  - Missing/corrupted blocks: {} (run with --log-block on to regenerate)", total_missing);
         }
         
         Ok(RepairResult {
             total_entries,
-            valid_entries: unique_entries.len() as u64,
-            invalid_entries,
+            valid_entries: final_valid_entries,
+            invalid_entries: invalid_entries + skipped_corrupted,
             duplicate_entries,
             truncated_entries,
-            min_block,
-            max_block,
+            min_block: final_min_block,
+            max_block: final_max_block,
             missing_blocks,
             repaired: true,
-            error_message: if has_missing_blocks { 
-                Some(format!("{} missing blocks need to be regenerated", missing_count))
+            error_message: if total_missing > 0 { 
+                Some(format!("{} missing/corrupted blocks need to be regenerated", total_missing))
             } else { 
                 None 
             },

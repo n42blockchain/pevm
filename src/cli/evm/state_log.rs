@@ -366,8 +366,17 @@ impl MmapStateLogDatabase {
     }
     
     /// 写入块的日志数据（先缓存，超过阈值自动 flush）
+    /// 自动跳过已存在的块（避免重复写入）
     #[allow(dead_code)]
     pub(crate) fn write_block_log(&mut self, block_number: u64, entries: &[ReadLogEntry]) -> eyre::Result<()> {
+        // 检查块是否已存在
+        if self.index.contains_key(&block_number) {
+            return Ok(()); // 已存在，跳过
+        }
+        if self.pending_writes.iter().any(|(bn, _)| *bn == block_number) {
+            return Ok(()); // 在 pending_writes 中，跳过
+        }
+        
         let data = Self::serialize_entries(entries)?;
         self.pending_writes.push((block_number, data));
         self.dirty = true;
@@ -383,12 +392,34 @@ impl MmapStateLogDatabase {
     }
     
     /// 批量写入（先缓存，超过阈值自动 flush）
+    /// 自动跳过已存在的块（避免重复写入）
     pub(crate) fn write_block_logs_batch(&mut self, batch: &[(u64, Vec<ReadLogEntry>)]) -> eyre::Result<()> {
+        let mut skipped = 0usize;
         for (block_number, entries) in batch {
+            // 检查块是否已存在于 index 中（已 flush 的块）
+            if self.index.contains_key(block_number) {
+                skipped += 1;
+                continue;
+            }
+            // 检查块是否已存在于 pending_writes 中（未 flush 的块）
+            if self.pending_writes.iter().any(|(bn, _)| bn == block_number) {
+                skipped += 1;
+                continue;
+            }
             let data = Self::serialize_entries(entries)?;
             self.pending_writes.push((*block_number, data));
         }
-        self.dirty = true;
+        
+        if skipped > 0 {
+            // 只在跳过块时输出日志（避免日志泛滥）
+            if skipped >= batch.len() / 2 {
+                warn!("Skipped {} existing blocks out of {} in batch", skipped, batch.len());
+            }
+        }
+        
+        if !self.pending_writes.is_empty() {
+            self.dirty = true;
+        }
         
         // 内存保护：当 pending_writes 累积超过 10000 个块时自动 flush
         // 降低阈值可减少内存压力，避免长时间运行后性能下降
@@ -499,8 +530,7 @@ impl MmapStateLogDatabase {
         Ok(())
     }
     
-    /// 检查块是否存在
-    #[allow(dead_code)]
+    /// 检查块是否存在（用于断点续传的精确检查）
     pub fn block_exists(&self, block_number: u64) -> bool {
         self.index.contains_key(&block_number)
     }

@@ -2244,9 +2244,15 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             let blocks = blockchain_db.block_with_senders_range(task.start..=task.end).unwrap();
 
                             // 步骤4: 如果使用累加模式且启用了日志记录（--log-block on），过滤掉已存在的块（断点续传）
-                            // 内存优化：使用范围检查或 HashSet 检查
+                            // 精确检查：使用 mmap_log_db 的 block_exists() 方法
+                            // 这样可以正确处理不连续的块（有缺失块的情况）
                             let worker_block_exists = |block_num: u64| -> bool {
-                                if use_range_check_clone {
+                                if let Some(ref db) = mmap_log_db_clone {
+                                    // mmap 模式：精确检查块是否存在
+                                    let db_guard = db.read().unwrap();
+                                    db_guard.block_exists(block_num)
+                                } else if use_range_check_clone {
+                                    // 回退到范围检查（不应该发生）
                                     if let Some((min, max)) = existing_blocks_range_clone {
                                         block_num >= min && block_num <= max
                                     } else {

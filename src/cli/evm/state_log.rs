@@ -720,6 +720,86 @@ pub struct RepairResult {
     pub error_message: Option<String>,
 }
 
+/// 分析损坏的索引条目，尝试找出规律
+fn analyze_corrupted_entries(
+    index_file_path: &Path,
+    data_end: u64,
+) -> eyre::Result<()> {
+    use std::io::{BufReader, Read, Seek, SeekFrom};
+    
+    let mut file = BufReader::new(File::open(index_file_path)?);
+    file.seek(SeekFrom::Start(32))?; // 跳过头部
+    
+    let mut entry_buf = [0u8; 20];
+    let mut entry_num = 0u64;
+    let mut first_invalid: Option<u64> = None;
+    let mut last_valid_offset: u64 = 32; // HEADER_SIZE
+    let mut consecutive_invalid = 0u64;
+    
+    info!("=== Analyzing index corruption pattern ===");
+    
+    loop {
+        match file.read_exact(&mut entry_buf) {
+            Ok(_) => {
+                entry_num += 1;
+                let block_number = u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
+                let offset = u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
+                let length = u32::from_le_bytes(entry_buf[16..20].try_into().unwrap());
+                
+                let is_valid = block_number < 100_000_000 
+                    && offset >= 32 
+                    && offset <= data_end
+                    && length > 0 
+                    && length < 10_000_000
+                    && (offset + length as u64) <= data_end;
+                
+                if is_valid {
+                    last_valid_offset = offset + length as u64;
+                    consecutive_invalid = 0;
+                } else {
+                    if first_invalid.is_none() {
+                        first_invalid = Some(entry_num);
+                        info!("First invalid entry at #{}: block={}, offset={}, length={}", 
+                            entry_num, block_number, offset, length);
+                        info!("Last valid data ended at offset: {}", last_valid_offset);
+                    }
+                    consecutive_invalid += 1;
+                    
+                    // 检查是否是连续的块号模式（可能是错误写入）
+                    if consecutive_invalid <= 5 {
+                        info!("Invalid entry #{}: block={}, offset={}, length={}", 
+                            entry_num, block_number, offset, length);
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    
+    if let Some(first) = first_invalid {
+        info!("=== Corruption Analysis ===");
+        info!("First invalid entry: #{}", first);
+        info!("Total entries: {}", entry_num);
+        info!("Valid entries before corruption: {}", first - 1);
+        info!("Last valid data offset: {} bytes ({:.2} GB)", 
+            last_valid_offset, last_valid_offset as f64 / 1024.0 / 1024.0 / 1024.0);
+        info!("Data file size: {} bytes ({:.2} GB)", 
+            data_end, data_end as f64 / 1024.0 / 1024.0 / 1024.0);
+        
+        if last_valid_offset < data_end {
+            let orphaned_data = data_end - last_valid_offset;
+            info!("Orphaned data (no index): {} bytes ({:.2} GB)", 
+                orphaned_data, orphaned_data as f64 / 1024.0 / 1024.0 / 1024.0);
+            warn!("There may be additional blocks in the data file without valid index entries!");
+            warn!("These blocks need to be regenerated.");
+        }
+    } else {
+        info!("No corruption found in index file.");
+    }
+    
+    Ok(())
+}
+
 impl MmapStateLogDatabase {
     /// 修复和整理日志文件
     /// 
@@ -745,6 +825,9 @@ impl MmapStateLogDatabase {
         let data_end = data_file_metadata.len();
         
         info!("Data file size: {} bytes ({:.2} GB)", data_end, data_end as f64 / 1024.0 / 1024.0 / 1024.0);
+        
+        // 先分析损坏模式
+        let _ = analyze_corrupted_entries(&index_file_path, data_end);
         
         // 读取所有索引条目
         let mut index_file = File::open(&index_file_path)?;

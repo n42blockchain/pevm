@@ -579,3 +579,312 @@ impl Drop for MmapStateLogDatabase {
         }
     }
 }
+
+/// 日志修复结果
+#[derive(Debug)]
+pub struct RepairResult {
+    pub total_entries: u64,
+    pub valid_entries: u64,
+    pub invalid_entries: u64,
+    pub duplicate_entries: u64,
+    pub min_block: Option<u64>,
+    pub max_block: Option<u64>,
+    pub missing_blocks: Vec<u64>,
+    pub repaired: bool,
+    pub error_message: Option<String>,
+}
+
+impl MmapStateLogDatabase {
+    /// 修复和整理日志文件
+    /// 
+    /// 功能：
+    /// 1. 验证所有索引条目的有效性
+    /// 2. 按块号排序并紧密排列数据
+    /// 3. 移除重复条目
+    /// 4. 检查块号连续性
+    /// 5. 发现错误或缺失时存盘并终止
+    pub fn repair_log(log_dir: &Path, expected_start: u64, expected_end: u64) -> eyre::Result<RepairResult> {
+        let data_file_path = log_dir.join("state_logs_data.bin");
+        let index_file_path = log_dir.join("state_logs_index.bin");
+        
+        if !data_file_path.exists() || !index_file_path.exists() {
+            return Err(eyre::eyre!("Log files not found in {:?}", log_dir));
+        }
+        
+        info!("=== Starting log repair for {:?} ===", log_dir);
+        info!("Expected block range: {} - {}", expected_start, expected_end);
+        
+        // 获取数据文件大小
+        let data_file_metadata = std::fs::metadata(&data_file_path)?;
+        let data_end = data_file_metadata.len();
+        
+        info!("Data file size: {} bytes ({:.2} GB)", data_end, data_end as f64 / 1024.0 / 1024.0 / 1024.0);
+        
+        // 读取所有索引条目
+        let mut index_file = File::open(&index_file_path)?;
+        let mut header = [0u8; 32];
+        index_file.read_exact(&mut header)?;
+        
+        // 验证头部
+        let magic = &header[0..8];
+        if magic != Self::MAGIC_INDEX {
+            return Err(eyre::eyre!("Invalid index file format"));
+        }
+        
+        let header_block_count = u64::from_le_bytes(header[12..20].try_into().unwrap());
+        info!("Index header says {} blocks", header_block_count);
+        
+        // 读取所有条目
+        let mut all_entries: Vec<(u64, u64, u32)> = Vec::new(); // (block_number, offset, length)
+        let mut entry_buf = [0u8; Self::INDEX_ENTRY_SIZE as usize];
+        let mut total_entries = 0u64;
+        let mut invalid_entries = 0u64;
+        
+        loop {
+            match index_file.read_exact(&mut entry_buf) {
+                Ok(_) => {
+                    total_entries += 1;
+                    let block_number = u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
+                    let offset = u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
+                    let length = u32::from_le_bytes(entry_buf[16..20].try_into().unwrap());
+                    
+                    // 验证条目
+                    let is_valid = block_number < 100_000_000 
+                        && offset >= Self::HEADER_SIZE 
+                        && offset <= data_end
+                        && length > 0 
+                        && length < 10_000_000
+                        && (offset + length as u64) <= data_end;
+                    
+                    if is_valid {
+                        all_entries.push((block_number, offset, length));
+                    } else {
+                        invalid_entries += 1;
+                        if invalid_entries <= 10 {
+                            warn!("Invalid entry #{}: block={}, offset={}, length={}", 
+                                total_entries, block_number, offset, length);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+            
+            // 进度报告
+            if total_entries % 1_000_000 == 0 {
+                info!("Read {} entries...", total_entries);
+            }
+        }
+        
+        info!("Total entries read: {}, valid: {}, invalid: {}", 
+            total_entries, all_entries.len(), invalid_entries);
+        
+        if all_entries.is_empty() {
+            return Ok(RepairResult {
+                total_entries,
+                valid_entries: 0,
+                invalid_entries,
+                duplicate_entries: 0,
+                min_block: None,
+                max_block: None,
+                missing_blocks: Vec::new(),
+                repaired: false,
+                error_message: Some("No valid entries found".to_string()),
+            });
+        }
+        
+        // 按块号排序
+        info!("Sorting {} entries by block number...", all_entries.len());
+        all_entries.sort_by_key(|(bn, _, _)| *bn);
+        
+        // 检查重复并构建去重后的索引
+        info!("Checking for duplicates...");
+        let mut unique_entries: Vec<(u64, u64, u32)> = Vec::with_capacity(all_entries.len());
+        let mut duplicate_entries = 0u64;
+        let mut last_block: Option<u64> = None;
+        
+        for (block_number, offset, length) in all_entries.iter() {
+            if last_block == Some(*block_number) {
+                duplicate_entries += 1;
+                // 保留后一个（可能是更新的数据）
+                unique_entries.pop();
+            }
+            unique_entries.push((*block_number, *offset, *length));
+            last_block = Some(*block_number);
+        }
+        
+        if duplicate_entries > 0 {
+            warn!("Found {} duplicate entries", duplicate_entries);
+        }
+        
+        let min_block = unique_entries.first().map(|(bn, _, _)| *bn);
+        let max_block = unique_entries.last().map(|(bn, _, _)| *bn);
+        
+        info!("Unique entries: {}, block range: {:?} - {:?}", 
+            unique_entries.len(), min_block, max_block);
+        
+        // 检查块号连续性（在期望范围内）
+        info!("Checking block continuity in range {} - {}...", expected_start, expected_end);
+        let mut missing_blocks: Vec<u64> = Vec::new();
+        let block_set: std::collections::HashSet<u64> = unique_entries.iter()
+            .map(|(bn, _, _)| *bn)
+            .collect();
+        
+        // 只检查期望范围内的缺失块
+        let check_start = std::cmp::max(expected_start, min_block.unwrap_or(0));
+        let check_end = std::cmp::min(expected_end, max_block.unwrap_or(u64::MAX));
+        
+        for block_num in check_start..=check_end {
+            if !block_set.contains(&block_num) {
+                missing_blocks.push(block_num);
+                if missing_blocks.len() <= 100 {
+                    warn!("Missing block: {}", block_num);
+                }
+                if missing_blocks.len() >= 1000 {
+                    warn!("Found {} missing blocks, stopping check...", missing_blocks.len());
+                    break;
+                }
+            }
+        }
+        
+        if !missing_blocks.is_empty() {
+            let missing_count = missing_blocks.len();
+            error!("Found {} missing blocks in range {} - {}", 
+                missing_count, check_start, check_end);
+            error!("Repair aborted. Please re-run log generation for missing blocks.");
+            
+            return Ok(RepairResult {
+                total_entries,
+                valid_entries: unique_entries.len() as u64,
+                invalid_entries,
+                duplicate_entries,
+                min_block,
+                max_block,
+                missing_blocks,
+                repaired: false,
+                error_message: Some(format!("Found {} missing blocks", missing_count)),
+            });
+        }
+        
+        // 开始整理：按块号顺序紧密排列数据
+        info!("=== Starting data compaction ===");
+        info!("This will create new compacted files...");
+        
+        // 打开原始数据文件用于读取
+        let data_file = File::open(&data_file_path)?;
+        let data_mmap = unsafe { memmap2::Mmap::map(&data_file)? };
+        
+        // 创建新的数据文件
+        let new_data_path = log_dir.join("state_logs_data.bin.new");
+        let new_index_path = log_dir.join("state_logs_index.bin.new");
+        
+        let mut new_data_file = BufWriter::with_capacity(4 * 1024 * 1024, File::create(&new_data_path)?);
+        let mut new_index_file = BufWriter::with_capacity(1024 * 1024, File::create(&new_index_path)?);
+        
+        // 写入数据文件头部
+        let mut data_header = [0u8; 32];
+        data_header[0..8].copy_from_slice(Self::MAGIC_DATA);
+        data_header[8..12].copy_from_slice(&Self::VERSION.to_le_bytes());
+        new_data_file.write_all(&data_header)?;
+        
+        // 写入索引文件头部
+        let mut index_header = [0u8; 32];
+        index_header[0..8].copy_from_slice(Self::MAGIC_INDEX);
+        index_header[8..12].copy_from_slice(&Self::VERSION.to_le_bytes());
+        index_header[12..20].copy_from_slice(&(unique_entries.len() as u64).to_le_bytes());
+        new_index_file.write_all(&index_header)?;
+        
+        // 按块号顺序复制数据并生成新索引
+        let mut new_offset = Self::HEADER_SIZE;
+        let mut processed = 0u64;
+        
+        for (block_number, old_offset, length) in unique_entries.iter() {
+            // 从原文件读取数据
+            let start = *old_offset as usize;
+            let end = start + *length as usize;
+            
+            if end > data_mmap.len() {
+                error!("Data corruption: block {} points beyond file end", block_number);
+                return Ok(RepairResult {
+                    total_entries,
+                    valid_entries: processed,
+                    invalid_entries,
+                    duplicate_entries,
+                    min_block,
+                    max_block,
+                    missing_blocks: vec![*block_number],
+                    repaired: false,
+                    error_message: Some(format!("Block {} data extends beyond file end", block_number)),
+                });
+            }
+            
+            let data = &data_mmap[start..end];
+            
+            // 写入新数据文件
+            new_data_file.write_all(data)?;
+            
+            // 写入新索引条目
+            let mut entry_buf = [0u8; 20];
+            entry_buf[0..8].copy_from_slice(&block_number.to_le_bytes());
+            entry_buf[8..16].copy_from_slice(&new_offset.to_le_bytes());
+            entry_buf[16..20].copy_from_slice(&length.to_le_bytes());
+            new_index_file.write_all(&entry_buf)?;
+            
+            new_offset += *length as u64;
+            processed += 1;
+            
+            // 进度报告
+            if processed % 1_000_000 == 0 {
+                info!("Compacted {} / {} blocks ({:.1}%)...", 
+                    processed, unique_entries.len(), 
+                    processed as f64 / unique_entries.len() as f64 * 100.0);
+            }
+        }
+        
+        new_data_file.flush()?;
+        new_index_file.flush()?;
+        drop(new_data_file);
+        drop(new_index_file);
+        drop(data_mmap);
+        drop(data_file);
+        
+        // 备份原文件并替换
+        info!("Backing up original files...");
+        let backup_data_path = data_file_path.with_extension("bin.backup");
+        let backup_index_path = index_file_path.with_extension("bin.backup");
+        
+        std::fs::rename(&data_file_path, &backup_data_path)?;
+        std::fs::rename(&index_file_path, &backup_index_path)?;
+        
+        info!("Replacing with compacted files...");
+        std::fs::rename(&new_data_path, &data_file_path)?;
+        std::fs::rename(&new_index_path, &index_file_path)?;
+        
+        let new_data_size = std::fs::metadata(&data_file_path)?.len();
+        let saved_bytes = data_end.saturating_sub(new_data_size);
+        
+        info!("=== Repair completed successfully! ===");
+        info!("  - Total entries processed: {}", total_entries);
+        info!("  - Valid entries: {}", unique_entries.len());
+        info!("  - Invalid entries removed: {}", invalid_entries);
+        info!("  - Duplicate entries removed: {}", duplicate_entries);
+        info!("  - Block range: {} - {}", min_block.unwrap_or(0), max_block.unwrap_or(0));
+        info!("  - Original size: {:.2} GB", data_end as f64 / 1024.0 / 1024.0 / 1024.0);
+        info!("  - Compacted size: {:.2} GB", new_data_size as f64 / 1024.0 / 1024.0 / 1024.0);
+        info!("  - Space saved: {:.2} GB ({:.1}%)", 
+            saved_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+            saved_bytes as f64 / data_end as f64 * 100.0);
+        info!("  - Backup files: {:?}, {:?}", backup_data_path, backup_index_path);
+        
+        Ok(RepairResult {
+            total_entries,
+            valid_entries: unique_entries.len() as u64,
+            invalid_entries,
+            duplicate_entries,
+            min_block,
+            max_block,
+            missing_blocks: Vec::new(),
+            repaired: true,
+            error_message: None,
+        })
+    }
+}

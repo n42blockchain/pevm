@@ -105,6 +105,10 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// When enabled, logs are stored in state_logs_mmap.bin with mmap access
     #[arg(long, alias = "mmap-log")]
     use_mmap_log: bool,
+    /// Repair and compact log files: validate, sort by block number, remove duplicates
+    /// and compact data. Stops if missing blocks are found.
+    #[arg(long, alias = "repair-log")]
+    repair_log: bool,
 }
 
 struct Task {
@@ -1791,6 +1795,39 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         // 步骤1: 获取日志目录（如果指定了 log_dir，使用累加文件系统；否则使用单个文件）
         let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RO)?;
         let log_dir = self.log_dir.as_deref();
+        
+        // 如果启用了 --repair-log，执行修复并退出
+        if self.repair_log {
+            if let Some(log_dir) = log_dir {
+                info!("Starting log repair mode...");
+                match MmapStateLogDatabase::repair_log(log_dir, self.begin_number, self.end_number) {
+                    Ok(result) => {
+                        if result.repaired {
+                            info!("Log repair completed successfully!");
+                            return Ok(());
+                        } else {
+                            if let Some(msg) = &result.error_message {
+                                error!("Log repair failed: {}", msg);
+                            }
+                            if !result.missing_blocks.is_empty() {
+                                let first_missing = result.missing_blocks.first().unwrap();
+                                let last_missing = result.missing_blocks.last().unwrap();
+                                error!("Missing blocks: first={}, last={}, count={}", 
+                                    first_missing, last_missing, result.missing_blocks.len());
+                                error!("Please re-run with --begin {} to fill in missing blocks", first_missing);
+                            }
+                            return Err(eyre::eyre!("Log repair failed"));
+                        }
+                    }
+                    Err(e) => {
+                        error!("Log repair error: {}", e);
+                        return Err(e);
+                    }
+                }
+            } else {
+                return Err(eyre::eyre!("--repair-log requires --log-dir to be set"));
+            }
+        }
         
         // 测试模式：启用内存模式（将 bin 文件完全读入内存，无压缩）
         // 可以通过环境变量 PEVM_IN_MEMORY_MODE=true 启用

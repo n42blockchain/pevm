@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use tracing::{info, error};
+use tracing::{info, warn, error};
 
 use super::ReadLogEntry;
 
@@ -227,21 +227,39 @@ impl MmapStateLogDatabase {
         // 读取所有索引条目
         let mut index = HashMap::with_capacity(entry_count as usize);
         let mut entry_buf = [0u8; Self::INDEX_ENTRY_SIZE as usize];
+        let mut skipped_invalid = 0u64;
         
-        // 读取到文件末尾，忽略不完整的条目
+        // 读取到文件末尾，忽略不完整或无效的条目
         loop {
             match index_file.read_exact(&mut entry_buf) {
                 Ok(_) => {
                     let block_number = u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
                     let offset = u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
                     let length = u32::from_le_bytes(entry_buf[16..20].try_into().unwrap());
-                    // 忽略无效条目（block_number 为 0 且 offset 为 0）
-                    if block_number > 0 || offset > Self::HEADER_SIZE {
+                    
+                    // 严格验证条目有效性：
+                    // 1. block_number 必须在合理范围内（< 1亿，足够覆盖以太坊历史）
+                    // 2. offset 必须 >= HEADER_SIZE 且 <= data_end
+                    // 3. length 必须 > 0 且 < 10MB（单个块的日志数据不应该超过这个大小）
+                    let is_valid = block_number < 100_000_000 
+                        && offset >= Self::HEADER_SIZE 
+                        && offset <= data_end
+                        && length > 0 
+                        && length < 10_000_000;
+                    
+                    if is_valid {
                         index.insert(block_number, (offset, length));
+                    } else if block_number != 0 || offset != 0 || length != 0 {
+                        // 跳过明显无效的条目（但不是全零条目）
+                        skipped_invalid += 1;
                     }
                 }
                 Err(_) => break, // 到达文件末尾或读取不完整
             }
+        }
+        
+        if skipped_invalid > 0 {
+            warn!("Skipped {} invalid index entries (corrupted data)", skipped_invalid);
         }
         
         // 如果实际读取的条目数与头部不一致，记录日志

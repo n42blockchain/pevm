@@ -205,20 +205,40 @@ impl MmapStateLogDatabase {
             return Err(eyre::eyre!("Unsupported index version: {}", index_version));
         }
         
-        let block_count = u64::from_le_bytes(index_header[12..20].try_into().unwrap());
+        let header_block_count = u64::from_le_bytes(index_header[12..20].try_into().unwrap());
+        
+        // 计算索引文件实际大小，读取所有有效条目（不仅仅依赖头部的 block_count）
+        // 这样即使程序崩溃时索引条目已追加但头部未更新，也能恢复所有条目
+        let index_file_size = index_file.metadata()?.len();
+        let actual_entry_count = (index_file_size.saturating_sub(Self::HEADER_SIZE)) / Self::INDEX_ENTRY_SIZE;
+        
+        // 使用实际条目数（可能比头部记录的多）
+        let entry_count = std::cmp::max(header_block_count, actual_entry_count);
         
         // 读取所有索引条目
-        let mut index = HashMap::with_capacity(block_count as usize);
+        let mut index = HashMap::with_capacity(entry_count as usize);
         let mut entry_buf = [0u8; Self::INDEX_ENTRY_SIZE as usize];
         
-        for _ in 0..block_count {
-            if index_file.read_exact(&mut entry_buf).is_err() {
-                break;
+        // 读取到文件末尾，忽略不完整的条目
+        loop {
+            match index_file.read_exact(&mut entry_buf) {
+                Ok(_) => {
+                    let block_number = u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
+                    let offset = u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
+                    let length = u32::from_le_bytes(entry_buf[16..20].try_into().unwrap());
+                    // 忽略无效条目（block_number 为 0 且 offset 为 0）
+                    if block_number > 0 || offset > Self::HEADER_SIZE {
+                        index.insert(block_number, (offset, length));
+                    }
+                }
+                Err(_) => break, // 到达文件末尾或读取不完整
             }
-            let block_number = u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
-            let offset = u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
-            let length = u32::from_le_bytes(entry_buf[16..20].try_into().unwrap());
-            index.insert(block_number, (offset, length));
+        }
+        
+        // 如果实际读取的条目数与头部不一致，更新头部
+        if index.len() as u64 != header_block_count {
+            info!("Index recovery: found {} entries (header said {}), will update header on next flush", 
+                index.len(), header_block_count);
         }
         
         info!("MmapStateLogDatabase opened (v2): {} blocks, data_end={}", index.len(), data_end);
@@ -319,8 +339,9 @@ impl MmapStateLogDatabase {
         self.pending_writes.push((block_number, data));
         self.dirty = true;
         
-        // 内存保护：当 pending_writes 累积超过 100000 个块时自动 flush
-        if self.pending_writes.len() >= 100000 {
+        // 内存保护：当 pending_writes 累积超过 10000 个块时自动 flush
+        // 降低阈值可减少内存压力，避免长时间运行后性能下降
+        if self.pending_writes.len() >= 10000 {
             info!("Auto-flushing {} pending blocks to prevent memory growth", self.pending_writes.len());
             self.flush()?;
         }
@@ -336,9 +357,9 @@ impl MmapStateLogDatabase {
         }
         self.dirty = true;
         
-        // 内存保护：当 pending_writes 累积超过 100000 个块时自动 flush
-        // 避免长时间运行时内存持续增长导致 OOM
-        if self.pending_writes.len() >= 100000 {
+        // 内存保护：当 pending_writes 累积超过 10000 个块时自动 flush
+        // 降低阈值可减少内存压力，避免长时间运行后性能下降
+        if self.pending_writes.len() >= 10000 {
             info!("Auto-flushing {} pending blocks to prevent memory growth", self.pending_writes.len());
             self.flush()?;
         }

@@ -366,13 +366,27 @@ impl MmapStateLogDatabase {
     }
     
     /// 写入块的日志数据（先缓存，超过阈值自动 flush）
-    /// 自动跳过已存在的块（避免重复写入）
+    /// 自动跳过已存在且有效的块（避免重复写入）
+    /// 对于损坏的块，会覆盖重新生成
     #[allow(dead_code)]
     pub(crate) fn write_block_log(&mut self, block_number: u64, entries: &[ReadLogEntry]) -> eyre::Result<()> {
-        // 检查块是否已存在
-        if self.index.contains_key(&block_number) {
-            return Ok(()); // 已存在，跳过
+        // 检查块是否已存在且有效
+        if let Some((offset, length)) = self.index.get(&block_number) {
+            let is_valid = *offset >= Self::HEADER_SIZE 
+                && *length > 0 
+                && *length < 10_000_000
+                && (*offset + *length as u64) <= self.data_end;
+            
+            if is_valid {
+                return Ok(()); // 已存在且有效，跳过
+            } else {
+                // 数据损坏，移除旧索引
+                warn!("Block {} data corrupted, will regenerate", block_number);
+                self.index.remove(&block_number);
+            }
         }
+        
+        // 检查是否在 pending_writes 中
         if self.pending_writes.iter().any(|(bn, _)| *bn == block_number) {
             return Ok(()); // 在 pending_writes 中，跳过
         }
@@ -392,29 +406,50 @@ impl MmapStateLogDatabase {
     }
     
     /// 批量写入（先缓存，超过阈值自动 flush）
-    /// 自动跳过已存在的块（避免重复写入）
+    /// 自动跳过已存在且有效的块（避免重复写入）
+    /// 对于损坏的块，会覆盖重新生成
     pub(crate) fn write_block_logs_batch(&mut self, batch: &[(u64, Vec<ReadLogEntry>)]) -> eyre::Result<()> {
         let mut skipped = 0usize;
+        let mut regenerated = 0usize;
+        
         for (block_number, entries) in batch {
             // 检查块是否已存在于 index 中（已 flush 的块）
-            if self.index.contains_key(block_number) {
-                skipped += 1;
-                continue;
+            if let Some((offset, length)) = self.index.get(block_number) {
+                // 验证数据是否有效
+                let is_valid = *offset >= Self::HEADER_SIZE 
+                    && *length > 0 
+                    && *length < 10_000_000
+                    && (*offset + *length as u64) <= self.data_end;
+                
+                if is_valid {
+                    skipped += 1;
+                    continue;
+                } else {
+                    // 数据损坏，移除旧索引，允许重新生成
+                    warn!("Block {} data corrupted (offset={}, length={}, data_end={}), will regenerate", 
+                        block_number, offset, length, self.data_end);
+                    self.index.remove(block_number);
+                    regenerated += 1;
+                }
             }
+            
             // 检查块是否已存在于 pending_writes 中（未 flush 的块）
             if self.pending_writes.iter().any(|(bn, _)| bn == block_number) {
                 skipped += 1;
                 continue;
             }
+            
             let data = Self::serialize_entries(entries)?;
             self.pending_writes.push((*block_number, data));
         }
         
-        if skipped > 0 {
-            // 只在跳过块时输出日志（避免日志泛滥）
-            if skipped >= batch.len() / 2 {
-                warn!("Skipped {} existing blocks out of {} in batch", skipped, batch.len());
-            }
+        if skipped > 0 && skipped >= batch.len() / 2 {
+            // 只在跳过大量块时输出日志（避免日志泛滥）
+            warn!("Skipped {} existing blocks out of {} in batch", skipped, batch.len());
+        }
+        
+        if regenerated > 0 {
+            info!("Regenerated {} corrupted blocks", regenerated);
         }
         
         if !self.pending_writes.is_empty() {
@@ -530,9 +565,69 @@ impl MmapStateLogDatabase {
         Ok(())
     }
     
-    /// 检查块是否存在（用于断点续传的精确检查）
+    /// 检查块是否存在且数据有效（用于断点续传的精确检查）
+    /// 如果块存在但数据损坏，返回 false（允许重新生成）
     pub fn block_exists(&self, block_number: u64) -> bool {
-        self.index.contains_key(&block_number)
+        if let Some((offset, length)) = self.index.get(&block_number) {
+            // 验证数据范围是否有效
+            let is_valid = *offset >= Self::HEADER_SIZE 
+                && *length > 0 
+                && *length < 10_000_000  // 单块数据不应超过 10MB
+                && (*offset + *length as u64) <= self.data_end;
+            
+            if !is_valid {
+                // 数据损坏，返回 false 允许重新生成
+                return false;
+            }
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// 检查块数据是否损坏
+    /// 返回 true 表示损坏（需要重新生成）
+    pub fn is_block_corrupted(&self, block_number: u64) -> bool {
+        if let Some((offset, length)) = self.index.get(&block_number) {
+            // 检查基本有效性
+            if *offset < Self::HEADER_SIZE 
+                || *length == 0 
+                || *length >= 10_000_000
+                || (*offset + *length as u64) > self.data_end {
+                return true; // 索引信息损坏
+            }
+            
+            // 如果有 mmap，可以进一步验证数据内容
+            if let Some(ref mmap) = self.mmap_data {
+                let start = *offset as usize;
+                let end = start + *length as usize;
+                
+                if end > mmap.len() {
+                    return true; // 数据超出文件范围
+                }
+                
+                // 验证数据格式：前 8 字节是条目数量
+                if *length >= 8 {
+                    let count = u64::from_le_bytes(mmap[start..start+8].try_into().unwrap_or([0u8; 8]));
+                    // 条目数量应该合理（不超过 100 万）
+                    if count > 1_000_000 {
+                        return true; // 数据格式损坏
+                    }
+                }
+            }
+            
+            false // 数据有效
+        } else {
+            false // 块不存在，不算损坏
+        }
+    }
+    
+    /// 标记块为损坏（从索引中移除，允许重新生成）
+    pub fn mark_block_corrupted(&mut self, block_number: u64) {
+        if self.index.remove(&block_number).is_some() {
+            warn!("Marked block {} as corrupted, will be regenerated", block_number);
+            self.dirty = true;
+        }
     }
     
     /// 获取块数量

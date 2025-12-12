@@ -359,9 +359,10 @@ impl MmapStateLogDatabase {
     }
     
     /// 批量读取多个块的日志数据（零拷贝）
-    pub fn read_block_logs_batch(&self, block_numbers: &[u64]) -> Vec<(u64, &[u8])> {
+    /// 返回与输入顺序相同的结果，缺失的块返回 None
+    pub fn read_block_logs_batch(&self, block_numbers: &[u64]) -> Vec<(u64, Option<&[u8]>)> {
         block_numbers.iter()
-            .filter_map(|&bn| self.read_block_log(bn).map(|data| (bn, data)))
+            .map(|&bn| (bn, self.read_block_log(bn)))
             .collect()
     }
     
@@ -1354,6 +1355,308 @@ impl MmapStateLogDatabase {
                 Some(format!("{} missing/corrupted blocks need to be regenerated", total_missing))
             } else { 
                 None 
+            },
+        })
+    }
+    
+    /// 从数据文件重建索引
+    /// 
+    /// 功能：
+    /// 1. 读取现有索引文件中的所有条目（即使部分损坏）
+    /// 2. 验证每个索引条目指向的数据是否有效
+    /// 3. 生成新的、只包含有效条目的索引文件
+    /// 4. 报告缺失/损坏的块
+    pub fn rebuild_index(log_dir: &Path, expected_start: u64, expected_end: u64) -> eyre::Result<RepairResult> {
+        let data_file_path = log_dir.join("state_logs_data.bin");
+        let index_file_path = log_dir.join("state_logs_index.bin");
+        
+        if !data_file_path.exists() {
+            return Err(eyre::eyre!("Data file not found: {:?}", data_file_path));
+        }
+        
+        info!("=== Starting index rebuild for {:?} ===", log_dir);
+        info!("Expected block range: {} - {}", expected_start, expected_end);
+        
+        // 获取数据文件大小并验证头部
+        let data_file = File::open(&data_file_path)?;
+        let data_file_size = data_file.metadata()?.len();
+        
+        info!("Data file size: {} bytes ({:.2} GB)", data_file_size, data_file_size as f64 / 1024.0 / 1024.0 / 1024.0);
+        
+        // 验证数据文件头部
+        let data_mmap = unsafe { memmap2::Mmap::map(&data_file)? };
+        if data_mmap.len() < 32 {
+            return Err(eyre::eyre!("Data file too small"));
+        }
+        
+        let data_magic = &data_mmap[0..8];
+        if data_magic != Self::MAGIC_DATA {
+            return Err(eyre::eyre!("Invalid data file format (magic mismatch)"));
+        }
+        
+        // 读取现有索引文件（如果存在）
+        let mut all_entries: Vec<(u64, u64, u32)> = Vec::new();
+        let mut total_index_entries = 0u64;
+        let mut invalid_index_entries = 0u64;
+        
+        if index_file_path.exists() {
+            info!("Reading existing index file...");
+            let mut index_file = File::open(&index_file_path)?;
+            let mut header = [0u8; 32];
+            
+            if index_file.read_exact(&mut header).is_ok() {
+                let magic = &header[0..8];
+                if magic == Self::MAGIC_INDEX {
+                    // 读取所有索引条目
+                    let mut entry_buf = [0u8; Self::INDEX_ENTRY_SIZE as usize];
+                    
+                    loop {
+                        match index_file.read_exact(&mut entry_buf) {
+                            Ok(_) => {
+                                total_index_entries += 1;
+                                let block_number = u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
+                                let offset = u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
+                                let length = u32::from_le_bytes(entry_buf[16..20].try_into().unwrap());
+                                
+                                // 基本索引有效性检查
+                                let is_index_valid = block_number < 100_000_000
+                                    && offset >= Self::HEADER_SIZE
+                                    && offset < data_file_size
+                                    && length > 0
+                                    && length < 10_000_000
+                                    && (offset + length as u64) <= data_file_size;
+                                
+                                if is_index_valid {
+                                    all_entries.push((block_number, offset, length));
+                                } else {
+                                    invalid_index_entries += 1;
+                                    if invalid_index_entries <= 10 {
+                                        warn!("Invalid index entry: block={}, offset={}, length={}", 
+                                            block_number, offset, length);
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    
+                    info!("Read {} index entries, {} invalid", total_index_entries, invalid_index_entries);
+                } else {
+                    warn!("Index file has invalid magic, will scan data file for recovery");
+                }
+            }
+        } else {
+            info!("Index file does not exist, cannot recover block numbers from data file alone");
+            info!("Note: Data file does not store block numbers, so full recovery is not possible without index");
+            return Err(eyre::eyre!("Index file not found and cannot recover without it. \
+                Data file format does not include block numbers."));
+        }
+        
+        if all_entries.is_empty() {
+            return Err(eyre::eyre!("No valid index entries found"));
+        }
+        
+        // 按块号排序并去重
+        info!("Sorting and deduplicating {} entries...", all_entries.len());
+        all_entries.sort_by_key(|(bn, _, _)| *bn);
+        all_entries.dedup_by_key(|(bn, _, _)| *bn);
+        
+        info!("After dedup: {} unique entries", all_entries.len());
+        
+        // 验证每个索引条目指向的数据是否有效
+        info!("Validating data integrity for each block...");
+        let mut valid_entries: Vec<(u64, u64, u32)> = Vec::with_capacity(all_entries.len());
+        let mut corrupted_blocks: Vec<u64> = Vec::new();
+        
+        for (block_number, offset, length) in all_entries.iter() {
+            let start = *offset as usize;
+            let end = start + *length as usize;
+            
+            // 检查数据范围
+            if end > data_mmap.len() {
+                corrupted_blocks.push(*block_number);
+                if corrupted_blocks.len() <= 20 {
+                    warn!("Corrupted block {} (data extends beyond file)", block_number);
+                }
+                continue;
+            }
+            
+            let data = &data_mmap[start..end];
+            
+            // 验证数据内容格式
+            let is_data_valid = if *length >= 8 {
+                let entry_count = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0u8; 8]));
+                if entry_count > 1_000_000 {
+                    false
+                } else {
+                    // 遍历条目验证格式
+                    let mut pos = 8usize;
+                    let mut valid = true;
+                    let mut count = 0u64;
+                    while pos < data.len() && count < entry_count {
+                        if pos >= data.len() {
+                            valid = false;
+                            break;
+                        }
+                        let entry_len = data[pos] as usize;
+                        pos += 1;
+                        if pos + entry_len > data.len() {
+                            valid = false;
+                            break;
+                        }
+                        pos += entry_len;
+                        count += 1;
+                    }
+                    valid && count == entry_count
+                }
+            } else {
+                false
+            };
+            
+            if is_data_valid {
+                valid_entries.push((*block_number, *offset, *length));
+            } else {
+                corrupted_blocks.push(*block_number);
+                if corrupted_blocks.len() <= 20 {
+                    warn!("Corrupted block {} (invalid data format)", block_number);
+                }
+            }
+        }
+        
+        if !corrupted_blocks.is_empty() {
+            warn!("Found {} corrupted blocks", corrupted_blocks.len());
+            if corrupted_blocks.len() > 20 {
+                warn!("... and {} more", corrupted_blocks.len() - 20);
+            }
+        }
+        
+        info!("Valid entries: {}, corrupted: {}", valid_entries.len(), corrupted_blocks.len());
+        
+        // 计算块范围和缺失块
+        let min_block = valid_entries.first().map(|(bn, _, _)| *bn);
+        let max_block = valid_entries.last().map(|(bn, _, _)| *bn);
+        
+        // 检查缺失块
+        info!("Checking for missing blocks in range {} - {}...", expected_start, expected_end);
+        let block_set: std::collections::HashSet<u64> = valid_entries.iter()
+            .map(|(bn, _, _)| *bn)
+            .collect();
+        
+        let mut missing_blocks: Vec<u64> = Vec::new();
+        let check_start = std::cmp::max(expected_start, min_block.unwrap_or(expected_start));
+        let check_end = std::cmp::min(expected_end, max_block.unwrap_or(expected_end));
+        
+        for block_num in check_start..=check_end {
+            if !block_set.contains(&block_num) {
+                missing_blocks.push(block_num);
+            }
+        }
+        
+        // 将损坏的块也加入缺失列表
+        for block_num in corrupted_blocks.iter() {
+            if !missing_blocks.contains(block_num) && *block_num >= expected_start && *block_num <= expected_end {
+                missing_blocks.push(*block_num);
+            }
+        }
+        missing_blocks.sort();
+        
+        // 写入新的索引文件
+        info!("Writing new index file with {} valid entries...", valid_entries.len());
+        let new_index_path = index_file_path.with_extension("bin.new");
+        
+        {
+            let mut new_index_file = BufWriter::with_capacity(1024 * 1024, File::create(&new_index_path)?);
+            
+            // 写入头部
+            let mut header = [0u8; 32];
+            header[0..8].copy_from_slice(Self::MAGIC_INDEX);
+            header[8..12].copy_from_slice(&Self::VERSION.to_le_bytes());
+            header[12..20].copy_from_slice(&(valid_entries.len() as u64).to_le_bytes());
+            new_index_file.write_all(&header)?;
+            
+            // 写入索引条目
+            for (block_number, offset, length) in valid_entries.iter() {
+                let mut entry_buf = [0u8; 20];
+                entry_buf[0..8].copy_from_slice(&block_number.to_le_bytes());
+                entry_buf[8..16].copy_from_slice(&offset.to_le_bytes());
+                entry_buf[16..20].copy_from_slice(&length.to_le_bytes());
+                new_index_file.write_all(&entry_buf)?;
+            }
+            
+            new_index_file.flush()?;
+        }
+        
+        // 备份原文件并替换
+        if index_file_path.exists() {
+            let backup_path = index_file_path.with_extension("bin.backup");
+            info!("Backing up original index to {:?}", backup_path);
+            std::fs::rename(&index_file_path, &backup_path)?;
+        }
+        
+        std::fs::rename(&new_index_path, &index_file_path)?;
+        
+        // 输出统计信息
+        info!("=== Index rebuild completed! ===");
+        info!("  - Total index entries read: {}", total_index_entries);
+        info!("  - Invalid index entries: {}", invalid_index_entries);
+        info!("  - Corrupted data blocks: {}", corrupted_blocks.len());
+        info!("  - Valid blocks written: {}", valid_entries.len());
+        if let (Some(min), Some(max)) = (min_block, max_block) {
+            info!("  - Block range: {} - {}", min, max);
+        }
+        
+        // 显示缺失块信息
+        let total_missing = missing_blocks.len();
+        if total_missing > 0 {
+            warn!("=== Missing/Corrupted blocks to regenerate: {} ===", total_missing);
+            
+            // 分组显示缺失块（连续的块显示为范围）
+            let mut ranges: Vec<(u64, u64)> = Vec::new();
+            for &block in missing_blocks.iter() {
+                if let Some(last) = ranges.last_mut() {
+                    if block == last.1 + 1 {
+                        last.1 = block;
+                        continue;
+                    }
+                }
+                ranges.push((block, block));
+            }
+            
+            // 显示前 20 个范围
+            for (i, (start, end)) in ranges.iter().take(20).enumerate() {
+                if start == end {
+                    warn!("  {}. Block {}", i + 1, start);
+                } else {
+                    warn!("  {}. Blocks {} - {} ({} blocks)", i + 1, start, end, end - start + 1);
+                }
+            }
+            if ranges.len() > 20 {
+                warn!("  ... and {} more ranges", ranges.len() - 20);
+            }
+            
+            if let Some(first) = missing_blocks.first() {
+                warn!("");
+                warn!("To regenerate missing blocks, run:");
+                warn!("  --log-block on --begin {} --end {}", first, expected_end);
+            }
+        } else {
+            info!("  - No missing blocks in range {} - {}", expected_start, expected_end);
+        }
+        
+        Ok(RepairResult {
+            total_entries: total_index_entries,
+            valid_entries: valid_entries.len() as u64,
+            invalid_entries: invalid_index_entries + corrupted_blocks.len() as u64,
+            duplicate_entries: 0,
+            truncated_entries: 0,
+            min_block,
+            max_block,
+            missing_blocks,
+            repaired: true,
+            error_message: if total_missing > 0 {
+                Some(format!("{} missing/corrupted blocks need to be regenerated", total_missing))
+            } else {
+                None
             },
         })
     }

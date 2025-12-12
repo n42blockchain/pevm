@@ -109,6 +109,10 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// and compact data. Stops if missing blocks are found.
     #[arg(long, alias = "repair-log")]
     repair_log: bool,
+    /// Rebuild index from data file: scan data file, validate entries,
+    /// rebuild clean index and report missing/corrupted blocks.
+    #[arg(long, alias = "rebuild-idx")]
+    rebuild_idx: bool,
 }
 
 struct Task {
@@ -1829,6 +1833,33 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             }
         }
         
+        // 如果启用了 --rebuild-idx，从数据文件重建索引并退出
+        if self.rebuild_idx {
+            if let Some(log_dir) = log_dir {
+                info!("Starting index rebuild mode...");
+                match MmapStateLogDatabase::rebuild_index(log_dir, self.begin_number, self.end_number) {
+                    Ok(result) => {
+                        info!("Index rebuild completed!");
+                        if !result.missing_blocks.is_empty() {
+                            let first_missing = result.missing_blocks.first().unwrap();
+                            let last_missing = result.missing_blocks.last().unwrap();
+                            warn!("Missing/corrupted blocks: first={}, last={}, count={}", 
+                                first_missing, last_missing, result.missing_blocks.len());
+                            warn!("To regenerate, run: --log-block on --begin {} --end {}", 
+                                first_missing, self.end_number);
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        error!("Index rebuild error: {}", e);
+                        return Err(e);
+                    }
+                }
+            } else {
+                return Err(eyre::eyre!("--rebuild-idx requires --log-dir to be set"));
+            }
+        }
+        
         // 测试模式：启用内存模式（将 bin 文件完全读入内存，无压缩）
         // 可以通过环境变量 PEVM_IN_MEMORY_MODE=true 启用
         let enable_in_memory_mode = std::env::var("PEVM_IN_MEMORY_MODE")
@@ -2337,6 +2368,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         .collect();
                                     
                                     // 从 mmap 读取（零拷贝）
+                                    // 返回格式: Vec<(block_number, Option<data>)>，缺失的块返回 None
                                     let db_guard = db.read().unwrap();
                                     let batch_data = db_guard.read_block_logs_batch(&block_numbers);
                                     
@@ -2345,47 +2377,53 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         Arc::new(blockchain_db.history_by_block_number(task.start.checked_sub(1).unwrap_or(0))?);
                                     
                                     // 为每个块创建 DbLoggedDatabase 并执行（零拷贝版本）
+                                    // 对于缺失的块，block_db_pairs 中的值为 None
                                     let mut block_db_pairs: Vec<(u64, Option<DbLoggedDatabase<'_>>)> = Vec::with_capacity(blocks_len);
                                     
-                                    for (bn, data) in batch_data.iter() {
-                                        match DbLoggedDatabase::new(data, shared_state_provider.clone()) {
-                                            Ok(db) => block_db_pairs.push((*bn, Some(db))),
-                                            Err(e) => {
-                                                warn!("Failed to create DbLoggedDatabase for block {}: {}", bn, e);
-                                                block_db_pairs.push((*bn, None));
+                                    for (bn, data_opt) in batch_data.iter() {
+                                        if let Some(data) = data_opt {
+                                            match DbLoggedDatabase::new(data, shared_state_provider.clone()) {
+                                                Ok(db) => block_db_pairs.push((*bn, Some(db))),
+                                                Err(e) => {
+                                                    warn!("Failed to create DbLoggedDatabase for block {}: {}", bn, e);
+                                                    block_db_pairs.push((*bn, None));
+                                                }
                                             }
+                                        } else {
+                                            // 日志中缺失的块
+                                            block_db_pairs.push((*bn, None));
                                         }
                                     }
                                     
                                     // 执行每个块
+                                    // block_db_pairs 与 blocks 一一对应（顺序相同）
                                     let mut db_iter = block_db_pairs.into_iter();
                                     for block in blocks.iter() {
                                         let block_number = block.sealed_block().header().number;
                                         
-                                        if let Some((db_block_number, Some(mut logged_db))) = db_iter.next() {
+                                        if let Some((db_block_number, db_opt)) = db_iter.next() {
+                                            // 验证块号匹配（应该总是匹配，因为我们保持了顺序）
                                             if db_block_number != block_number {
-                                                error!("Block number mismatch: expected {}, got {}", block_number, db_block_number);
+                                                error!("Block number mismatch: expected {}, got {} (this should not happen)", block_number, db_block_number);
                                                 continue;
                                             }
                                             
-                                            // 执行块
-                                            let executor = evm_config.batch_executor(&mut logged_db);
-                                            if let Err(e) = executor.execute_batch(std::iter::once(block)) {
-                                                error!("Execution error for block {} using mmap DbLoggedDatabase: {}", block_number, e);
-                                            }
-                                            
-                                            // 更新统计
-                                            let txs = block.sealed_block().body().transaction_count();
-                                            *cumulative_gas.lock().unwrap() += block.sealed_block().header().gas_used;
-                                            *txs_counter.lock().unwrap() += txs as u64;
-                                        } else {
-                                            // 使用数据库直接执行
-                                            let db = StateProviderDatabase::new(
-                                                blockchain_db.history_by_block_number(block_number.saturating_sub(1))?
-                                            );
-                                            let executor = evm_config.batch_executor(db);
-                                            if let Err(e) = executor.execute_batch(std::iter::once(block)) {
-                                                error!("Execution error for block {} using StateProviderDatabase: {}", block_number, e);
+                                            if let Some(mut logged_db) = db_opt {
+                                                // 使用日志数据执行块
+                                                let executor = evm_config.batch_executor(&mut logged_db);
+                                                if let Err(e) = executor.execute_batch(std::iter::once(block)) {
+                                                    error!("Execution error for block {} using mmap DbLoggedDatabase: {}", block_number, e);
+                                                }
+                                            } else {
+                                                // 日志中缺失的块，使用数据库直接执行
+                                                debug!(target: "exex::evm", "Block {} missing in log, using database", block_number);
+                                                let db = StateProviderDatabase::new(
+                                                    blockchain_db.history_by_block_number(block_number.saturating_sub(1))?
+                                                );
+                                                let executor = evm_config.batch_executor(db);
+                                                if let Err(e) = executor.execute_batch(std::iter::once(block)) {
+                                                    error!("Execution error for block {} using StateProviderDatabase: {}", block_number, e);
+                                                }
                                             }
                                             
                                             // 更新统计
@@ -2596,37 +2634,38 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                     }
                                     
                                     // 第二步：按顺序执行所有块
-                                    // 关键性能优化：直接按顺序匹配，避免 O(n²) 的 find() 查找
-                                    // block_db_pairs 已经是按 blocks 的顺序创建的，可以直接按索引匹配
-                                    let mut db_iter = block_db_pairs.into_iter();
+                                    // block_db_pairs 可能比 blocks 少（缺失的块不在日志中）
+                                    // 使用 HashMap 来快速查找，对于缺失的块使用数据库直接执行
+                                    let mut block_db_map: std::collections::HashMap<u64, LoggedDatabase> = 
+                                        block_db_pairs.into_iter().collect();
+                                    
                                     for block in blocks.iter() {
                                         // 性能优化：移除热路径上的日志检查，直接判断停止标志
                                         if should_stop_worker.load(Ordering::Relaxed) {
                                             return Ok(());
                                         }
                                         
-                                        // 直接取下一个 LoggedDatabase（已经按顺序匹配）
-                                        if let Some((db_block_number, logged_db)) = db_iter.next() {
-                                            let block_number = block.sealed_block().header().number;
-                                            // 验证块号匹配（调试用，仅在不匹配时打印）
-                                            if db_block_number != block_number {
-                                                error!("Block number mismatch: expected {}, got {}", block_number, db_block_number);
-                                                continue;
-                                            }
-                                            
-                                            // 创建 executor（每个块需要不同的 LoggedDatabase）
+                                        let block_number = block.sealed_block().header().number;
+                                        
+                                        // 查找日志数据库，如果存在则使用日志执行，否则使用数据库直接执行
+                                        // 使用 remove 取出所有权
+                                        if let Some(logged_db) = block_db_map.remove(&block_number) {
+                                            // 使用日志数据执行块
                                             let executor = evm_config.batch_executor(logged_db);
-                                            
-                                            // 执行单个块
                                             let _output = executor.execute(block)?;
-                                            
-                                            // 性能优化：移除热路径上的日志检查
-                                            if should_stop_worker.load(Ordering::Relaxed) {
-                                                return Ok(());
-                                            }
                                         } else {
-                                            error!("LoggedDatabase exhausted before blocks finished");
-                                            break;
+                                            // 日志中缺失的块，使用数据库直接执行
+                                            debug!(target: "exex::evm", "Block {} missing in log (filesystem mode), using database", block_number);
+                                            let db = StateProviderDatabase::new(
+                                                blockchain_db.history_by_block_number(block_number.saturating_sub(1))?
+                                            );
+                                            let executor = evm_config.batch_executor(db);
+                                            let _output = executor.execute(block)?;
+                                        }
+                                        
+                                        // 性能优化：移除热路径上的日志检查
+                                        if should_stop_worker.load(Ordering::Relaxed) {
+                                            return Ok(());
                                         }
                                     }
                                     // 文件系统模式：统计更新

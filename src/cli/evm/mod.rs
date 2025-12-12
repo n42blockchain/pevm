@@ -2225,20 +2225,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             // 块存在检查函数（用于补齐模式：跳过已存在且有效的块）
                             // mmap 模式：使用 block_exists() 精确检查（包括损坏检测）
                             // 文件系统模式：使用 HashSet 检查
-                            let missing_count = std::sync::atomic::AtomicU64::new(0);
                             let worker_block_exists = |block_num: u64| -> bool {
                                 if let Some(ref db) = mmap_log_db_clone {
                                     // mmap 模式：精确检查块是否存在且数据有效（包括损坏检测）
                                     let db_guard = db.read().unwrap();
-                                    let exists = db_guard.block_exists(block_num);
-                                    // 调试：如果块不存在或损坏，记录日志
-                                    if !exists {
-                                        let count = missing_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        if count < 10 {
-                                            info!(target: "exex::evm", "Block {} does not exist in mmap log, will process", block_num);
-                                        }
-                                    }
-                                    exists
+                                    db_guard.block_exists(block_num)
                                 } else {
                                     // 文件系统模式：使用 HashSet 检查
                                     existing_blocks_clone.contains(&block_num)
@@ -2273,7 +2264,6 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             // 如果使用累加模式且启用了日志记录（--log-block on）且所有块都已存在，跳过执行
                             if let Some(_log_dir) = &log_dir_clone {
                                 if log_block_enabled && blocks_to_process_numbers.is_empty() {
-                                    debug!(target: "exex::evm", task_start = task.start, task_end = task.end, "All blocks in task already exist, skipping execution");
                                     return Ok(());
                                 }
                             }
@@ -2420,7 +2410,6 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                                 }
                                             } else {
                                                 // 日志中缺失的块，使用数据库直接执行
-                                                debug!(target: "exex::evm", "Block {} missing in log, using database", block_number);
                                                 let db = StateProviderDatabase::new(
                                                     blockchain_db.history_by_block_number(block_number.saturating_sub(1))?
                                                 );
@@ -2659,7 +2648,6 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                             let _output = executor.execute(block)?;
                                         } else {
                                             // 日志中缺失的块，使用数据库直接执行
-                                            debug!(target: "exex::evm", "Block {} missing in log (filesystem mode), using database", block_number);
                                             let db = StateProviderDatabase::new(
                                                 blockchain_db.history_by_block_number(block_number.saturating_sub(1))?
                                             );

@@ -29,6 +29,172 @@ use tracing::{info, warn, error};
 
 use super::ReadLogEntry;
 
+/// 只读状态日志数据库（无锁，用于 --use-log on 模式）
+/// 
+/// 特点：
+/// - 完全无锁，多线程可直接并行访问
+/// - 只包含只读操作所需的字段
+/// - 使用 Arc 包装，可在多线程间共享
+pub struct MmapStateLogReader {
+    /// 数据文件的内存映射（只读）
+    mmap_data: memmap2::Mmap,
+    /// 索引：block_number -> (offset, length)
+    index: HashMap<u64, (u64, u32)>,
+    /// 数据文件大小
+    data_end: u64,
+}
+
+impl std::fmt::Debug for MmapStateLogReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MmapStateLogReader")
+            .field("index_count", &self.index.len())
+            .field("data_end", &self.data_end)
+            .finish_non_exhaustive()
+    }
+}
+
+// 显式实现 Sync，允许多线程无锁访问
+// 安全性：mmap_data 和 index 在创建后都是只读的
+unsafe impl Sync for MmapStateLogReader {}
+
+impl MmapStateLogReader {
+    /// 从 MmapStateLogDatabase 创建只读访问器
+    pub fn from_database(db: &MmapStateLogDatabase) -> eyre::Result<Option<Self>> {
+        // 需要有数据文件路径才能创建只读访问器
+        if db.index.is_empty() {
+            return Ok(None);
+        }
+        
+        // 重新打开并映射数据文件（因为 Mmap 不支持 clone）
+        let data_file = File::open(&db.data_file_path)?;
+        let mmap_data = unsafe { memmap2::Mmap::map(&data_file)? };
+        
+        Ok(Some(Self {
+            mmap_data,
+            index: db.index.clone(),
+            data_end: db.data_end,
+        }))
+    }
+    
+    /// 从文件直接打开（只读模式）
+    pub fn open(log_dir: &Path) -> eyre::Result<Self> {
+        let data_path = log_dir.join("state_logs_data.bin");
+        let index_path = log_dir.join("state_logs_index.bin");
+        
+        if !data_path.exists() || !index_path.exists() {
+            return Err(eyre::eyre!("Log files not found"));
+        }
+        
+        // 打开并映射数据文件
+        let data_file = File::open(&data_path)?;
+        let data_end = data_file.metadata()?.len();
+        let mmap_data = unsafe { memmap2::Mmap::map(&data_file)? };
+        
+        // 验证数据文件头部
+        if mmap_data.len() < 32 {
+            return Err(eyre::eyre!("Data file too small"));
+        }
+        if &mmap_data[0..8] != b"STLOGDT2" {
+            return Err(eyre::eyre!("Invalid data file format"));
+        }
+        
+        // 读取索引文件
+        let mut index_file = File::open(&index_path)?;
+        let mut header = [0u8; 32];
+        index_file.read_exact(&mut header)?;
+        
+        if &header[0..8] != b"STLOGIX2" {
+            return Err(eyre::eyre!("Invalid index file format"));
+        }
+        
+        let header_block_count = u64::from_le_bytes(header[12..20].try_into().unwrap());
+        
+        // 读取索引条目
+        let index_file_size = index_file.metadata()?.len();
+        let actual_entry_count = (index_file_size.saturating_sub(32)) / 20;
+        let entry_count = std::cmp::max(header_block_count, actual_entry_count);
+        
+        let mut index = HashMap::with_capacity(entry_count as usize);
+        let mut entry_buf = [0u8; 20];
+        
+        while index_file.read_exact(&mut entry_buf).is_ok() {
+            let block_number = u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
+            let offset = u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
+            let length = u32::from_le_bytes(entry_buf[16..20].try_into().unwrap());
+            
+            // 验证条目有效性
+            let is_valid = block_number < 100_000_000
+                && offset >= 32
+                && offset <= data_end
+                && length > 0
+                && length < 10_000_000;
+            
+            if is_valid {
+                index.insert(block_number, (offset, length));
+            }
+        }
+        
+        info!("MmapStateLogReader opened: {} blocks indexed", index.len());
+        
+        Ok(Self {
+            mmap_data,
+            index,
+            data_end,
+        })
+    }
+    
+    /// 读取块的日志数据（零拷贝，无锁）
+    #[inline]
+    pub fn read_block_log(&self, block_number: u64) -> Option<&[u8]> {
+        let (offset, length) = self.index.get(&block_number)?;
+        let start = *offset as usize;
+        let end = start + *length as usize;
+        if end <= self.mmap_data.len() {
+            Some(&self.mmap_data[start..end])
+        } else {
+            None
+        }
+    }
+    
+    /// 批量读取多个块的日志数据（零拷贝，无锁）
+    #[inline]
+    pub fn read_block_logs_batch(&self, block_numbers: &[u64]) -> Vec<(u64, Option<&[u8]>)> {
+        block_numbers.iter()
+            .map(|&bn| (bn, self.read_block_log(bn)))
+            .collect()
+    }
+    
+    /// 检查块是否存在且数据有效（无锁）
+    #[inline]
+    pub fn block_exists(&self, block_number: u64) -> bool {
+        if let Some((offset, length)) = self.index.get(&block_number) {
+            // 验证索引数据范围是否有效
+            *offset >= 32
+                && *length > 0
+                && *length < 10_000_000
+                && (*offset + *length as u64) <= self.data_end
+        } else {
+            false
+        }
+    }
+    
+    /// 获取块数量
+    #[inline]
+    pub fn block_count(&self) -> usize {
+        self.index.len()
+    }
+    
+    /// 获取块范围
+    pub fn get_block_range(&self) -> Option<(u64, u64)> {
+        if self.index.is_empty() {
+            return None;
+        }
+        let min = *self.index.keys().min().unwrap();
+        let max = *self.index.keys().max().unwrap();
+        Some((min, max))
+    }
+}
+
 /// 内存映射状态日志数据库（v2 - 分离索引，Windows 兼容）
 /// 
 /// 特点：

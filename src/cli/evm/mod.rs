@@ -5,7 +5,7 @@ mod profiling;
 mod state_log;
 mod logged_db;
 
-pub use state_log::MmapStateLogDatabase;
+pub use state_log::{MmapStateLogDatabase, MmapStateLogReader};
 pub use logged_db::DbLoggedDatabase;
 
 use clap::Parser;
@@ -1869,26 +1869,21 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         // 检查是否启用日志记录模式（用于决定是否跳过已存在的块）
         let log_block_enabled = self.log_block.as_ref().map(|s| s == "on").unwrap_or(false);
         
-        // 如果启用了 mmap 日志模式（--mmap-log），初始化 MmapStateLogDatabase
-        // mmap 模式优先于文件系统模式（更适合大数据集，支持断点续传）
-        let mmap_log_db: Option<Arc<std::sync::RwLock<MmapStateLogDatabase>>> = if self.use_mmap_log {
+        // 检查是否启用从日志执行模式
+        let use_log_enabled = self.use_log.as_ref().map(|s| s == "on").unwrap_or(false);
+        
+        // 如果启用了 mmap 日志模式（--mmap-log），初始化数据库
+        // - 写入模式（--log-block on）：使用 MmapStateLogDatabase + RwLock
+        // - 读取模式（--use-log on）：使用 MmapStateLogReader（无锁，性能更好）
+        let mmap_log_db: Option<Arc<std::sync::RwLock<MmapStateLogDatabase>>> = if self.use_mmap_log && log_block_enabled {
             if let Some(log_dir) = log_dir {
-                // 根据模式选择不同的打开方式：
-                // - 写入模式（--log-block on）：不创建 mmap，避免 Windows 大文件 mmap 问题
-                // - 读取模式（--use-log on）：创建 mmap 用于快速读取
-                let db_result = if log_block_enabled {
-                    MmapStateLogDatabase::open_for_write(log_dir)
-                } else {
-                    MmapStateLogDatabase::open(log_dir)
-                };
-                
-                match db_result {
+                match MmapStateLogDatabase::open_for_write(log_dir) {
                     Ok(db) => {
                         if let Some((min, max)) = db.get_block_range() {
-                            info!("Using mmap-based state log storage (--mmap-log mode): {} blocks, range {} - {}", 
+                            info!("Using mmap-based state log storage (WRITE mode): {} blocks, range {} - {}", 
                                 db.block_count(), min, max);
                         } else {
-                            info!("Using mmap-based state log storage (--mmap-log mode): empty database");
+                            info!("Using mmap-based state log storage (WRITE mode): empty database");
                         }
                         Some(Arc::new(std::sync::RwLock::new(db)))
                     }
@@ -1899,6 +1894,31 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 }
             } else {
                 warn!("--mmap-log requires --log-dir to be set.");
+                None
+            }
+        } else {
+            None
+        };
+        
+        // 无锁只读访问器（用于 --use-log on 模式，性能更好）
+        let mmap_log_reader: Option<Arc<MmapStateLogReader>> = if self.use_mmap_log && use_log_enabled && !log_block_enabled {
+            if let Some(log_dir) = log_dir {
+                match MmapStateLogReader::open(log_dir) {
+                    Ok(reader) => {
+                        if let Some((min, max)) = reader.get_block_range() {
+                            info!("Using mmap-based state log storage (READ mode, lock-free): {} blocks, range {} - {}", 
+                                reader.block_count(), min, max);
+                        } else {
+                            info!("Using mmap-based state log storage (READ mode, lock-free): empty database");
+                        }
+                        Some(Arc::new(reader))
+                    }
+                    Err(e) => {
+                        warn!("Failed to open MmapStateLogReader: {}. Falling back to locked mode.", e);
+                        None
+                    }
+                }
+            } else {
                 None
             }
         } else {
@@ -2153,8 +2173,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             let global_log_file_handle_clone = global_log_file_handle.clone();
             // 将内存模式标志传递给 worker 线程
             let enable_in_memory_mode_clone = enable_in_memory_mode;
-            // mmap 日志模式
+            // mmap 日志模式（写入用）
             let mmap_log_db_clone = mmap_log_db.clone();
+            // mmap 无锁只读访问器（读取用，性能更好）
+            let mmap_log_reader_clone = mmap_log_reader.clone();
 
             // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
             threads.push(thread::spawn(move || {
@@ -2352,8 +2374,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                 // 如果启用了从日志执行（--use-log on），为每个块从累计日志中读取并执行
                                 // 性能优化：批量预加载所有块的日志数据，减少文件I/O和创建开销
                                 
-                                // 优先使用 mmap 模式（零拷贝，适合大数据集）
-                                if let Some(ref db) = mmap_log_db_clone {
+                                // 优先使用无锁 mmap reader（零拷贝，无锁，性能最好）
+                                if let Some(ref reader) = mmap_log_reader_clone {
                                     let blocks_len = blocks.len();
                                     
                                     // 获取所有需要的块号
@@ -2361,10 +2383,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         .map(|b| b.sealed_block().header().number)
                                         .collect();
                                     
-                                    // 从 mmap 读取（零拷贝）
+                                    // 从 mmap 读取（零拷贝，无锁！）
                                     // 返回格式: Vec<(block_number, Option<data>)>，缺失的块返回 None
-                                    let db_guard = db.read().unwrap();
-                                    let batch_data = db_guard.read_block_logs_batch(&block_numbers);
+                                    let batch_data = reader.read_block_logs_batch(&block_numbers);
                                     
                                     // 创建共享的 StateProvider
                                     let shared_state_provider: Arc<dyn reth_provider::StateProvider> = 

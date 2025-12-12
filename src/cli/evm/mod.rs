@@ -2225,14 +2225,18 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             // 块存在检查函数（用于补齐模式：跳过已存在且有效的块）
                             // mmap 模式：使用 block_exists() 精确检查（包括损坏检测）
                             // 文件系统模式：使用 HashSet 检查
+                            let missing_count = std::sync::atomic::AtomicU64::new(0);
                             let worker_block_exists = |block_num: u64| -> bool {
                                 if let Some(ref db) = mmap_log_db_clone {
                                     // mmap 模式：精确检查块是否存在且数据有效（包括损坏检测）
                                     let db_guard = db.read().unwrap();
                                     let exists = db_guard.block_exists(block_num);
                                     // 调试：如果块不存在或损坏，记录日志
-                                    if !exists && block_num == task.start {
-                                        debug!(target: "exex::evm", "Block {} does not exist or is corrupted in mmap log, will process", block_num);
+                                    if !exists {
+                                        let count = missing_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if count < 10 {
+                                            info!(target: "exex::evm", "Block {} does not exist in mmap log, will process", block_num);
+                                        }
                                     }
                                     exists
                                 } else {
@@ -2699,33 +2703,47 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                 let mut step_cumulative_gas: u64 = 0;
                                 let mut step_txs_counter: usize = 0;
 
-                                // 只统计实际处理的块（不包括已存在的块，用于断点续传）
-                                // 只在 --log-block on 模式下过滤已存在的块
-                                blocks.iter()
-                                    .filter(|block| {
-                                        let block_num = block.sealed_block().header().number;
-                                        if let Some(_log_dir) = &log_dir_clone {
-                                            if log_block_enabled {
-                                                !worker_block_exists(block_num)
-                                            } else {
-                                                true // 其他模式，统计所有块
-                                            }
-                                        } else {
-                                            true
-                                        }
-                                    })
-                                    .for_each(|block| {
+                                // 只统计实际处理的块（不包括已存在的块，用于补齐模式）
+                                // 使用 blocks_to_process_numbers 作为过滤依据，保持一致性
+                                // （避免因为其他线程 flush 导致 worker_block_exists() 返回不同结果）
+                                if let Some(_log_dir) = &log_dir_clone {
+                                    if log_block_enabled {
+                                        // --log-block on 模式：只统计需要处理的块
+                                        let blocks_to_process_set: std::collections::HashSet<u64> = 
+                                            blocks_to_process_numbers.iter().cloned().collect();
+                                        blocks.iter()
+                                            .filter(|block| {
+                                                let block_num = block.sealed_block().header().number;
+                                                blocks_to_process_set.contains(&block_num)
+                                            })
+                                            .for_each(|block| {
+                                                td += block.sealed_block().header().difficulty;
+                                                step_cumulative_gas += block.sealed_block().header().gas_used;
+                                                step_txs_counter += block.sealed_block().body().transaction_count();
+                                            });
+                                    } else {
+                                        // 其他模式，统计所有块
+                                        blocks.iter().for_each(|block| {
+                                            td += block.sealed_block().header().difficulty;
+                                            step_cumulative_gas += block.sealed_block().header().gas_used;
+                                            step_txs_counter += block.sealed_block().body().transaction_count();
+                                        });
+                                    }
+                                } else {
+                                    // 没有 log_dir，统计所有块
+                                    blocks.iter().for_each(|block| {
                                         td += block.sealed_block().header().difficulty;
                                         step_cumulative_gas += block.sealed_block().header().gas_used;
                                         step_txs_counter += block.sealed_block().body().transaction_count();
                                     });
+                                }
 
                                 // Ensure the locks are correctly used without deadlock
                                 {
                                     *cumulative_gas.lock().unwrap() += step_cumulative_gas;
                                 }
                                 {
-                                    // 只统计实际处理的块数（不包括已存在的块，用于断点续传）
+                                    // 只统计实际处理的块数（不包括已存在的块，用于补齐模式）
                                     let processed_count = if let Some(_log_dir) = &log_dir_clone {
                                         blocks_to_process_numbers.len() as u64
                                     } else {

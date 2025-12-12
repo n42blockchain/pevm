@@ -2333,9 +2333,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         logs_guard.drain(..).collect::<Vec<_>>()
                                     };
                                     
-                                    if !logs.is_empty() {
-                                        block_logs.push((block_number, logs));
-                                    }
+                                    // 总是添加到 block_logs，即使日志为空
+                                    // 这样索引会被更新，表示这个块已经被处理过了
+                                    block_logs.push((block_number, logs));
                                 }
                                 
                                 // 批量写入日志（减少锁竞争和文件I/O）
@@ -2794,6 +2794,16 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                     }
                 }
             }
+            // 刷新 mmap 日志数据库
+            if let Some(ref mmap_db) = mmap_log_db {
+                if let Ok(mut db_guard) = mmap_db.write() {
+                    if let Err(e) = db_guard.flush() {
+                        warn!("Failed to flush mmap log database on Ctrl+C: {}", e);
+                    } else {
+                        info!("Mmap log database flushed on Ctrl+C ({} blocks pending)", 0);
+                    }
+                }
+            }
             info!("Ctrl+C received, waiting for threads to finish current tasks...");
             // 给线程一些时间完成当前任务，但不要无限等待
             let timeout = Duration::from_secs(5);
@@ -2828,6 +2838,21 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                     }
                     Err(e) => error!("Thread execution error: {:?}", e),
                 };
+            }
+            
+            // 正常结束时刷新 mmap 日志数据库
+            if let Some(ref mmap_db) = mmap_log_db {
+                if let Ok(mut db_guard) = mmap_db.write() {
+                    let pending_count = db_guard.pending_count();
+                    if pending_count > 0 {
+                        info!("Flushing {} pending blocks to mmap log database...", pending_count);
+                        if let Err(e) = db_guard.flush() {
+                            error!("Failed to flush mmap log database: {}", e);
+                        } else {
+                            info!("Mmap log database flushed successfully");
+                        }
+                    }
+                }
             }
         }
 

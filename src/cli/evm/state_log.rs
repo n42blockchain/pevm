@@ -716,6 +716,11 @@ impl MmapStateLogDatabase {
         self.index.len()
     }
     
+    /// 获取待写入的块数量
+    pub fn pending_count(&self) -> usize {
+        self.pending_writes.len()
+    }
+    
     /// 获取已存在的块号范围
     pub fn get_block_range(&self) -> Option<(u64, u64)> {
         if self.index.is_empty() {

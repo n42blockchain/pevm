@@ -6,7 +6,7 @@ mod state_log;
 mod logged_db;
 
 pub use state_log::{MmapStateLogDatabase, MmapStateLogReader};
-pub use logged_db::{DbLoggedDatabase, BytecodeCache};
+pub use logged_db::{DbLoggedDatabase, BytecodeCache, CachedStateProviderDatabase};
 
 use clap::Parser;
 use reth_chainspec::ChainSpec;
@@ -2029,7 +2029,6 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             current_start = current_end + 1;
         }
 
-
         // 性能优化：在程序开始时打开日志文件句柄，所有线程共享，程序结束时关闭
         // 如果启用了 --use-log on 且使用了日志目录，创建全局文件句柄
         let use_log_enabled = self.use_log.as_ref().map(|s| s == "on").unwrap_or(false);
@@ -2708,9 +2707,12 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                             let _output = executor.execute(block)?;
                                         } else {
                                             // 日志中缺失的块，使用数据库直接执行
-                                            // Windows 修复：显式管理 state_provider 生命周期
+                                            // Windows 修复：使用 CachedStateProviderDatabase 减少 MDBX 访问
                                             let state_provider = blockchain_db.history_by_block_number(block_number.saturating_sub(1))?;
-                                            let db = StateProviderDatabase::new(&state_provider);
+                                            let db = CachedStateProviderDatabase::new(
+                                                &state_provider,
+                                                Some(bytecode_cache_clone.clone()),
+                                            );
                                             let executor = evm_config.batch_executor(db);
                                             let _output = executor.execute(block)?;
                                             drop(state_provider);
@@ -2741,13 +2743,17 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                 }
                             } else {
                                 // 正常批量执行（不记录日志）
-                                // Windows 修复：显式管理 state_provider 生命周期，避免 MDBX mmap 积累
+                                // Windows 修复：使用 CachedStateProviderDatabase 减少 MDBX 访问
+                                // 通过缓存 bytecode/account/storage 显著减少数据库查询
+                                // 这是 --use-log 模式能稳定运行的关键原因之一
                                 let state_provider = blockchain_db.history_by_block_number(task.start - 1)?;
-                                let db = StateProviderDatabase::new(&state_provider);
+                                let db = CachedStateProviderDatabase::new(
+                                    &state_provider,
+                                    Some(bytecode_cache_clone.clone()),
+                                );
                                 let executor = evm_config.batch_executor(db);
                                 let _execute_result = executor.execute_batch(blocks.iter())?;
                                 // 显式释放 state_provider，减少 MDBX mmap 压力
-                                // 这在 Windows 上特别重要，可以避免 STATUS_IN_PAGE_ERROR
                                 drop(state_provider);
                             }
 

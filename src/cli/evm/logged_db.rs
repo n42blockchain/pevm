@@ -251,3 +251,124 @@ impl<'a> RevmDatabase for DbLoggedDatabase<'a> {
     }
 }
 
+// ============================================================================
+// CachedStateProviderDatabase: 用于纯 EVM 执行模式的带缓存数据库
+// ============================================================================
+
+/// 带缓存的 StateProviderDatabase 包装器
+/// 
+/// 用于纯 EVM 执行模式，通过缓存减少 MDBX 访问，避免 Windows 上的 STATUS_IN_PAGE_ERROR
+/// 
+/// 缓存策略：
+/// - BytecodeCache：全局共享，合约代码不可变
+/// - AccountCache：线程级别，每个 task 内有效（避免跨 task 状态污染）
+/// - StorageCache：线程级别，每个 task 内有效
+pub struct CachedStateProviderDatabase<'a> {
+    state_provider: &'a dyn reth_provider::StateProvider,
+    bytecode_cache: Option<Arc<BytecodeCache>>,
+    // 线程级别缓存：减少同一 task 内的重复查询
+    account_cache: HashMap<Address, Option<AccountInfo>>,
+    storage_cache: HashMap<(Address, U256), U256>,
+    block_hash_cache: HashMap<u64, B256>,
+}
+
+impl<'a> std::fmt::Debug for CachedStateProviderDatabase<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedStateProviderDatabase")
+            .field("bytecode_cache", &self.bytecode_cache.as_ref().map(|c| c.len()))
+            .field("account_cache_size", &self.account_cache.len())
+            .field("storage_cache_size", &self.storage_cache.len())
+            .field("block_hash_cache_size", &self.block_hash_cache.len())
+            .finish()
+    }
+}
+
+impl<'a> CachedStateProviderDatabase<'a> {
+    /// 创建新的带缓存数据库
+    pub fn new(
+        state_provider: &'a dyn reth_provider::StateProvider,
+        bytecode_cache: Option<Arc<BytecodeCache>>,
+    ) -> Self {
+        Self {
+            state_provider,
+            bytecode_cache,
+            account_cache: HashMap::new(),
+            storage_cache: HashMap::new(),
+            block_hash_cache: HashMap::new(),
+        }
+    }
+}
+
+impl<'a> RevmDatabase for CachedStateProviderDatabase<'a> {
+    type Error = <StateProviderDatabase<Box<dyn reth_provider::StateProvider>> as RevmDatabase>::Error;
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        // 先查本地缓存
+        if let Some(cached) = self.account_cache.get(&address) {
+            return Ok(cached.clone());
+        }
+        
+        // 缓存未命中，查询数据库
+        let mut inner_db = StateProviderDatabase::new(self.state_provider);
+        let result = inner_db.basic(address)?;
+        
+        // 写入本地缓存
+        self.account_cache.insert(address, result.clone());
+        
+        Ok(result)
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        // 先查全局缓存（合约代码不可变，可以跨 task 共享）
+        if let Some(ref cache) = self.bytecode_cache {
+            if let Some(bytecode) = cache.get(&code_hash) {
+                return Ok(bytecode);
+            }
+        }
+        
+        // 缓存未命中，查询数据库
+        let mut inner_db = StateProviderDatabase::new(self.state_provider);
+        let bytecode = inner_db.code_by_hash(code_hash)?;
+        
+        // 写入全局缓存
+        if let Some(ref cache) = self.bytecode_cache {
+            cache.insert(code_hash, bytecode.clone());
+        }
+        
+        Ok(bytecode)
+    }
+
+    fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        // 先查本地缓存
+        let key = (address, index);
+        if let Some(&cached) = self.storage_cache.get(&key) {
+            return Ok(cached);
+        }
+        
+        // 缓存未命中，查询数据库
+        let mut inner_db = StateProviderDatabase::new(self.state_provider);
+        let value = inner_db.storage(address, index)?;
+        
+        // 写入本地缓存
+        self.storage_cache.insert(key, value);
+        
+        Ok(value)
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        // 先查本地缓存
+        if let Some(&cached) = self.block_hash_cache.get(&number) {
+            return Ok(cached);
+        }
+        
+        // 缓存未命中，查询数据库
+        let mut inner_db = StateProviderDatabase::new(self.state_provider);
+        let hash = inner_db.block_hash(number)?;
+        
+        // 写入本地缓存
+        self.block_hash_cache.insert(number, hash);
+        
+        Ok(hash)
+    }
+}
+

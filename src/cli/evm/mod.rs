@@ -2683,11 +2683,12 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                             let _output = executor.execute(block)?;
                                         } else {
                                             // 日志中缺失的块，使用数据库直接执行
-                                            let db = StateProviderDatabase::new(
-                                                blockchain_db.history_by_block_number(block_number.saturating_sub(1))?
-                                            );
+                                            // Windows 修复：显式管理 state_provider 生命周期
+                                            let state_provider = blockchain_db.history_by_block_number(block_number.saturating_sub(1))?;
+                                            let db = StateProviderDatabase::new(&state_provider);
                                             let executor = evm_config.batch_executor(db);
                                             let _output = executor.execute(block)?;
+                                            drop(state_provider);
                                         }
                                         
                                         // 性能优化：移除热路径上的日志检查
@@ -2715,9 +2716,14 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                 }
                             } else {
                                 // 正常批量执行（不记录日志）
-                                let db = StateProviderDatabase::new(blockchain_db.history_by_block_number(task.start - 1)?);
+                                // Windows 修复：显式管理 state_provider 生命周期，避免 MDBX mmap 积累
+                                let state_provider = blockchain_db.history_by_block_number(task.start - 1)?;
+                                let db = StateProviderDatabase::new(&state_provider);
                                 let executor = evm_config.batch_executor(db);
                                 let _execute_result = executor.execute_batch(blocks.iter())?;
+                                // 显式释放 state_provider，减少 MDBX mmap 压力
+                                // 这在 Windows 上特别重要，可以避免 STATUS_IN_PAGE_ERROR
+                                drop(state_provider);
                             }
 
                             // 通用统计代码（仅用于非 use_log 模式）
@@ -2784,16 +2790,21 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             error!("Thread {:?} execution error: {:?}", thread_id, e);
                         }
                         
-                        // 定期刷新 state_provider，避免 MDBX 读事务超时（300秒）
-                        if use_log_enabled && state_provider_created_at.elapsed() > STATE_PROVIDER_REFRESH_INTERVAL {
-                            // 创建新的 state_provider（旧的会自动 drop）
-                            thread_level_state_provider = match blockchain_db.history_by_block_number(0) {
-                                Ok(sp) => Some(Arc::new(sp)),
-                                Err(e) => {
-                                    error!("Failed to refresh thread-level state provider: {}", e);
-                                    None
-                                }
-                            };
+                        // 定期刷新 state_provider，避免 MDBX 读事务超时和 mmap 资源积累
+                        // Windows 上长时间运行的 mmap 映射可能会导致 STATUS_IN_PAGE_ERROR
+                        // 所有模式都需要定期刷新，不仅仅是 use_log 模式
+                        if state_provider_created_at.elapsed() > STATE_PROVIDER_REFRESH_INTERVAL {
+                            if use_log_enabled {
+                                // use_log 模式：刷新线程级别的 state_provider
+                                thread_level_state_provider = match blockchain_db.history_by_block_number(0) {
+                                    Ok(sp) => Some(Arc::new(sp)),
+                                    Err(e) => {
+                                        error!("Failed to refresh thread-level state provider: {}", e);
+                                        None
+                                    }
+                                };
+                            }
+                            // 重置计时器（所有模式）
                             state_provider_created_at = std::time::Instant::now();
                         }
                     }

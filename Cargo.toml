@@ -120,12 +120,23 @@ rand_xorshift.opt-level = 3
 unarray.opt-level = 3
 hash-db.opt-level = 3
 triehash.opt-level = 3
+# revm 核心包（v31 新架构）
 revm.opt-level = 3
 revm-primitives.opt-level = 3
 revm-interpreter.opt-level = 3
 revm-database.opt-level = 3
+revm-database-interface.opt-level = 3
 revm-state.opt-level = 3
 revm-bytecode.opt-level = 3
+revm-context.opt-level = 3
+revm-context-interface.opt-level = 3
+revm-handler.opt-level = 3
+revm-inspector.opt-level = 3
+revm-precompile.opt-level = 3
+# alloy-evm（新）
+alloy-evm.opt-level = 3
+op-revm.opt-level = 3
+# reth 相关
 reth-evm.opt-level = 3
 reth-revm.opt-level = 3
 reth-trie.opt-level = 3

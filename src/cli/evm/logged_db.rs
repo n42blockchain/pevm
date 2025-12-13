@@ -14,6 +14,7 @@ use crate::revm::state::{AccountInfo, Bytecode};
 
 /// 全局 Bytecode 缓存（合约代码不可变，可以安全缓存）
 /// 使用 RwLock 实现线程安全的读写访问
+/// 注意：Bytecode 内部使用 Bytes（引用计数），克隆成本很低
 pub struct BytecodeCache {
     cache: RwLock<HashMap<B256, Bytecode>>,
 }
@@ -34,7 +35,7 @@ impl BytecodeCache {
         }
     }
     
-    /// 查询缓存
+    /// 查询缓存（Bytecode 克隆成本很低，内部使用 Bytes 引用计数）
     #[inline]
     pub fn get(&self, code_hash: &B256) -> Option<Bytecode> {
         self.cache.read().ok()?.get(code_hash).cloned()
@@ -208,7 +209,7 @@ impl<'a> RevmDatabase for DbLoggedDatabase<'a> {
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        // 性能优化：先查缓存（无锁读取路径更快）
+        // 性能优化：先查缓存（Bytecode 克隆成本很低，内部使用 Bytes 引用计数）
         if let Some(ref cache) = self.bytecode_cache {
             if let Some(bytecode) = cache.get(&code_hash) {
                 return Ok(bytecode);

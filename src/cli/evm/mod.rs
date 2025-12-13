@@ -22,7 +22,7 @@ use reth_cli_commands::common::{AccessRights, Environment, EnvironmentArgs};
 
 use reth_consensus::FullConsensus;
 use reth_provider::{
-    BlockNumReader, HeaderProvider, ProviderError, 
+    BlockNumReader, HeaderProvider, ProviderError,
     providers::BlockchainProvider, BlockReader, ChainSpecProvider, StateProviderFactory,
 };
 use reth_errors::ConsensusError;

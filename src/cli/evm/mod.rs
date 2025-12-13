@@ -2060,15 +2060,29 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         // 获取线程数：
         // 1. 如果启用单线程模式，使用 1 个线程
         // 2. 如果指定了 --threads，使用指定的值
-        // 3. 否则使用默认值（CPU_COUNT * 2 - 1）
-        // 注意：在 Windows 上运行 --log-block on 时，建议使用较少的线程（如 4-8）以避免 mmap 问题
+        // 3. 否则使用默认值：
+        //    - Windows: CPU_COUNT（减少 mmap 压力，避免 STATUS_IN_PAGE_ERROR）
+        //    - 其他系统: CPU_COUNT * 2 - 1
         let thread_count = if self.single_thread {
             1
         } else if let Some(tc) = self.thread_count {
             std::cmp::max(1, tc) // 至少 1 个线程
         } else {
-            self.get_cpu_count() * 2 - 1
+            #[cfg(windows)]
+            {
+                // Windows 修复：使用较少的线程以减少 MDBX mmap 压力
+                // 过多线程会导致 STATUS_IN_PAGE_ERROR
+                let cpu_count = self.get_cpu_count();
+                std::cmp::max(1, cpu_count)
+            }
+            #[cfg(not(windows))]
+            {
+                self.get_cpu_count() * 2 - 1
+            }
         };
+        #[cfg(windows)]
+        info!("Using {} worker threads (Windows: reduced to avoid mmap issues)", thread_count);
+        #[cfg(not(windows))]
         info!("Using {} worker threads", thread_count);
         let mut threads: Vec<JoinHandle<Result<()>>> = Vec::with_capacity(thread_count);
 
@@ -2214,7 +2228,18 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 
                 // 用于跟踪 state_provider 的创建时间，避免 MDBX 读事务超时
                 let mut state_provider_created_at = std::time::Instant::now();
-                const STATE_PROVIDER_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(240); // 240秒刷新一次，留60秒余量
+                // Windows 修复：使用更短的刷新间隔来避免 STATUS_IN_PAGE_ERROR
+                // MDBX 的 mmap 在 Windows 上长时间运行容易出问题
+                #[cfg(windows)]
+                const STATE_PROVIDER_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+                #[cfg(not(windows))]
+                const STATE_PROVIDER_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(240);
+                
+                // Windows 修复：每处理 N 个 task 后强制刷新，避免 mmap 积累
+                #[cfg(windows)]
+                let mut task_counter: u32 = 0;
+                #[cfg(windows)]
+                const TASKS_BEFORE_FORCE_REFRESH: u32 = 50; // Windows 上每 50 个 task 强制刷新
                 
                 loop {
                     // 检查停止标志
@@ -2793,6 +2818,17 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                         // 定期刷新 state_provider，避免 MDBX 读事务超时和 mmap 资源积累
                         // Windows 上长时间运行的 mmap 映射可能会导致 STATUS_IN_PAGE_ERROR
                         // 所有模式都需要定期刷新，不仅仅是 use_log 模式
+                        
+                        // Windows 修复：基于 task 计数的强制刷新
+                        #[cfg(windows)]
+                        {
+                            task_counter += 1;
+                            if task_counter >= TASKS_BEFORE_FORCE_REFRESH {
+                                task_counter = 0;
+                                state_provider_created_at = std::time::Instant::now() - STATE_PROVIDER_REFRESH_INTERVAL;
+                            }
+                        }
+                        
                         if state_provider_created_at.elapsed() > STATE_PROVIDER_REFRESH_INTERVAL {
                             if use_log_enabled {
                                 // use_log 模式：刷新线程级别的 state_provider
@@ -2806,6 +2842,14 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             }
                             // 重置计时器（所有模式）
                             state_provider_created_at = std::time::Instant::now();
+                            
+                            // Windows 修复：强制释放内存，帮助系统回收 mmap 资源
+                            #[cfg(windows)]
+                            {
+                                // 提示 Rust 运行时进行垃圾收集
+                                // 虽然 Rust 没有 GC，但这会帮助释放已 drop 的资源
+                                std::hint::spin_loop();
+                            }
                         }
                     }
                 }

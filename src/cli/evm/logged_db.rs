@@ -2,7 +2,8 @@
 //! 
 //! 提供从日志数据读取的 Database 实现，用于 EVM 执行
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use alloy_primitives::{Address, B256, U256};
 use reth_codecs::Compact;
 use reth_primitives::Account;
@@ -10,6 +11,54 @@ use reth_revm::database::StateProviderDatabase;
 
 use crate::revm::Database as RevmDatabase;
 use crate::revm::state::{AccountInfo, Bytecode};
+
+/// 全局 Bytecode 缓存（合约代码不可变，可以安全缓存）
+/// 使用 RwLock 实现线程安全的读写访问
+pub struct BytecodeCache {
+    cache: RwLock<HashMap<B256, Bytecode>>,
+}
+
+impl std::fmt::Debug for BytecodeCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BytecodeCache")
+            .field("cache_size", &self.len())
+            .finish()
+    }
+}
+
+impl BytecodeCache {
+    /// 创建新的缓存
+    pub fn new() -> Self {
+        Self {
+            cache: RwLock::new(HashMap::with_capacity(100_000)),
+        }
+    }
+    
+    /// 查询缓存
+    #[inline]
+    pub fn get(&self, code_hash: &B256) -> Option<Bytecode> {
+        self.cache.read().ok()?.get(code_hash).cloned()
+    }
+    
+    /// 插入缓存
+    #[inline]
+    pub fn insert(&self, code_hash: B256, bytecode: Bytecode) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.insert(code_hash, bytecode);
+        }
+    }
+    
+    /// 获取缓存大小
+    pub fn len(&self) -> usize {
+        self.cache.read().map(|c| c.len()).unwrap_or(0)
+    }
+}
+
+impl Default for BytecodeCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// 空 codehash 常量
 const EMPTY_CODE_HASH_BYTES: &[u8; 32] = &[
@@ -35,6 +84,8 @@ pub struct DbLoggedDatabase<'a> {
     pos: usize,
     /// 用于 code_by_hash 查询的状态提供者
     state_provider: Arc<dyn reth_provider::StateProvider>,
+    /// 全局 Bytecode 缓存（可选，用于减少数据库查询）
+    bytecode_cache: Option<Arc<BytecodeCache>>,
 }
 
 impl<'a> std::fmt::Debug for DbLoggedDatabase<'a> {
@@ -58,6 +109,26 @@ impl<'a> DbLoggedDatabase<'a> {
             data,
             pos: 8, // 跳过 count
             state_provider,
+            bytecode_cache: None,
+        })
+    }
+    
+    /// 从数据创建，带 Bytecode 缓存（零拷贝）
+    /// data 格式：count(8 bytes) + entries
+    #[inline]
+    pub fn new_with_cache(
+        data: &'a [u8], 
+        state_provider: Arc<dyn reth_provider::StateProvider>,
+        bytecode_cache: Arc<BytecodeCache>,
+    ) -> eyre::Result<Self> {
+        if data.len() < 8 {
+            return Err(eyre::eyre!("Invalid data: too short"));
+        }
+        Ok(Self {
+            data,
+            pos: 8, // 跳过 count
+            state_provider,
+            bytecode_cache: Some(bytecode_cache),
         })
     }
     
@@ -137,10 +208,25 @@ impl<'a> RevmDatabase for DbLoggedDatabase<'a> {
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        // 性能优化：先查缓存（无锁读取路径更快）
+        if let Some(ref cache) = self.bytecode_cache {
+            if let Some(bytecode) = cache.get(&code_hash) {
+                return Ok(bytecode);
+            }
+        }
+        
+        // 缓存未命中，查询数据库
         let mut inner_db = StateProviderDatabase::new(
             self.state_provider.as_ref() as &dyn reth_provider::StateProvider
         );
-        inner_db.code_by_hash(code_hash)
+        let bytecode = inner_db.code_by_hash(code_hash)?;
+        
+        // 写入缓存（合约代码不可变，安全缓存）
+        if let Some(ref cache) = self.bytecode_cache {
+            cache.insert(code_hash, bytecode.clone());
+        }
+        
+        Ok(bytecode)
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {

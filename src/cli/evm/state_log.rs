@@ -98,29 +98,39 @@ impl MmapStateLogReader {
             return Err(eyre::eyre!("Invalid data file format"));
         }
         
-        // 读取索引文件
-        let mut index_file = File::open(&index_path)?;
-        let mut header = [0u8; 32];
-        index_file.read_exact(&mut header)?;
+        // 使用 mmap 读取索引文件（避免数百万次系统调用）
+        let index_file = File::open(&index_path)?;
+        let index_file_size = index_file.metadata()?.len();
         
-        if &header[0..8] != b"STLOGIX2" {
+        if index_file_size < 32 {
+            return Err(eyre::eyre!("Index file too small"));
+        }
+        
+        // mmap 整个索引文件
+        let mmap_index = unsafe { memmap2::Mmap::map(&index_file)? };
+        
+        // 验证头部
+        if &mmap_index[0..8] != b"STLOGIX2" {
             return Err(eyre::eyre!("Invalid index file format"));
         }
         
-        let header_block_count = u64::from_le_bytes(header[12..20].try_into().unwrap());
-        
-        // 读取索引条目
-        let index_file_size = index_file.metadata()?.len();
+        // 计算条目数量
         let actual_entry_count = (index_file_size.saturating_sub(32)) / 20;
-        let entry_count = std::cmp::max(header_block_count, actual_entry_count);
         
-        let mut index = HashMap::with_capacity(entry_count as usize);
-        let mut entry_buf = [0u8; 20];
+        // 预分配 HashMap
+        let mut index = HashMap::with_capacity(actual_entry_count as usize);
         
-        while index_file.read_exact(&mut entry_buf).is_ok() {
-            let block_number = u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
-            let offset = u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
-            let length = u32::from_le_bytes(entry_buf[16..20].try_into().unwrap());
+        // 直接从 mmap 内存中解析索引条目（零拷贝，无系统调用）
+        let entries_data = &mmap_index[32..];
+        let entry_count = entries_data.len() / 20;
+        
+        for i in 0..entry_count {
+            let entry_start = i * 20;
+            let entry = &entries_data[entry_start..entry_start + 20];
+            
+            let block_number = u64::from_le_bytes(entry[0..8].try_into().unwrap());
+            let offset = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+            let length = u32::from_le_bytes(entry[16..20].try_into().unwrap());
             
             // 验证条目有效性
             let is_valid = block_number < 100_000_000

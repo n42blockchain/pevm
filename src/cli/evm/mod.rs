@@ -6,7 +6,7 @@ mod state_log;
 mod logged_db;
 
 pub use state_log::{MmapStateLogDatabase, MmapStateLogReader};
-pub use logged_db::DbLoggedDatabase;
+pub use logged_db::{DbLoggedDatabase, BytecodeCache};
 
 use clap::Parser;
 use reth_chainspec::ChainSpec;
@@ -30,7 +30,7 @@ use reth_node_ethereum::{consensus::EthBeaconConsensus, EthEvmConfig};
 use reth_evm::{execute::Executor, ConfigureEvm};
 use reth_revm::database::StateProviderDatabase;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}};
 use std::thread;
 use std::thread::JoinHandle;
 use eyre::{Report, Result};
@@ -1773,8 +1773,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             // 采样频率 100Hz（每秒采样 100 次）
             match profiling::ProfilerGuardWrapper::new(100) {
                 Ok(guard) => {
-                    #[cfg(unix)]
+                    #[cfg(all(unix, target_os = "linux"))]
                     info!("CPU profiler started (100Hz sampling rate, using pprof-rs)");
+                    #[cfg(target_os = "macos")]
+                    info!("CPU profiler started (100Hz sampling rate, using thread-based sampling)");
                     #[cfg(windows)]
                     info!("CPU profiler started (100Hz sampling rate, using thread-based sampling)");
                     Some(guard)
@@ -2070,12 +2072,16 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         info!("Using {} worker threads", thread_count);
         let mut threads: Vec<JoinHandle<Result<()>>> = Vec::with_capacity(thread_count);
 
-        // 创建共享 gas 计数器和停止标志
+        // 创建共享计数器（使用原子操作避免锁竞争，提高多线程性能）
         let task_queue = Arc::new(Mutex::new(tasks));
-        let cumulative_gas = Arc::new(Mutex::new(0));
-        let block_counter = Arc::new(Mutex::new(self.begin_number - 1));
-        let txs_counter = Arc::new(Mutex::new(0));
+        let cumulative_gas = Arc::new(AtomicU64::new(0));
+        let block_counter = Arc::new(AtomicU64::new(self.begin_number - 1));
+        let txs_counter = Arc::new(AtomicU64::new(0));
         let should_stop = Arc::new(AtomicBool::new(false));
+        
+        // 创建全局 Bytecode 缓存（合约代码不可变，可安全跨线程共享）
+        // 这是最重要的性能优化之一，避免重复查询数据库获取相同的合约代码
+        let bytecode_cache = Arc::new(BytecodeCache::new());
 
         // 设置 Ctrl+C 信号处理
         let should_stop_clone = Arc::clone(&should_stop);
@@ -2109,17 +2115,18 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
                     thread::sleep(Duration::from_secs(1));
 
-                    let current_cumulative_gas = cumulative_gas.lock().unwrap();
-                    let diff_gas = *current_cumulative_gas - previous_cumulative_gas;
-                    previous_cumulative_gas = *current_cumulative_gas;
+                    // 使用原子操作读取计数器（无锁，高性能）
+                    let current_cumulative_gas = cumulative_gas.load(Ordering::Relaxed);
+                    let diff_gas = current_cumulative_gas - previous_cumulative_gas;
+                    previous_cumulative_gas = current_cumulative_gas;
 
-                    let current_block_counter = block_counter.lock().unwrap();
-                    let diff_block = *current_block_counter - previous_block_counter;
-                    previous_block_counter = *current_block_counter;
+                    let current_block_counter = block_counter.load(Ordering::Relaxed);
+                    let diff_block = current_block_counter - previous_block_counter;
+                    previous_block_counter = current_block_counter;
 
-                    let current_txs_counter = txs_counter.lock().unwrap();
-                    let diff_txs = *current_txs_counter - previous_txs_counter;
-                    previous_txs_counter = *current_txs_counter;
+                    let current_txs_counter = txs_counter.load(Ordering::Relaxed);
+                    let diff_txs = current_txs_counter - previous_txs_counter;
+                    previous_txs_counter = current_txs_counter;
 
                     if diff_block > 0 {
                         let duration = start.elapsed();
@@ -2144,7 +2151,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
                     // 检查是否已经处理完所有块
                     // current_block_counter 存储的是实际块号，所以要与 end_number 比较
-                    if *current_block_counter >= end_number {
+                    if current_block_counter >= end_number {
                         info!("All blocks processed, status thread exiting");
                         break;
                     }
@@ -2177,6 +2184,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             let mmap_log_db_clone = mmap_log_db.clone();
             // mmap 无锁只读访问器（读取用，性能更好）
             let mmap_log_reader_clone = mmap_log_reader.clone();
+            // Bytecode 缓存（合约代码不可变，跨线程共享）
+            let bytecode_cache_clone = bytecode_cache.clone();
 
             // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
             threads.push(thread::spawn(move || {
@@ -2397,7 +2406,12 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                     
                                     for (bn, data_opt) in batch_data.iter() {
                                         if let Some(data) = data_opt {
-                                            match DbLoggedDatabase::new(data, shared_state_provider.clone()) {
+                                            // 使用带缓存的版本，避免重复查询合约代码
+                                            match DbLoggedDatabase::new_with_cache(
+                                                data, 
+                                                shared_state_provider.clone(),
+                                                bytecode_cache_clone.clone(),
+                                            ) {
                                                 Ok(db) => block_db_pairs.push((*bn, Some(db))),
                                                 Err(e) => {
                                                     warn!("Failed to create DbLoggedDatabase for block {}: {}", bn, e);
@@ -2440,15 +2454,15 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                                 }
                                             }
                                             
-                                            // 更新统计
+                                            // 更新统计（使用原子操作，无锁）
                                             let txs = block.sealed_block().body().transaction_count();
-                                            *cumulative_gas.lock().unwrap() += block.sealed_block().header().gas_used;
-                                            *txs_counter.lock().unwrap() += txs as u64;
+                                            cumulative_gas.fetch_add(block.sealed_block().header().gas_used, Ordering::Relaxed);
+                                            txs_counter.fetch_add(txs as u64, Ordering::Relaxed);
                                         }
                                     }
                                     
-                                    // 更新 block_counter
-                                    *block_counter.lock().unwrap() += blocks.len() as u64;
+                                    // 更新 block_counter（使用原子操作，无锁）
+                                    block_counter.fetch_add(blocks.len() as u64, Ordering::Relaxed);
                                     
                                 } else if let Some(log_dir) = &log_dir_clone {
                                     // 文件系统模式：从文件读取日志数据
@@ -2690,9 +2704,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                             step_gas += block.sealed_block().header().gas_used;
                                             step_txs += block.sealed_block().body().transaction_count() as u64;
                                         }
-                                        *cumulative_gas.lock().unwrap() += step_gas;
-                                        *txs_counter.lock().unwrap() += step_txs;
-                                        *block_counter.lock().unwrap() += blocks.len() as u64;
+                                        // 使用原子操作更新统计（无锁，高性能）
+                                        cumulative_gas.fetch_add(step_gas, Ordering::Relaxed);
+                                        txs_counter.fetch_add(step_txs, Ordering::Relaxed);
+                                        block_counter.fetch_add(blocks.len() as u64, Ordering::Relaxed);
                                     }
                                 } else {
                                     error!("--use-log on requires --log-dir to be specified");
@@ -2747,22 +2762,18 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                     });
                                 }
 
-                                // Ensure the locks are correctly used without deadlock
-                                {
-                                    *cumulative_gas.lock().unwrap() += step_cumulative_gas;
-                                }
-                                {
-                                    // 只统计实际处理的块数（不包括已存在的块，用于补齐模式）
-                                    let processed_count = if let Some(_log_dir) = &log_dir_clone {
-                                        blocks_to_process_numbers.len() as u64
-                                    } else {
-                                        blocks.len() as u64
-                                    };
-                                    *block_counter.lock().unwrap() += processed_count;
-                                }
-                                {
-                                    *txs_counter.lock().unwrap() += step_txs_counter as u64;
-                                }
+                                // 使用原子操作更新统计（无锁，高性能）
+                                cumulative_gas.fetch_add(step_cumulative_gas, Ordering::Relaxed);
+                                
+                                // 只统计实际处理的块数（不包括已存在的块，用于补齐模式）
+                                let processed_count = if let Some(_log_dir) = &log_dir_clone {
+                                    blocks_to_process_numbers.len() as u64
+                                } else {
+                                    blocks.len() as u64
+                                };
+                                block_counter.fetch_add(processed_count, Ordering::Relaxed);
+                                
+                                txs_counter.fetch_add(step_txs_counter as u64, Ordering::Relaxed);
                             }
 
                             Ok(())

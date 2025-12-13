@@ -407,9 +407,14 @@ tokio-stream = "0.1"
 lz4_flex = { version = "0.11", default-features = false }
 
 # performance profiling
-# Unix: 使用 pprof-rs (基于 POSIX 信号)
-[target.'cfg(unix)'.dependencies]
+# Linux: 使用 pprof-rs (基于 POSIX 信号)
+[target.'cfg(all(unix, target_os = "linux"))'.dependencies]
 pprof = { version = "0.14", features = ["flamegraph"] }
+
+# macOS: 使用基于线程的采样（避免信号兼容性问题）
+[target.'cfg(target_os = "macos")'.dependencies]
+inferno = { version = "0.12", default-features = false }
+backtrace = "0.3"
 libc = "0.2"
 
 # Windows: 使用基于线程的采样（简化版，不依赖 POSIX）

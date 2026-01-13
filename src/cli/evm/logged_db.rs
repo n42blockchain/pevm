@@ -1,9 +1,11 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! 日志数据库模块
 //! 
 //! 提供从日志数据读取的 Database 实现，用于 EVM 执行
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use alloy_primitives::{Address, B256, U256};
 use reth_codecs::Compact;
 use reth_primitives::Account;
@@ -13,10 +15,10 @@ use crate::revm::Database as RevmDatabase;
 use crate::revm::state::{AccountInfo, Bytecode};
 
 /// 全局 Bytecode 缓存（合约代码不可变，可以安全缓存）
-/// 使用 RwLock 实现线程安全的读写访问
+/// 使用 DashMap 实现高并发的线程安全访问
 /// 注意：Bytecode 内部使用 Bytes（引用计数），克隆成本很低
 pub struct BytecodeCache {
-    cache: RwLock<HashMap<B256, Bytecode>>,
+    cache: dashmap::DashMap<B256, Bytecode>,
 }
 
 impl std::fmt::Debug for BytecodeCache {
@@ -31,27 +33,27 @@ impl BytecodeCache {
     /// 创建新的缓存
     pub fn new() -> Self {
         Self {
-            cache: RwLock::new(HashMap::with_capacity(100_000)),
+            cache: dashmap::DashMap::with_capacity(100_000),
         }
     }
-    
+
     /// 查询缓存（Bytecode 克隆成本很低，内部使用 Bytes 引用计数）
+    /// 性能优化：使用 DashMap，无锁读取，细粒度写锁，提升并发性能
     #[inline]
     pub fn get(&self, code_hash: &B256) -> Option<Bytecode> {
-        self.cache.read().ok()?.get(code_hash).cloned()
+        self.cache.get(code_hash).map(|entry| entry.value().clone())
     }
-    
+
     /// 插入缓存
+    /// 性能优化：使用 DashMap，细粒度锁，不会阻塞其他条目的读写
     #[inline]
     pub fn insert(&self, code_hash: B256, bytecode: Bytecode) {
-        if let Ok(mut cache) = self.cache.write() {
-            cache.insert(code_hash, bytecode);
-        }
+        self.cache.insert(code_hash, bytecode);
     }
-    
+
     /// 获取缓存大小
     pub fn len(&self) -> usize {
-        self.cache.read().map(|c| c.len()).unwrap_or(0)
+        self.cache.len()
     }
 }
 
@@ -76,7 +78,7 @@ fn get_empty_code_hash() -> B256 {
 }
 
 /// 从日志数据读取的 Database（零拷贝版本）
-/// 
+///
 /// 直接使用内存中的数据指针访问日志数据，适用于 mmap 模式
 pub struct DbLoggedDatabase<'a> {
     /// 原始数据的引用
@@ -118,7 +120,7 @@ impl<'a> DbLoggedDatabase<'a> {
     /// data 格式：count(8 bytes) + entries
     #[inline]
     pub fn new_with_cache(
-        data: &'a [u8], 
+        data: &'a [u8],
         state_provider: Arc<dyn reth_provider::StateProvider>,
         bytecode_cache: Arc<BytecodeCache>,
     ) -> eyre::Result<Self> {

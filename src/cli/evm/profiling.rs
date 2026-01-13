@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! 性能分析模块 - 跨平台 CPU 性能分析支持
 //! 
 //! - Linux: 使用 pprof-rs（信号采样，最准确）

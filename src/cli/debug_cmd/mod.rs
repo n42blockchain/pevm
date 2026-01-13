@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `reth debug` command. Collection of various debugging routines.
 
 use clap::{Parser, Subcommand};

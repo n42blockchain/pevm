@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `reth evm` command.
 
 #[cfg(any(unix, windows))]

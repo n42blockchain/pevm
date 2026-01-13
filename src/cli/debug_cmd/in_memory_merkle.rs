@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Command for debugging in-memory merkle trie calculation.
 
 use alloy_consensus::BlockHeader;

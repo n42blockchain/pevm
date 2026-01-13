@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Command for debugging execution.
 
 use alloy_eips::BlockHashOrNumber;

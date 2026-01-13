@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! 状态日志存储模块
 //! 
 //! 使用内存映射（mmap）存储状态日志，支持大数据集（400GB+）
@@ -145,7 +147,27 @@ impl MmapStateLogReader {
         }
         
         info!("MmapStateLogReader opened: {} blocks indexed", index.len());
-        
+
+        // 性能优化：添加 madvise 提示，优化内核页面缓存策略
+        #[cfg(unix)]
+        {
+            unsafe {
+                // MADV_SEQUENTIAL: 提示内核这是顺序访问模式，启用积极的预读，减少页面故障延迟
+                // MADV_WILLNEED: 提示内核数据即将被访问，预加载到页面缓存（macOS 上很重要）
+                // 这两个提示可以组合使用，显著提升顺序读取性能（尤其是大文件）
+                let result = libc::madvise(
+                    mmap_data.as_ptr() as *mut libc::c_void,
+                    mmap_data.len(),
+                    libc::MADV_SEQUENTIAL | libc::MADV_WILLNEED,
+                );
+                if result == 0 {
+                    info!("madvise applied successfully: SEQUENTIAL | WILLNEED ({} bytes)", mmap_data.len());
+                } else {
+                    warn!("madvise failed: errno={}", *libc::__error());
+                }
+            }
+        }
+
         Ok(Self {
             mmap_data,
             index,

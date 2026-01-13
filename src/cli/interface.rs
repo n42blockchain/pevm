@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! CLI definition and entrypoint to executable
 
 use crate::{chainspec::EthereumChainSpecParser, cli::{debug_cmd, evm}};

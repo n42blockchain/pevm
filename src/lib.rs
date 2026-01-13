@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Rust Ethereum (reth) binary executable.
 //!
 //! ## Feature Flags

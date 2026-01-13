@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Command for debugging merkle tree calculation.
 use alloy_eips::BlockHashOrNumber;
 use backon::{ConstantBuilder, Retryable};

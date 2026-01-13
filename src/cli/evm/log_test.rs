@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Tests for log file reading and writing functionality
 
 use super::{write_read_logs_binary, read_read_logs_binary, LoggedDatabase, ReadLogEntry};

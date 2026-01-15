@@ -166,7 +166,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
             }
             Commands::DumpGenesis(command) => runner.run_blocking_until_ctrl_c(command.execute()),
             Commands::Db(command) => {
-                runner.run_blocking_until_ctrl_c(command.execute::<EthereumNode>())
+                runner.run_command_until_exit(|ctx| command.execute::<EthereumNode>(ctx))
             }
             Commands::Download(command) => {
                 runner.run_blocking_until_ctrl_c(command.execute::<EthereumNode>())

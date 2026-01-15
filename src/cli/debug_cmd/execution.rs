@@ -18,7 +18,6 @@ use reth_downloaders::{
     bodies::bodies::BodiesDownloaderBuilder,
     headers::reverse_headers::ReverseHeadersDownloaderBuilder,
 };
-use reth_errors::ConsensusError;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_exex::ExExManagerHandle;
 use reth_network::{BlockDownloaderProvider, NetworkHandle};
@@ -66,7 +65,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         &self,
         config: &Config,
         client: Client,
-        consensus: Arc<dyn FullConsensus<N::Primitives, Error = ConsensusError>>,
+        consensus: Arc<dyn FullConsensus<N::Primitives>>,
         provider_factory: ProviderFactory<N>,
         task_executor: &TaskExecutor,
         static_file_producer: StaticFileProducer<ProviderFactory<N>>,
@@ -85,7 +84,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             .into_task_with(task_executor);
 
         let stage_conf = &config.stages;
-        let prune_modes = config.prune.clone().map(|prune| prune.segments).unwrap_or_default();
+        let prune_modes = config.prune.segments.clone();
 
         let (tip_tx, tip_rx) = watch::channel(B256::ZERO);
         let executor = EthEvmConfig::ethereum(provider_factory.chain_spec());
@@ -175,7 +174,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         let Environment { provider_factory, config, data_dir } =
             self.env.init::<N>(AccessRights::RW)?;
 
-        let consensus: Arc<dyn FullConsensus<N::Primitives, Error = ConsensusError>> =
+        let consensus: Arc<dyn FullConsensus<N::Primitives>> =
             Arc::new(EthBeaconConsensus::new(provider_factory.chain_spec()));
 
         // Configure and build network

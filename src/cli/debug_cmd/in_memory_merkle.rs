@@ -27,7 +27,7 @@ use reth_primitives_traits::SealedBlock;
 use reth_provider::{
     providers::ProviderNodeTypes, AccountExtReader, ChainSpecProvider, DatabaseProviderFactory,
     HashedPostStateProvider, HashingWriter, LatestStateProviderRef, OriginalValuesKnown,
-    ProviderFactory, StageCheckpointReader, StateWriter, StorageReader, BlockWriter, StorageLocation,
+    ProviderFactory, StageCheckpointReader, StateWriter, StorageReader, BlockWriter,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_stages::StageId;
@@ -154,9 +154,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         let execution_outcome = ExecutionOutcome::from((block_execution_output, block.number()));
 
         // Unpacked `BundleState::state_root_slow` function
+        let hashed_post_state = state_provider.hashed_post_state(execution_outcome.state());
+        let hashed_post_state_sorted = hashed_post_state.into_sorted();
         let (in_memory_state_root, in_memory_updates) = StateRoot::overlay_root_with_updates(
             provider.tx_ref(),
-            state_provider.hashed_post_state(execution_outcome.state()),
+            &hashed_post_state_sorted,
         )?;
 
         if in_memory_state_root == block.state_root() {
@@ -167,11 +169,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         let provider_rw = provider_factory.database_provider_rw()?;
 
         // Insert block, state and hashes
-        provider_rw.insert_block(block.clone().try_recover()?, StorageLocation::Database)?;
+        let recovered_block = block.clone().try_recover()?;
+        provider_rw.insert_block(&recovered_block)?;
         provider_rw.write_state(
             &execution_outcome,
             OriginalValuesKnown::No,
-            StorageLocation::Database,
         )?;
         let storage_lists =
             provider_rw.changed_storages_with_range(block.number..=block.number())?;
@@ -183,7 +185,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         provider_rw.insert_account_for_hashing(accounts)?;
 
         let (state_root, incremental_trie_updates) = StateRoot::incremental_root_with_updates(
-            provider_rw.tx_ref(),
+            &provider_rw,
             block.number..=block.number(),
         )?;
         if state_root != block.state_root() {

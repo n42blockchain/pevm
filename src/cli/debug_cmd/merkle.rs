@@ -10,7 +10,7 @@ use reth_cli_commands::common::{AccessRights, CliNodeTypes, Environment, Environ
 use reth_cli_runner::CliContext;
 use reth_cli_util::get_secret_key;
 use reth_config::Config;
-use reth_consensus::{Consensus, ConsensusError};
+use reth_consensus::Consensus;
 use reth_db_api::{cursor::DbCursorRO, tables, transaction::DbTx};
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::{execute::Executor, ConfigureEvm};
@@ -24,7 +24,7 @@ use reth_node_ethereum::{consensus::EthBeaconConsensus, EthEvmConfig};
 use reth_provider::{
     providers::ProviderNodeTypes, BlockNumReader, BlockWriter, ChainSpecProvider,
     DatabaseProviderFactory, LatestStateProviderRef, OriginalValuesKnown, ProviderFactory,
-    StateWriter, StorageLocation,
+    StateWriter,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_stages::{
@@ -130,7 +130,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         info!(target: "reth::cli", target_block_number=self.to, "Finished downloading tip of block range");
 
         // build the full block client
-        let consensus: Arc<dyn Consensus<BlockTy<N>, Error = ConsensusError>> =
+        let consensus: Arc<dyn Consensus<BlockTy<N>>> =
             Arc::new(EthBeaconConsensus::new(provider_factory.chain_spec()));
         let block_range_client = FullBlockClient::new(fetch_client, consensus);
 
@@ -155,7 +155,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                 block.try_recover().map_err(|_| eyre::eyre!("Error sealing block with senders"))?;
             trace!(target: "reth::cli", block_number, "Executing block");
 
-            provider_rw.insert_block(sealed_block.clone(), StorageLocation::Database)?;
+            provider_rw.insert_block(&sealed_block)?;
 
             let executor = executor_provider.batch_executor(StateProviderDatabase::new(
                 LatestStateProviderRef::new(&provider_rw),
@@ -165,7 +165,6 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             provider_rw.write_state(
                 &ExecutionOutcome::single(block_number, output),
                 OriginalValuesKnown::Yes,
-                StorageLocation::Database,
             )?;
 
             let checkpoint = Some(StageCheckpoint::new(

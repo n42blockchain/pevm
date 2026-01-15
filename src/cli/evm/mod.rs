@@ -24,10 +24,9 @@ use reth_cli_commands::common::{AccessRights, Environment, EnvironmentArgs};
 
 use reth_consensus::FullConsensus;
 use reth_provider::{
-    BlockNumReader, HeaderProvider, ProviderError,
+    BlockNumReader,
     providers::BlockchainProvider, BlockReader, ChainSpecProvider, StateProviderFactory,
 };
-use reth_errors::ConsensusError;
 use reth_node_ethereum::{consensus::EthBeaconConsensus, EthEvmConfig};
 use reth_evm::{execute::Executor, ConfigureEvm};
 use reth_revm::database::StateProviderDatabase;
@@ -1989,7 +1988,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         
         // 提前获取 chain_spec，避免在线程中重复调用（可能有锁）
         let chain_spec = provider_factory.chain_spec();
-        let _consensus: Arc<dyn FullConsensus<EthPrimitives, Error = ConsensusError>> =
+        let _consensus: Arc<dyn FullConsensus<EthPrimitives>> =
             Arc::new(EthBeaconConsensus::new(chain_spec.clone()));
 
         // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
@@ -2269,8 +2268,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                         // catch_unwind 的开销很大，特别是在没有 panic 的情况下也会产生 unwinding 开销
                         // 如果确实需要错误恢复，可以在更高层处理
                         let result: Result<(), Report> = (|| -> Result<(), Report> {
-                            let mut td = blockchain_db.header_td_by_number(task.start - 1)?
-                                .ok_or_else(|| ProviderError::HeaderNotFound(task.start.into()))?;
+                            // Note: header_td_by_number removed in v1.10.0 (total difficulty not needed in PoS)
+                            // let mut td = blockchain_db.header_td_by_number(task.start - 1)?
+                            //     .ok_or_else(|| ProviderError::HeaderNotFound(task.start.into()))?;
 
                             // 使用共享的 blockchain_db（如 v1.8.4 的方式）
                             // 预先创建的 evm_config 避免重复创建
@@ -2656,32 +2656,49 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                             })
                                             .collect();
                                         
-                                        // 并行解压
-                                        // 性能关键优化：所有块复用线程级别的 state_provider
-                                        // 避免为每个块调用 history_by_block_number，减少数据库查询
-                                        let shared_state_provider_for_rayon = shared_state_provider.clone();
-                                        
-                                        let mut decompressed_results: Vec<(usize, u64, Result<LoggedDatabase, eyre::Error>)> = block_decompress_tasks
+                                        // 并行解压数据（v1.10.0修复：分离解压和Database创建）
+                                        // 阶段1：并行解压，只返回解压后的数据（不创建LoggedDatabase，避免StateProvider线程安全问题）
+                                        let mut decompressed_data_results: Vec<(usize, u64, Result<Vec<u8>, eyre::Error>)> = block_decompress_tasks
                                             .into_par_iter()
                                             .map(|(block_number, compressed_data, original_idx)| {
-                                                // 从压缩数据创建 LoggedDatabase（性能优化：零复制版本）
-                                                // 直接传递 Vec<u8> 所有权，避免不必要的内存复制
-                                                match LoggedDatabase::new_from_compressed_buffer_owned(compressed_data, shared_state_provider_for_rayon.clone(), enable_in_memory_mode_clone) {
-                                                    Ok(db) => (original_idx, block_number, Ok(db)),
-                                                    Err(e) => (original_idx, block_number, Err(eyre::eyre!("Failed to create LoggedDatabase for block {}: {}", block_number, e))),
-                                                }
+                                                // 仅解压数据，不创建Database
+                                                // ThreadLocalLogCache::from_compressed_buffer_owned 内部会解压
+                                                // 但我们需要返回解压后的原始数据，所以先解压
+                                                let decompressed = if enable_in_memory_mode_clone {
+                                                    // 未压缩模式：直接返回
+                                                    Ok(compressed_data)
+                                                } else {
+                                                    // 解压数据
+                                                    match lz4_flex::decompress_size_prepended(&compressed_data) {
+                                                        Ok(data) => Ok(data),
+                                                        Err(e) => Err(eyre::eyre!("Failed to decompress block {}: {}", block_number, e)),
+                                                    }
+                                                };
+                                                (original_idx, block_number, decompressed)
                                             })
                                             .collect();
-                                        
+
                                         // 按原始索引排序，保持块号顺序
-                                        decompressed_results.sort_by_key(|(idx, _, _)| *idx);
-                                        
-                                        // 转换为最终的 block_db_pairs
-                                        for (_, block_number, result) in decompressed_results {
+                                        decompressed_data_results.sort_by_key(|(idx, _, _)| *idx);
+
+                                        // 阶段2：串行创建LoggedDatabase（在主线程，可以安全使用StateProvider）
+                                        for (_, block_number, result) in decompressed_data_results {
                                             match result {
-                                                Ok(db) => block_db_pairs.push((block_number, db)),
+                                                Ok(decompressed_data) => {
+                                                    // 从解压后的数据创建LoggedDatabase
+                                                    match LoggedDatabase::new_from_compressed_buffer_owned(
+                                                        decompressed_data,
+                                                        shared_state_provider.clone(),
+                                                        true // 已经解压，标记为uncompressed
+                                                    ) {
+                                                        Ok(db) => block_db_pairs.push((block_number, db)),
+                                                        Err(e) => {
+                                                            error!("Failed to create LoggedDatabase for block {}: {}", block_number, e);
+                                                        }
+                                                    }
+                                                }
                                                 Err(e) => {
-                                                    error!("Failed to create LoggedDatabase for block {}: {}", block_number, e);
+                                                    error!("Failed to decompress block {}: {}", block_number, e);
                                                 }
                                             }
                                         }
@@ -2780,14 +2797,14 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                                 blocks_to_process_set.contains(&block_num)
                                             })
                                             .for_each(|block| {
-                                                td += block.sealed_block().header().difficulty;
+                                                // td += block.sealed_block().header().difficulty; // PoS: total difficulty not used
                                                 step_cumulative_gas += block.sealed_block().header().gas_used;
                                                 step_txs_counter += block.sealed_block().body().transaction_count();
                                             });
                                     } else {
                                         // 其他模式，统计所有块
                                         blocks.iter().for_each(|block| {
-                                            td += block.sealed_block().header().difficulty;
+                                            // td += block.sealed_block().header().difficulty; // PoS: total difficulty not used
                                             step_cumulative_gas += block.sealed_block().header().gas_used;
                                             step_txs_counter += block.sealed_block().body().transaction_count();
                                         });
@@ -2795,7 +2812,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                 } else {
                                     // 没有 log_dir，统计所有块
                                     blocks.iter().for_each(|block| {
-                                        td += block.sealed_block().header().difficulty;
+                                        // td += block.sealed_block().header().difficulty; // PoS: total difficulty not used
                                         step_cumulative_gas += block.sealed_block().header().gas_used;
                                         step_txs_counter += block.sealed_block().body().transaction_count();
                                     });

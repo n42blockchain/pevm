@@ -2643,12 +2643,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                             }
                                         }
                                     } else {
-                                        // 多线程模式：使用 rayon 并行解压
-                                        use rayon::prelude::*;
-                                        
+                                        // v1.10.0修复：串行模式（StateProvider线程安全问题）
+
                                         // 准备处理的块数据：Vec<(block_number, compressed_data, block_index)>
                                         // 性能优化：预分配容量
-                                        let block_decompress_tasks: Vec<(u64, Vec<u8>, usize)> = blocks.iter()
+                                        let mut block_decompress_tasks: Vec<(u64, Vec<u8>, usize)> = blocks.iter()
                                             .enumerate()
                                             .filter_map(|(block_idx, block)| {
                                                 let block_number = block.sealed_block().header().number;
@@ -2656,49 +2655,23 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                             })
                                             .collect();
                                         
-                                        // 并行解压数据（v1.10.0修复：分离解压和Database创建）
-                                        // 阶段1：并行解压，只返回解压后的数据（不创建LoggedDatabase，避免StateProvider线程安全问题）
-                                        let mut decompressed_data_results: Vec<(usize, u64, Result<Vec<u8>, eyre::Error>)> = block_decompress_tasks
-                                            .into_par_iter()
-                                            .map(|(block_number, compressed_data, original_idx)| {
-                                                // 仅解压数据，不创建Database
-                                                // ThreadLocalLogCache::from_compressed_buffer_owned 内部会解压
-                                                // 但我们需要返回解压后的原始数据，所以先解压
-                                                let decompressed = if enable_in_memory_mode_clone {
-                                                    // 未压缩模式：直接返回
-                                                    Ok(compressed_data)
-                                                } else {
-                                                    // 解压数据
-                                                    match lz4_flex::decompress_size_prepended(&compressed_data) {
-                                                        Ok(data) => Ok(data),
-                                                        Err(e) => Err(eyre::eyre!("Failed to decompress block {}: {}", block_number, e)),
-                                                    }
-                                                };
-                                                (original_idx, block_number, decompressed)
-                                            })
-                                            .collect();
+                                        // v1.10.0修复：串行创建LoggedDatabase（避免StateProvider线程安全问题）
+                                        // StateProvider不再是Sync，无法在rayon线程中使用
+                                        // 解压操作交给ThreadLocalLogCache内部处理，保证数据格式正确
 
-                                        // 按原始索引排序，保持块号顺序
-                                        decompressed_data_results.sort_by_key(|(idx, _, _)| *idx);
+                                        // 按块号排序以保持顺序
+                                        block_decompress_tasks.sort_by_key(|(_, _, idx)| *idx);
 
-                                        // 阶段2：串行创建LoggedDatabase（在主线程，可以安全使用StateProvider）
-                                        for (_, block_number, result) in decompressed_data_results {
-                                            match result {
-                                                Ok(decompressed_data) => {
-                                                    // 从解压后的数据创建LoggedDatabase
-                                                    match LoggedDatabase::new_from_compressed_buffer_owned(
-                                                        decompressed_data,
-                                                        shared_state_provider.clone(),
-                                                        true // 已经解压，标记为uncompressed
-                                                    ) {
-                                                        Ok(db) => block_db_pairs.push((block_number, db)),
-                                                        Err(e) => {
-                                                            error!("Failed to create LoggedDatabase for block {}: {}", block_number, e);
-                                                        }
-                                                    }
-                                                }
+                                        // 串行创建所有LoggedDatabase
+                                        for (block_number, compressed_data, _) in block_decompress_tasks {
+                                            match LoggedDatabase::new_from_compressed_buffer_owned(
+                                                compressed_data,
+                                                shared_state_provider.clone(),
+                                                enable_in_memory_mode_clone
+                                            ) {
+                                                Ok(db) => block_db_pairs.push((block_number, db)),
                                                 Err(e) => {
-                                                    error!("Failed to decompress block {}: {}", block_number, e);
+                                                    error!("Failed to create LoggedDatabase for block {}: {}", block_number, e);
                                                 }
                                             }
                                         }

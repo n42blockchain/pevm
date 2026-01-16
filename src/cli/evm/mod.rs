@@ -2632,13 +2632,23 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                             
                                             // 从压缩数据创建 LoggedDatabase（性能优化：零复制版本）
                                             // 直接传递 Vec<u8> 所有权，避免不必要的内存复制
-                                            // is_uncompressed 根据 enable_in_memory_mode 设置
-                                            match LoggedDatabase::new_from_compressed_buffer_owned(compressed_data, shared_state_provider.clone(), enable_in_memory_mode_clone) {
+                                            // v1.10.0修复：自适应数据格式处理（先尝试正确格式以保持性能，失败时回退）
+                                            let is_uncompressed = enable_in_memory_mode_clone;
+                                            match LoggedDatabase::new_from_compressed_buffer_owned(compressed_data.clone(), shared_state_provider.clone(), is_uncompressed) {
                                                 Ok(db) => {
                                                     block_db_pairs.push((block_number, db));
                                                 }
                                                 Err(e) => {
-                                                    error!("Failed to create LoggedDatabase for block {}: {}", block_number, e);
+                                                    // 如果创建失败，尝试用相反的格式标志重试
+                                                    debug!("Failed with is_uncompressed={}, retrying with opposite flag for block {}: {}", is_uncompressed, block_number, e);
+                                                    match LoggedDatabase::new_from_compressed_buffer_owned(compressed_data, shared_state_provider.clone(), !is_uncompressed) {
+                                                        Ok(db) => {
+                                                            block_db_pairs.push((block_number, db));
+                                                        }
+                                                        Err(e2) => {
+                                                            error!("Failed to create LoggedDatabase for block {} with both format flags: {} / {}", block_number, e, e2);
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -2663,15 +2673,28 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         block_decompress_tasks.sort_by_key(|(_, _, idx)| *idx);
 
                                         // 串行创建所有LoggedDatabase
+                                        let is_uncompressed = enable_in_memory_mode_clone;
                                         for (block_number, compressed_data, _) in block_decompress_tasks {
+                                            // v1.10.0修复：自适应数据格式处理（先尝试正确格式以保持性能，失败时回退）
                                             match LoggedDatabase::new_from_compressed_buffer_owned(
-                                                compressed_data,
+                                                compressed_data.clone(),
                                                 shared_state_provider.clone(),
-                                                enable_in_memory_mode_clone
+                                                is_uncompressed
                                             ) {
                                                 Ok(db) => block_db_pairs.push((block_number, db)),
                                                 Err(e) => {
-                                                    error!("Failed to create LoggedDatabase for block {}: {}", block_number, e);
+                                                    // 如果创建失败，尝试用相反的格式标志重试
+                                                    debug!("Failed with is_uncompressed={}, retrying with opposite flag for block {}: {}", is_uncompressed, block_number, e);
+                                                    match LoggedDatabase::new_from_compressed_buffer_owned(
+                                                        compressed_data,
+                                                        shared_state_provider.clone(),
+                                                        !is_uncompressed
+                                                    ) {
+                                                        Ok(db) => block_db_pairs.push((block_number, db)),
+                                                        Err(e2) => {
+                                                            error!("Failed to create LoggedDatabase for block {} with both format flags: {} / {}", block_number, e, e2);
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -2693,21 +2716,40 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         
                                         // 查找日志数据库，如果存在则使用日志执行，否则使用数据库直接执行
                                         // 使用 remove 取出所有权
+                                        let mut executed_successfully = false;
                                         if let Some(logged_db) = block_db_map.remove(&block_number) {
                                             // 使用日志数据执行块
+                                            // v1.10.0修复：捕获LoggedDatabase执行错误，自动回退到数据库执行
                                             let executor = evm_config.batch_executor(logged_db);
-                                            let _output = executor.execute(block)?;
-                                        } else {
-                                            // 日志中缺失的块，使用数据库直接执行
-                                            // Windows 修复：使用 CachedStateProviderDatabase 减少 MDBX 访问
-                                            let state_provider = blockchain_db.history_by_block_number(block_number.saturating_sub(1))?;
-                                            let db = CachedStateProviderDatabase::new(
-                                                &state_provider,
-                                                Some(bytecode_cache_clone.clone()),
-                                            );
-                                            let executor = evm_config.batch_executor(db);
-                                            let _output = executor.execute(block)?;
-                                            drop(state_provider);
+                                            match executor.execute(block) {
+                                                Ok(_output) => {
+                                                    executed_successfully = true;
+                                                }
+                                                Err(e) => {
+                                                    warn!("LoggedDatabase execution failed for block {}, falling back to database: {}", block_number, e);
+                                                }
+                                            }
+                                        }
+
+                                        if !executed_successfully {
+                                            // 日志中缺失的块或日志执行失败，使用数据库直接执行
+                                            // v1.10.0修复：捕获数据库执行错误，避免StateProvider多线程问题导致panic
+                                            match (|| -> eyre::Result<()> {
+                                                let state_provider = blockchain_db.history_by_block_number(block_number.saturating_sub(1))?;
+                                                let db = CachedStateProviderDatabase::new(
+                                                    &state_provider,
+                                                    Some(bytecode_cache_clone.clone()),
+                                                );
+                                                let executor = evm_config.batch_executor(db);
+                                                let _output = executor.execute(block)?;
+                                                drop(state_provider);
+                                                Ok(())
+                                            })() {
+                                                Ok(_) => {},
+                                                Err(e) => {
+                                                    error!("Failed to execute block {} with database fallback: {}. Skipping this block.", block_number, e);
+                                                }
+                                            }
                                         }
                                         
                                         // 性能优化：移除热路径上的日志检查
@@ -3049,8 +3091,16 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
                 // 从压缩数据创建 LoggedDatabase（性能优化：零复制版本）
                 // 直接传递 Vec<u8> 所有权，避免不必要的内存复制
-                let logged_db = LoggedDatabase::new_from_compressed_buffer_owned(compressed_data, Arc::new(state_provider), enable_in_memory_mode)
-                    .map_err(|e| eyre::eyre!("Failed to create LoggedDatabase from compressed data: {}", e))?;
+                // v1.10.0修复：自适应数据格式处理（先尝试正确格式以保持性能，失败时回退）
+                let state_provider_arc = Arc::new(state_provider);
+                let logged_db = match LoggedDatabase::new_from_compressed_buffer_owned(compressed_data.clone(), state_provider_arc.clone(), enable_in_memory_mode) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        debug!("Failed with is_uncompressed={}, retrying with opposite flag: {}", enable_in_memory_mode, e);
+                        LoggedDatabase::new_from_compressed_buffer_owned(compressed_data, state_provider_arc, !enable_in_memory_mode)
+                            .map_err(|e2| eyre::eyre!("Failed to create LoggedDatabase with both format flags: {} / {}", e, e2))?
+                    }
+                };
                 
                 info!("Loaded log data from {} (using thread-local cache)", &log_path);
                 

@@ -4,7 +4,6 @@
 //! 
 //! 提供从日志数据读取的 Database 实现，用于 EVM 执行
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use alloy_primitives::{Address, B256, U256};
 use reth_codecs::Compact;
@@ -115,7 +114,7 @@ impl<'a> DbLoggedDatabase<'a> {
             bytecode_cache: None,
         })
     }
-    
+
     /// 从数据创建，带 Bytecode 缓存（零拷贝）
     /// data 格式：count(8 bytes) + entries
     #[inline]
@@ -181,17 +180,17 @@ impl<'a> RevmDatabase for DbLoggedDatabase<'a> {
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         if let Some(compact_data) = self.next_entry() {
             // 快速检查空账户标记
-            if compact_data.is_empty() || 
+            if compact_data.is_empty() ||
                (compact_data.len() == 1 && (compact_data[0] == 0x00 || compact_data[0] == 0xc0)) {
                 return Ok(None);
             }
-            
+
             // 解码账户
             let mut account_info = match Self::decode_account_compact(compact_data) {
                 Ok(info) => info,
                 Err(_) => return Ok(None),
             };
-            
+
             // 加载 bytecode（如果需要）
             let code_hash = account_info.code_hash();
             if code_hash.as_slice() != EMPTY_CODE_HASH_BYTES {
@@ -199,7 +198,7 @@ impl<'a> RevmDatabase for DbLoggedDatabase<'a> {
                     account_info.code = Some(code);
                 }
             }
-            
+
             Ok(Some(account_info))
         } else {
             // 日志数据用完，回退到数据库查询
@@ -217,18 +216,18 @@ impl<'a> RevmDatabase for DbLoggedDatabase<'a> {
                 return Ok(bytecode);
             }
         }
-        
+
         // 缓存未命中，查询数据库
         let mut inner_db = StateProviderDatabase::new(
             self.state_provider.as_ref() as &dyn reth_provider::StateProvider
         );
         let bytecode = inner_db.code_by_hash(code_hash)?;
-        
+
         // 写入缓存（合约代码不可变，安全缓存）
         if let Some(ref cache) = self.bytecode_cache {
             cache.insert(code_hash, bytecode.clone());
         }
-        
+
         Ok(bytecode)
     }
 
@@ -254,49 +253,43 @@ impl<'a> RevmDatabase for DbLoggedDatabase<'a> {
 }
 
 // ============================================================================
-// CachedStateProviderDatabase: 用于纯 EVM 执行模式的带缓存数据库
+// CachedStateProviderDatabase: 用于纯 EVM 执行模式的轻量级数据库
 // ============================================================================
 
-/// 带缓存的 StateProviderDatabase 包装器
-/// 
-/// 用于纯 EVM 执行模式，通过缓存减少 MDBX 访问，避免 Windows 上的 STATUS_IN_PAGE_ERROR
-/// 
-/// 缓存策略：
-/// - BytecodeCache：全局共享，合约代码不可变
-/// - AccountCache：线程级别，每个 task 内有效（避免跨 task 状态污染）
-/// - StorageCache：线程级别，每个 task 内有效
+/// 轻量级 StateProviderDatabase 包装器
+///
+/// 用于纯 EVM 执行模式，零额外开销
+///
+/// 设计原理：
+/// - executor 内部的 State 已经缓存了账户和存储数据
+/// - MDBX 本身有页面缓存，重复查询很快
+/// - DashMap 等并发缓存的开销 > 直接 MDBX 查询
+///
+/// 性能优化：
+/// - 完全移除所有缓存层，直接转发查询到内部数据库
+/// - 内部复用同一个 StateProviderDatabase 实例
+/// - 所有方法都标记为 #[inline]，消除函数调用开销
 pub struct CachedStateProviderDatabase<'a> {
-    state_provider: &'a dyn reth_provider::StateProvider,
-    bytecode_cache: Option<Arc<BytecodeCache>>,
-    // 线程级别缓存：减少同一 task 内的重复查询
-    account_cache: HashMap<Address, Option<AccountInfo>>,
-    storage_cache: HashMap<(Address, U256), U256>,
-    block_hash_cache: HashMap<u64, B256>,
+    /// 内部数据库（复用，避免每次查询创建新实例）
+    inner_db: StateProviderDatabase<&'a dyn reth_provider::StateProvider>,
 }
 
 impl<'a> std::fmt::Debug for CachedStateProviderDatabase<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedStateProviderDatabase")
-            .field("bytecode_cache", &self.bytecode_cache.as_ref().map(|c| c.len()))
-            .field("account_cache_size", &self.account_cache.len())
-            .field("storage_cache_size", &self.storage_cache.len())
-            .field("block_hash_cache_size", &self.block_hash_cache.len())
             .finish()
     }
 }
 
 impl<'a> CachedStateProviderDatabase<'a> {
-    /// 创建新的带缓存数据库
+    /// 创建新的轻量级数据库
+    /// 注意：bytecode_cache 参数保留用于 API 兼容性，但不再使用
     pub fn new(
         state_provider: &'a dyn reth_provider::StateProvider,
-        bytecode_cache: Option<Arc<BytecodeCache>>,
+        _bytecode_cache: Option<Arc<BytecodeCache>>,
     ) -> Self {
         Self {
-            state_provider,
-            bytecode_cache,
-            account_cache: HashMap::new(),
-            storage_cache: HashMap::new(),
-            block_hash_cache: HashMap::new(),
+            inner_db: StateProviderDatabase::new(state_provider),
         }
     }
 }
@@ -304,73 +297,444 @@ impl<'a> CachedStateProviderDatabase<'a> {
 impl<'a> RevmDatabase for CachedStateProviderDatabase<'a> {
     type Error = <StateProviderDatabase<Box<dyn reth_provider::StateProvider>> as RevmDatabase>::Error;
 
+    #[inline]
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        // 先查本地缓存
-        if let Some(cached) = self.account_cache.get(&address) {
-            return Ok(cached.clone());
+        // 直接转发到内部数据库，无额外缓存开销
+        // executor 的 State 已经缓存了账户数据
+        self.inner_db.basic(address)
+    }
+
+    #[inline]
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        // 直接查询数据库，不使用缓存
+        // 原因：DashMap 的并发开销 > 直接 MDBX 查询
+        // MDBX 本身有页面缓存，重复查询很快
+        self.inner_db.code_by_hash(code_hash)
+    }
+
+    #[inline]
+    fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        // 直接转发到内部数据库，无额外缓存开销
+        // executor 的 State 已经缓存了存储数据
+        self.inner_db.storage(address, index)
+    }
+
+    #[inline]
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        // 直接转发到内部数据库
+        // block_hash 查询较少，不值得缓存
+        self.inner_db.block_hash(number)
+    }
+}
+
+// ============================================================================
+// BatchDbLoggedDatabase: 支持批量执行的日志数据库
+// ============================================================================
+
+/// 批量日志数据库 - 支持使用 execute_batch 批量执行多个块
+///
+/// 关键优化：通过自动跟踪每个块的日志条目数量，在块边界自动切换日志数据源
+/// 这使得可以使用单个 executor 批量执行多个块，性能提升 5-6 倍
+///
+/// 工作原理：
+/// 1. 预先解析每个块的日志数据，获取条目数量
+/// 2. 每次 basic/storage 调用读取当前块的下一个条目
+/// 3. 当当前块的条目读完时，自动切换到下一个块
+pub struct BatchDbLoggedDatabase<'a> {
+    /// 每个块的日志数据：(数据切片, 条目数量, 当前读取位置)
+    /// 按执行顺序存储
+    blocks_data: Vec<BlockLogData<'a>>,
+    /// 当前正在执行的块索引
+    current_block_idx: std::cell::Cell<usize>,
+    /// 状态提供者（用于 code_by_hash 查询）
+    state_provider: Arc<dyn reth_provider::StateProvider>,
+    /// Bytecode 缓存
+    bytecode_cache: Option<Arc<BytecodeCache>>,
+}
+
+/// 单个块的日志数据
+struct BlockLogData<'a> {
+    /// 块号
+    block_number: u64,
+    /// 日志数据（跳过 count 头后的数据）
+    data: &'a [u8],
+    /// 条目数量
+    entry_count: u64,
+    /// 当前读取位置
+    pos: std::cell::Cell<usize>,
+    /// 已读取的条目数
+    entries_read: std::cell::Cell<u64>,
+}
+
+impl<'a> std::fmt::Debug for BatchDbLoggedDatabase<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BatchDbLoggedDatabase")
+            .field("blocks_count", &self.blocks_data.len())
+            .field("current_block_idx", &self.current_block_idx.get())
+            .finish()
+    }
+}
+
+impl<'a> BatchDbLoggedDatabase<'a> {
+    /// 从多个块的日志数据创建
+    ///
+    /// # 参数
+    /// - `blocks_data`: Vec<(block_number, data)> - 每个块的日志数据，数据格式：count(8 bytes) + entries
+    /// - `state_provider`: 状态提供者（用于 code_by_hash 和回退查询）
+    /// - `bytecode_cache`: 可选的全局 Bytecode 缓存
+    pub fn new(
+        blocks_data: Vec<(u64, &'a [u8])>,
+        state_provider: Arc<dyn reth_provider::StateProvider>,
+        bytecode_cache: Option<Arc<BytecodeCache>>,
+    ) -> eyre::Result<Self> {
+        let mut parsed_blocks = Vec::with_capacity(blocks_data.len());
+
+        for (block_number, data) in blocks_data {
+            if data.len() < 8 {
+                return Err(eyre::eyre!("Invalid data for block {}: too short", block_number));
+            }
+
+            // 读取条目数量（小端序）
+            let entry_count = u64::from_le_bytes(data[0..8].try_into().unwrap());
+
+            parsed_blocks.push(BlockLogData {
+                block_number,
+                data: &data[8..], // 跳过 count
+                entry_count,
+                pos: std::cell::Cell::new(0),
+                entries_read: std::cell::Cell::new(0),
+            });
         }
-        
-        // 缓存未命中，查询数据库
-        let mut inner_db = StateProviderDatabase::new(self.state_provider);
-        let result = inner_db.basic(address)?;
-        
-        // 写入本地缓存
-        self.account_cache.insert(address, result.clone());
-        
-        Ok(result)
+
+        Ok(Self {
+            blocks_data: parsed_blocks,
+            current_block_idx: std::cell::Cell::new(0),
+            state_provider,
+            bytecode_cache,
+        })
+    }
+
+    /// 读取当前块的下一个条目数据
+    /// 如果当前块数据读完，自动切换到下一个块
+    #[inline]
+    fn next_entry(&self) -> Option<&'a [u8]> {
+        loop {
+            let idx = self.current_block_idx.get();
+            if idx >= self.blocks_data.len() {
+                return None;
+            }
+
+            let block = &self.blocks_data[idx];
+            let pos = block.pos.get();
+            let entries_read = block.entries_read.get();
+
+            // 检查是否已读完当前块的所有条目
+            if entries_read >= block.entry_count {
+                // 切换到下一个块
+                self.current_block_idx.set(idx + 1);
+                continue;
+            }
+
+            // 读取下一个条目
+            if pos >= block.data.len() {
+                // 数据不足，切换到下一个块
+                self.current_block_idx.set(idx + 1);
+                continue;
+            }
+
+            let len = block.data[pos] as usize;
+            let start = pos + 1;
+            let end = start + len;
+
+            if end > block.data.len() {
+                // 数据损坏，切换到下一个块
+                self.current_block_idx.set(idx + 1);
+                continue;
+            }
+
+            // 更新读取位置和计数
+            block.pos.set(end);
+            block.entries_read.set(entries_read + 1);
+
+            return Some(&block.data[start..end]);
+        }
+    }
+
+    /// 获取当前块号（用于调试）
+    #[allow(dead_code)]
+    pub fn current_block_number(&self) -> Option<u64> {
+        let idx = self.current_block_idx.get();
+        self.blocks_data.get(idx).map(|b| b.block_number)
+    }
+}
+
+impl<'a> RevmDatabase for BatchDbLoggedDatabase<'a> {
+    type Error = <StateProviderDatabase<Box<dyn reth_provider::StateProvider>> as RevmDatabase>::Error;
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        if let Some(compact_data) = self.next_entry() {
+            // 快速检查空账户标记
+            if compact_data.is_empty() ||
+               (compact_data.len() == 1 && (compact_data[0] == 0x00 || compact_data[0] == 0xc0)) {
+                return Ok(None);
+            }
+
+            // 解码账户
+            let mut account_info = match DbLoggedDatabase::decode_account_compact(compact_data) {
+                Ok(info) => info,
+                Err(_) => return Ok(None),
+            };
+
+            // 加载 bytecode（如果需要）
+            let code_hash = account_info.code_hash();
+            if code_hash.as_slice() != EMPTY_CODE_HASH_BYTES {
+                if let Ok(code) = self.code_by_hash(code_hash) {
+                    account_info.code = Some(code);
+                }
+            }
+
+            Ok(Some(account_info))
+        } else {
+            // 日志数据用完，回退到数据库查询
+            let mut inner_db = StateProviderDatabase::new(
+                self.state_provider.as_ref() as &dyn reth_provider::StateProvider
+            );
+            inner_db.basic(address)
+        }
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        // 先查全局缓存（合约代码不可变，可以跨 task 共享）
+        // 先查缓存
         if let Some(ref cache) = self.bytecode_cache {
             if let Some(bytecode) = cache.get(&code_hash) {
                 return Ok(bytecode);
             }
         }
-        
+
         // 缓存未命中，查询数据库
-        let mut inner_db = StateProviderDatabase::new(self.state_provider);
+        let mut inner_db = StateProviderDatabase::new(
+            self.state_provider.as_ref() as &dyn reth_provider::StateProvider
+        );
         let bytecode = inner_db.code_by_hash(code_hash)?;
-        
-        // 写入全局缓存
+
+        // 写入缓存
         if let Some(ref cache) = self.bytecode_cache {
             cache.insert(code_hash, bytecode.clone());
         }
-        
+
         Ok(bytecode)
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        // 先查本地缓存
-        let key = (address, index);
-        if let Some(&cached) = self.storage_cache.get(&key) {
-            return Ok(cached);
+        if let Some(compact_data) = self.next_entry() {
+            let data_len = compact_data.len();
+            let (value, _) = U256::from_compact(compact_data, data_len);
+            Ok(value)
+        } else {
+            let mut inner_db = StateProviderDatabase::new(
+                self.state_provider.as_ref() as &dyn reth_provider::StateProvider
+            );
+            inner_db.storage(address, index)
         }
-        
-        // 缓存未命中，查询数据库
-        let mut inner_db = StateProviderDatabase::new(self.state_provider);
-        let value = inner_db.storage(address, index)?;
-        
-        // 写入本地缓存
-        self.storage_cache.insert(key, value);
-        
-        Ok(value)
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
-        // 先查本地缓存
-        if let Some(&cached) = self.block_hash_cache.get(&number) {
-            return Ok(cached);
-        }
-        
-        // 缓存未命中，查询数据库
-        let mut inner_db = StateProviderDatabase::new(self.state_provider);
-        let hash = inner_db.block_hash(number)?;
-        
-        // 写入本地缓存
-        self.block_hash_cache.insert(number, hash);
-        
-        Ok(hash)
+        let mut inner_db = StateProviderDatabase::new(
+            self.state_provider.as_ref() as &dyn reth_provider::StateProvider
+        );
+        inner_db.block_hash(number)
     }
 }
 
+// ============================================================================
+// BatchOwnedLoggedDatabase: 支持批量执行的日志数据库（拥有数据所有权版本）
+// ============================================================================
+
+/// 批量日志数据库（拥有数据所有权） - 用于文件系统模式
+///
+/// 与 BatchDbLoggedDatabase 类似，但拥有数据的所有权而不是借用
+/// 适用于需要解压后存储的场景
+pub struct BatchOwnedLoggedDatabase {
+    /// 每个块的日志数据
+    blocks_data: Vec<OwnedBlockLogData>,
+    /// 当前正在执行的块索引
+    current_block_idx: std::cell::Cell<usize>,
+    /// 状态提供者
+    state_provider: Arc<dyn reth_provider::StateProvider>,
+    /// Bytecode 缓存
+    bytecode_cache: Option<Arc<BytecodeCache>>,
+}
+
+/// 单个块的日志数据（拥有所有权）
+struct OwnedBlockLogData {
+    /// 块号
+    #[allow(dead_code)]
+    block_number: u64,
+    /// 日志数据（拥有所有权，跳过 count 头后的数据）
+    data: Vec<u8>,
+    /// 条目数量
+    entry_count: u64,
+    /// 当前读取位置
+    pos: std::cell::Cell<usize>,
+    /// 已读取的条目数
+    entries_read: std::cell::Cell<u64>,
+}
+
+impl std::fmt::Debug for BatchOwnedLoggedDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BatchOwnedLoggedDatabase")
+            .field("blocks_count", &self.blocks_data.len())
+            .field("current_block_idx", &self.current_block_idx.get())
+            .finish()
+    }
+}
+
+impl BatchOwnedLoggedDatabase {
+    /// 从多个块的日志数据创建
+    ///
+    /// # 参数
+    /// - `blocks_data`: Vec<(block_number, data)> - 每个块的日志数据，数据格式：count(8 bytes) + entries
+    /// - `state_provider`: 状态提供者
+    /// - `bytecode_cache`: 可选的全局 Bytecode 缓存
+    pub fn new(
+        blocks_data: Vec<(u64, Vec<u8>)>,
+        state_provider: Arc<dyn reth_provider::StateProvider>,
+        bytecode_cache: Option<Arc<BytecodeCache>>,
+    ) -> eyre::Result<Self> {
+        let mut parsed_blocks = Vec::with_capacity(blocks_data.len());
+
+        for (block_number, data) in blocks_data {
+            if data.len() < 8 {
+                return Err(eyre::eyre!("Invalid data for block {}: too short", block_number));
+            }
+
+            // 读取条目数量（小端序）
+            let entry_count = u64::from_le_bytes(data[0..8].try_into().unwrap());
+
+            parsed_blocks.push(OwnedBlockLogData {
+                block_number,
+                data: data[8..].to_vec(), // 跳过 count
+                entry_count,
+                pos: std::cell::Cell::new(0),
+                entries_read: std::cell::Cell::new(0),
+            });
+        }
+
+        Ok(Self {
+            blocks_data: parsed_blocks,
+            current_block_idx: std::cell::Cell::new(0),
+            state_provider,
+            bytecode_cache,
+        })
+    }
+
+    /// 读取当前块的下一个条目数据
+    #[inline]
+    fn next_entry(&self) -> Option<&[u8]> {
+        loop {
+            let idx = self.current_block_idx.get();
+            if idx >= self.blocks_data.len() {
+                return None;
+            }
+
+            let block = &self.blocks_data[idx];
+            let pos = block.pos.get();
+            let entries_read = block.entries_read.get();
+
+            if entries_read >= block.entry_count {
+                self.current_block_idx.set(idx + 1);
+                continue;
+            }
+
+            if pos >= block.data.len() {
+                self.current_block_idx.set(idx + 1);
+                continue;
+            }
+
+            let len = block.data[pos] as usize;
+            let start = pos + 1;
+            let end = start + len;
+
+            if end > block.data.len() {
+                self.current_block_idx.set(idx + 1);
+                continue;
+            }
+
+            block.pos.set(end);
+            block.entries_read.set(entries_read + 1);
+
+            return Some(&block.data[start..end]);
+        }
+    }
+}
+
+impl RevmDatabase for BatchOwnedLoggedDatabase {
+    type Error = <StateProviderDatabase<Box<dyn reth_provider::StateProvider>> as RevmDatabase>::Error;
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        if let Some(compact_data) = self.next_entry() {
+            if compact_data.is_empty() ||
+               (compact_data.len() == 1 && (compact_data[0] == 0x00 || compact_data[0] == 0xc0)) {
+                return Ok(None);
+            }
+
+            let mut account_info = match DbLoggedDatabase::decode_account_compact(compact_data) {
+                Ok(info) => info,
+                Err(_) => return Ok(None),
+            };
+
+            let code_hash = account_info.code_hash();
+            if code_hash.as_slice() != EMPTY_CODE_HASH_BYTES {
+                if let Ok(code) = self.code_by_hash(code_hash) {
+                    account_info.code = Some(code);
+                }
+            }
+
+            Ok(Some(account_info))
+        } else {
+            let mut inner_db = StateProviderDatabase::new(
+                self.state_provider.as_ref() as &dyn reth_provider::StateProvider
+            );
+            inner_db.basic(address)
+        }
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        if let Some(ref cache) = self.bytecode_cache {
+            if let Some(bytecode) = cache.get(&code_hash) {
+                return Ok(bytecode);
+            }
+        }
+
+        let mut inner_db = StateProviderDatabase::new(
+            self.state_provider.as_ref() as &dyn reth_provider::StateProvider
+        );
+        let bytecode = inner_db.code_by_hash(code_hash)?;
+
+        if let Some(ref cache) = self.bytecode_cache {
+            cache.insert(code_hash, bytecode.clone());
+        }
+
+        Ok(bytecode)
+    }
+
+    fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        if let Some(compact_data) = self.next_entry() {
+            let data_len = compact_data.len();
+            let (value, _) = U256::from_compact(compact_data, data_len);
+            Ok(value)
+        } else {
+            let mut inner_db = StateProviderDatabase::new(
+                self.state_provider.as_ref() as &dyn reth_provider::StateProvider
+            );
+            inner_db.storage(address, index)
+        }
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        let mut inner_db = StateProviderDatabase::new(
+            self.state_provider.as_ref() as &dyn reth_provider::StateProvider
+        );
+        inner_db.block_hash(number)
+    }
+}

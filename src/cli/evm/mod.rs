@@ -8,7 +8,7 @@ mod state_log;
 mod logged_db;
 
 pub use state_log::{MmapStateLogDatabase, MmapStateLogReader};
-pub use logged_db::{DbLoggedDatabase, BytecodeCache, CachedStateProviderDatabase};
+pub use logged_db::{DbLoggedDatabase, BytecodeCache, CachedStateProviderDatabase, LogExecutionStats};
 
 use clap::Parser;
 use reth_chainspec::ChainSpec;
@@ -602,33 +602,86 @@ fn open_log_files(log_dir: &Path) -> eyre::Result<(File, File)> {
     Ok((idx_file, bin_file))
 }
 
-/// 步骤2: 读取索引文件，获取所有块的索引条目（使用BufReader优化）
+/// 步骤2: 读取索引文件，获取所有块的索引条目（性能优化：批量读取+预分配）
 fn read_index_file(idx_file: &mut File) -> eyre::Result<Vec<IndexEntry>> {
     use std::io::Seek;
     idx_file.seek(SeekFrom::Start(0))?;
-    
-    // 使用BufReader包装文件（缓冲区大小64KB，适合索引文件读取）
-    const BUFFER_SIZE: usize = 64 * 1024;
+
+    // 性能优化：获取文件大小，预分配Vec容量
+    // 避免2000万次插入时的频繁重新分配（每次容量翻倍时需要复制所有数据）
+    let file_size = idx_file.metadata()?.len() as usize;
+    let entry_count = file_size / 24; // 每个条目24字节
+
+    // 大索引文件（>100MB）显示加载进度
+    let show_progress = file_size > 100 * 1024 * 1024;
+    if show_progress {
+        info!("Loading index file: {:.1} MB ({} blocks)...",
+            file_size as f64 / 1024.0 / 1024.0, entry_count);
+    }
+
+    // 性能优化：使用大缓冲区批量读取（2MB，适合大索引文件）
+    // 对于2000万块（480MB），减少系统调用次数从2000万次到240次
+    const BUFFER_SIZE: usize = 2 * 1024 * 1024; // 2MB缓冲区
     let mut reader = BufReader::with_capacity(BUFFER_SIZE, idx_file);
-    
-    let mut entries = Vec::new();
-    let mut buffer = [0u8; 24]; // 每个条目24字节
-    
+
+    // 性能优化：预分配Vec容量，避免频繁重新分配
+    // 2000万条记录时，可节省约25次重新分配（log2(20000000) ≈ 24.25）
+    let mut entries = Vec::with_capacity(entry_count);
+
+    // 进度跟踪
+    let mut bytes_read = 0usize;
+    let mut last_progress = 0usize;
+
+    // 性能优化：批量读取缓冲区（8192条 * 24字节 = 196KB）
+    // 减少逐条解析的开销，使用Vec处理更快
+    const BATCH_SIZE: usize = 8192;
+    let mut batch_buffer = vec![0u8; BATCH_SIZE * 24];
+
     loop {
-        match reader.read_exact(&mut buffer) {
-            Ok(_) => {
-                let block_number = u64::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7]]);
-                let offset = u64::from_le_bytes([buffer[8], buffer[9], buffer[10], buffer[11], buffer[12], buffer[13], buffer[14], buffer[15]]);
-                let length = u64::from_le_bytes([buffer[16], buffer[17], buffer[18], buffer[19], buffer[20], buffer[21], buffer[22], buffer[23]]);
-                entries.push(IndexEntry { block_number, offset, length });
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                break; // 文件结束
+        match reader.read(&mut batch_buffer) {
+            Ok(0) => break, // 文件结束
+            Ok(n) => {
+                bytes_read += n;
+
+                // 显示进度（每10%显示一次，避免过多日志）
+                if show_progress {
+                    let progress = (bytes_read * 100) / file_size;
+                    if progress >= last_progress + 10 {
+                        info!("  Loading index: {}% ({:.1} MB / {:.1} MB)",
+                            progress,
+                            bytes_read as f64 / 1024.0 / 1024.0,
+                            file_size as f64 / 1024.0 / 1024.0);
+                        last_progress = progress;
+                    }
+                }
+
+                // 批量解析读取的数据
+                let entry_count_in_batch = n / 24;
+                for i in 0..entry_count_in_batch {
+                    let offset = i * 24;
+                    let block_number = u64::from_le_bytes([
+                        batch_buffer[offset], batch_buffer[offset + 1], batch_buffer[offset + 2], batch_buffer[offset + 3],
+                        batch_buffer[offset + 4], batch_buffer[offset + 5], batch_buffer[offset + 6], batch_buffer[offset + 7]
+                    ]);
+                    let entry_offset = u64::from_le_bytes([
+                        batch_buffer[offset + 8], batch_buffer[offset + 9], batch_buffer[offset + 10], batch_buffer[offset + 11],
+                        batch_buffer[offset + 12], batch_buffer[offset + 13], batch_buffer[offset + 14], batch_buffer[offset + 15]
+                    ]);
+                    let length = u64::from_le_bytes([
+                        batch_buffer[offset + 16], batch_buffer[offset + 17], batch_buffer[offset + 18], batch_buffer[offset + 19],
+                        batch_buffer[offset + 20], batch_buffer[offset + 21], batch_buffer[offset + 22], batch_buffer[offset + 23]
+                    ]);
+                    entries.push(IndexEntry { block_number, offset: entry_offset, length });
+                }
             }
             Err(e) => return Err(e.into()),
         }
     }
-    
+
+    if show_progress {
+        info!("Index loaded: {} blocks", entries.len());
+    }
+
     Ok(entries)
 }
 
@@ -1874,7 +1927,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         
         // 检查是否启用从日志执行模式
         let use_log_enabled = self.use_log.as_ref().map(|s| s == "on").unwrap_or(false);
-        
+
+        // 创建日志执行统计收集器（仅在use_log模式下使用）
+        let log_stats = Arc::new(LogExecutionStats::new());
+
         // 如果启用了 mmap 日志模式（--mmap-log），初始化数据库
         // - 写入模式（--log-block on）：使用 MmapStateLogDatabase + RwLock
         // - 读取模式（--use-log on）：使用 MmapStateLogReader（无锁，性能更好）
@@ -2032,8 +2088,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
         // 性能优化：在程序开始时打开日志文件句柄，所有线程共享，程序结束时关闭
         // 如果启用了 --use-log on 且使用了日志目录，创建全局文件句柄
+        // 重要修复：如果使用了 --mmap-log 且 mmap_log_reader 存在，跳过旧格式文件（blocks_log.bin）
         let use_log_enabled = self.use_log.as_ref().map(|s| s == "on").unwrap_or(false);
-        let global_log_file_handle: Option<Arc<GlobalLogFileHandle>> = if use_log_enabled {
+        let global_log_file_handle: Option<Arc<GlobalLogFileHandle>> = if use_log_enabled && mmap_log_reader.is_none() {
+            // 只有在未使用 mmap_log_reader 时才使用旧格式的 blocks_log.bin
             if let Some(log_dir) = log_dir {
                 let bin_path = log_dir.join("blocks_log.bin");
                 match GlobalLogFileHandle::new(&bin_path, enable_in_memory_mode) {
@@ -2200,6 +2258,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             let mmap_log_reader_clone = mmap_log_reader.clone();
             // Bytecode 缓存（合约代码不可变，跨线程共享）
             let bytecode_cache_clone = bytecode_cache.clone();
+            // 日志执行统计收集器（线程安全，用于聚合所有线程的统计）
+            let log_stats_clone = log_stats.clone();
 
             // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
             threads.push(thread::spawn(move || {
@@ -2325,6 +2385,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                 }
                             }
 
+                            // 修复：记录实际处理的块号（用于准确统计，避免时序竞态导致的虚假统计）
+                            // 在 --log-block on 模式下，blocks_to_process_numbers 是预先计算的，
+                            // 但在执行时可能被其他 worker 跳过，导致统计不准确
+                            let mut actually_processed_blocks: Vec<u64> = Vec::new();
+
                             // 如果启用了日志记录（--log-block on），为每个块单独执行并记录日志
                             if log_block_enabled {
                                 // 性能优化：批量收集日志数据，减少写入次数和锁竞争
@@ -2383,8 +2448,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                     // 总是添加到 block_logs，即使日志为空
                                     // 这样索引会被更新，表示这个块已经被处理过了
                                     block_logs.push((block_number, logs));
+
+                                    // 修复：记录实际处理的块号（用于准确统计）
+                                    actually_processed_blocks.push(block_number);
                                 }
-                                
+
                                 // 批量写入日志（减少锁竞争和文件I/O）
                                 // 优先使用 mmap 模式，其次使用文件系统模式
                                 if let Some(ref db) = mmap_log_db_clone {
@@ -2469,6 +2537,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                                 if let Err(e) = executor.execute_batch(std::iter::once(block)) {
                                                     error!("Execution error for block {} using mmap DbLoggedDatabase: {}", block_number, e);
                                                 }
+                                                // 收集统计信息
+                                                log_stats_clone.accumulate(&logged_db);
                                             } else {
                                                 // 日志中缺失的块，使用数据库直接执行
                                                 let db = StateProviderDatabase::new(
@@ -2799,17 +2869,17 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                 let mut step_txs_counter: usize = 0;
 
                                 // 只统计实际处理的块（不包括已存在的块，用于补齐模式）
-                                // 使用 blocks_to_process_numbers 作为过滤依据，保持一致性
-                                // （避免因为其他线程 flush 导致 worker_block_exists() 返回不同结果）
+                                // 修复：使用 actually_processed_blocks 而不是 blocks_to_process_numbers
+                                // 避免时序竞态导致的虚假统计（预先计算vs实际执行的差异）
                                 if let Some(_log_dir) = &log_dir_clone {
                                     if log_block_enabled {
-                                        // --log-block on 模式：只统计需要处理的块
-                                        let blocks_to_process_set: std::collections::HashSet<u64> = 
-                                            blocks_to_process_numbers.iter().cloned().collect();
+                                        // --log-block on 模式：只统计实际处理的块
+                                        let actually_processed_set: std::collections::HashSet<u64> =
+                                            actually_processed_blocks.iter().cloned().collect();
                                         blocks.iter()
                                             .filter(|block| {
                                                 let block_num = block.sealed_block().header().number;
-                                                blocks_to_process_set.contains(&block_num)
+                                                actually_processed_set.contains(&block_num)
                                             })
                                             .for_each(|block| {
                                                 // td += block.sealed_block().header().difficulty; // PoS: total difficulty not used
@@ -2835,15 +2905,20 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
                                 // 使用原子操作更新统计（无锁，高性能）
                                 cumulative_gas.fetch_add(step_cumulative_gas, Ordering::Relaxed);
-                                
+
                                 // 只统计实际处理的块数（不包括已存在的块，用于补齐模式）
+                                // 修复：使用 actually_processed_blocks.len() 而不是 blocks_to_process_numbers.len()
                                 let processed_count = if let Some(_log_dir) = &log_dir_clone {
-                                    blocks_to_process_numbers.len() as u64
+                                    if log_block_enabled {
+                                        actually_processed_blocks.len() as u64
+                                    } else {
+                                        blocks_to_process_numbers.len() as u64
+                                    }
                                 } else {
                                     blocks.len() as u64
                                 };
                                 block_counter.fetch_add(processed_count, Ordering::Relaxed);
-                                
+
                                 txs_counter.fetch_add(step_txs_counter as u64, Ordering::Relaxed);
                             }
 
@@ -3130,6 +3205,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         } else {
             thread::sleep(Duration::from_secs(1));
             info!("EVM command completed successfully");
+        }
+
+        // 显示日志执行统计（仅在use_log模式下）
+        if use_log_enabled {
+            log_stats.print();
         }
 
         // 如果启用了性能分析，生成火焰图（跨平台支持）

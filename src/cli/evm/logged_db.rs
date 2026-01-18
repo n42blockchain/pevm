@@ -6,10 +6,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use alloy_primitives::{Address, B256, U256};
 use reth_codecs::Compact;
 use reth_primitives::Account;
 use reth_revm::database::StateProviderDatabase;
+use tracing::info;
 
 use crate::revm::Database as RevmDatabase;
 use crate::revm::state::{AccountInfo, Bytecode};
@@ -89,6 +91,12 @@ pub struct DbLoggedDatabase<'a> {
     state_provider: Arc<dyn reth_provider::StateProvider>,
     /// 全局 Bytecode 缓存（可选，用于减少数据库查询）
     bytecode_cache: Option<Arc<BytecodeCache>>,
+    /// 统计：读取账户的数量
+    pub account_reads: usize,
+    /// 统计：读取storage的数量
+    pub storage_reads: usize,
+    /// 统计：退化到数据库读取的次数
+    pub db_fallbacks: usize,
 }
 
 impl<'a> std::fmt::Debug for DbLoggedDatabase<'a> {
@@ -113,6 +121,9 @@ impl<'a> DbLoggedDatabase<'a> {
             pos: 8, // 跳过 count
             state_provider,
             bytecode_cache: None,
+            account_reads: 0,
+            storage_reads: 0,
+            db_fallbacks: 0,
         })
     }
     
@@ -132,6 +143,9 @@ impl<'a> DbLoggedDatabase<'a> {
             pos: 8, // 跳过 count
             state_provider,
             bytecode_cache: Some(bytecode_cache),
+            account_reads: 0,
+            storage_reads: 0,
+            db_fallbacks: 0,
         })
     }
     
@@ -179,19 +193,21 @@ impl<'a> RevmDatabase for DbLoggedDatabase<'a> {
     type Error = <StateProviderDatabase<Box<dyn reth_provider::StateProvider>> as RevmDatabase>::Error;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.account_reads += 1;
+
         if let Some(compact_data) = self.next_entry() {
             // 快速检查空账户标记
-            if compact_data.is_empty() || 
+            if compact_data.is_empty() ||
                (compact_data.len() == 1 && (compact_data[0] == 0x00 || compact_data[0] == 0xc0)) {
                 return Ok(None);
             }
-            
+
             // 解码账户
             let mut account_info = match Self::decode_account_compact(compact_data) {
                 Ok(info) => info,
                 Err(_) => return Ok(None),
             };
-            
+
             // 加载 bytecode（如果需要）
             let code_hash = account_info.code_hash();
             if code_hash.as_slice() != EMPTY_CODE_HASH_BYTES {
@@ -199,10 +215,11 @@ impl<'a> RevmDatabase for DbLoggedDatabase<'a> {
                     account_info.code = Some(code);
                 }
             }
-            
+
             Ok(Some(account_info))
         } else {
             // 日志数据用完，回退到数据库查询
+            self.db_fallbacks += 1;
             let mut inner_db = StateProviderDatabase::new(
                 self.state_provider.as_ref() as &dyn reth_provider::StateProvider
             );
@@ -233,11 +250,14 @@ impl<'a> RevmDatabase for DbLoggedDatabase<'a> {
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        self.storage_reads += 1;
+
         if let Some(compact_data) = self.next_entry() {
             let data_len = compact_data.len();
             let (value, _) = U256::from_compact(compact_data, data_len);
             Ok(value)
         } else {
+            self.db_fallbacks += 1;
             let mut inner_db = StateProviderDatabase::new(
                 self.state_provider.as_ref() as &dyn reth_provider::StateProvider
             );
@@ -369,8 +389,76 @@ impl<'a> RevmDatabase for CachedStateProviderDatabase<'a> {
         
         // 写入本地缓存
         self.block_hash_cache.insert(number, hash);
-        
+
         Ok(hash)
+    }
+}
+
+// ============================================================================
+// LogExecutionStats: 全局统计收集器
+// ============================================================================
+
+/// 日志执行统计信息（线程安全）
+///
+/// 用于收集所有线程的日志执行统计，在执行结束时显示
+#[derive(Debug, Default)]
+pub struct LogExecutionStats {
+    /// 总账户读取次数
+    pub account_reads: AtomicUsize,
+    /// 总storage读取次数
+    pub storage_reads: AtomicUsize,
+    /// 退化到数据库读取的次数
+    pub db_fallbacks: AtomicUsize,
+}
+
+impl LogExecutionStats {
+    /// 创建新的统计收集器
+    pub fn new() -> Self {
+        Self {
+            account_reads: AtomicUsize::new(0),
+            storage_reads: AtomicUsize::new(0),
+            db_fallbacks: AtomicUsize::new(0),
+        }
+    }
+
+    /// 累加统计数据（从单个DbLoggedDatabase）
+    pub fn accumulate(&self, db: &DbLoggedDatabase<'_>) {
+        self.account_reads.fetch_add(db.account_reads, Ordering::Relaxed);
+        self.storage_reads.fetch_add(db.storage_reads, Ordering::Relaxed);
+        self.db_fallbacks.fetch_add(db.db_fallbacks, Ordering::Relaxed);
+    }
+
+    /// 直接添加统计数据
+    pub fn add(&self, account_reads: usize, storage_reads: usize, db_fallbacks: usize) {
+        self.account_reads.fetch_add(account_reads, Ordering::Relaxed);
+        self.storage_reads.fetch_add(storage_reads, Ordering::Relaxed);
+        self.db_fallbacks.fetch_add(db_fallbacks, Ordering::Relaxed);
+    }
+
+    /// 打印统计信息
+    pub fn print(&self) {
+        let accounts = self.account_reads.load(Ordering::Relaxed);
+        let storages = self.storage_reads.load(Ordering::Relaxed);
+        let fallbacks = self.db_fallbacks.load(Ordering::Relaxed);
+        let total_reads = accounts + storages;
+
+        info!("=== Log Execution Statistics ===");
+        info!("  Account reads:       {:>12}", accounts);
+        info!("  Storage reads:       {:>12}", storages);
+        info!("  Total reads:         {:>12}", total_reads);
+        info!("  DB fallbacks:        {:>12}", fallbacks);
+        if total_reads > 0 {
+            let fallback_rate = (fallbacks as f64 / total_reads as f64) * 100.0;
+            info!("  Fallback rate:       {:>11.2}%", fallback_rate);
+        }
+        info!("================================");
+    }
+
+    /// 重置统计
+    pub fn reset(&self) {
+        self.account_reads.store(0, Ordering::Relaxed);
+        self.storage_reads.store(0, Ordering::Relaxed);
+        self.db_fallbacks.store(0, Ordering::Relaxed);
     }
 }
 

@@ -6,9 +6,11 @@
 mod profiling;
 mod state_log;
 mod logged_db;
+mod batch_log_store;
 
 pub use state_log::{MmapStateLogDatabase, MmapStateLogReader};
 pub use logged_db::{DbLoggedDatabase, BytecodeCache, CachedStateProviderDatabase};
+pub use batch_log_store::{BatchLogStore, BatchLogStoreWriter, BatchDatabase, BatchLoggingDatabase as BatchLoggingDb};
 
 use clap::Parser;
 use reth_chainspec::ChainSpec;
@@ -114,6 +116,12 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// rebuild clean index and report missing/corrupted blocks.
     #[arg(long, alias = "rebuild-idx")]
     rebuild_idx: bool,
+    /// Generate batch-level log files (batch_size=100 blocks per batch)
+    #[arg(long, alias = "gen-batchlog")]
+    gen_batchlog: bool,
+    /// Use batch-level log files for execution
+    #[arg(long, alias = "use-batchlog")]
+    use_batchlog: bool,
 }
 
 struct Task {
@@ -2097,6 +2105,32 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         // 这是最重要的性能优化之一，避免重复查询数据库获取相同的合约代码
         let bytecode_cache = Arc::new(BytecodeCache::new());
 
+        // 批次日志存储（用于 --use-batchlog 模式）
+        let batchlog_store: Option<Arc<batch_log_store::BatchLogStore>> = if self.use_batchlog {
+            if let Some(log_dir) = log_dir {
+                match batch_log_store::BatchLogStore::open(log_dir) {
+                    Ok(store) => {
+                        info!("Using batch-level log storage: {} batches (batch_size={}, range: {} - {})",
+                            store.header().batch_count, store.batch_size(),
+                            store.header().first_block_number, store.header().last_block_number);
+                        Some(Arc::new(store))
+                    }
+                    Err(e) => { warn!("Failed to open BatchLogStore: {}. Falling back to database.", e); None }
+                }
+            } else { warn!("--use-batchlog requires --log-dir to be set."); None }
+        } else { None };
+
+        // 批次日志写入器（用于 --gen-batchlog 模式）
+        let batchlog_writer: Option<Arc<Mutex<batch_log_store::BatchLogStoreWriter>>> = if self.gen_batchlog {
+            if let Some(log_dir) = log_dir {
+                info!("Creating batch-level log file: {} (batch_size=100)", log_dir.display());
+                match batch_log_store::BatchLogStoreWriter::new(log_dir, 100) {
+                    Ok(writer) => Some(Arc::new(Mutex::new(writer))),
+                    Err(e) => { error!("Failed to create BatchLogStoreWriter: {}", e); return Err(e); }
+                }
+            } else { return Err(eyre::eyre!("--gen-batchlog requires --log-dir to be set")); }
+        } else { None };
+
         // 设置 Ctrl+C 信号处理
         let should_stop_clone = Arc::clone(&should_stop);
         tokio::spawn(async move {
@@ -2200,6 +2234,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             let mmap_log_reader_clone = mmap_log_reader.clone();
             // Bytecode 缓存（合约代码不可变，跨线程共享）
             let bytecode_cache_clone = bytecode_cache.clone();
+            // 批次日志存储和写入器
+            let batchlog_store_clone = batchlog_store.clone();
+            let batchlog_writer_clone = batchlog_writer.clone();
+            let gen_batchlog = self.gen_batchlog;
+            let use_batchlog = self.use_batchlog;
 
             // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
             threads.push(thread::spawn(move || {
@@ -2325,8 +2364,106 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                 }
                             }
 
+                            // 批次日志生成模式（--gen-batchlog）
+                            if gen_batchlog {
+                                if let Some(ref writer) = batchlog_writer_clone {
+                                    let log_data: Vec<u8>;
+                                    let entry_count: u64;
+                                    let batch_start_block: u64;
+                                    let batch_end_block: u64;
+                                    let batch_success: bool;
+
+                                    {
+                                        let batch_state_provider = blockchain_db.history_by_block_number(task.start.checked_sub(1).unwrap_or(0))?;
+                                        let inner_db = StateProviderDatabase::new(&batch_state_provider);
+                                        let mut logging_db = batch_log_store::BatchLoggingDatabase::new(inner_db);
+
+                                        batch_success = {
+                                            let executor = evm_config.batch_executor(&mut logging_db);
+                                            match executor.execute_batch(blocks.iter()) {
+                                                Ok(_) => true,
+                                                Err(e) => { error!("Batch execution error for blocks {}-{}: {}", task.start, task.end, e); false }
+                                            }
+                                        };
+
+                                        (log_data, entry_count) = logging_db.take_logs();
+                                        batch_start_block = blocks.first().map(|b| b.sealed_block().header().number).unwrap_or(task.start);
+                                        batch_end_block = blocks.last().map(|b| b.sealed_block().header().number).unwrap_or(task.end);
+                                    }
+
+                                    if batch_success {
+                                        {
+                                            let mut writer_guard = writer.lock().unwrap();
+                                            if let Err(e) = writer_guard.write_batch(batch_start_block, batch_end_block, &log_data, entry_count) {
+                                                error!("Failed to write batch log for blocks {}-{}: {}", batch_start_block, batch_end_block, e);
+                                            }
+                                        }
+                                        for block in blocks.iter() {
+                                            let txs = block.sealed_block().body().transaction_count();
+                                            cumulative_gas.fetch_add(block.sealed_block().header().gas_used, Ordering::Relaxed);
+                                            txs_counter.fetch_add(txs as u64, Ordering::Relaxed);
+                                        }
+                                        block_counter.fetch_add(blocks.len() as u64, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            // 批次日志回放模式（--use-batchlog）
+                            else if use_batchlog {
+                                if let Some(ref store) = batchlog_store_clone {
+                                    let batch_size = store.batch_size() as usize;
+                                    let first_block = blocks.first().map(|b| b.sealed_block().header().number).unwrap_or(task.start);
+                                    let last_block = blocks.last().map(|b| b.sealed_block().header().number).unwrap_or(task.end);
+                                    let log_first_block = store.header().first_block_number;
+                                    let log_last_block = store.header().last_block_number;
+                                    let mut current_batch_start = (first_block / batch_size as u64) * batch_size as u64;
+
+                                    while current_batch_start <= last_block && current_batch_start <= log_last_block {
+                                        let batch_end = current_batch_start + batch_size as u64 - 1;
+                                        let batch_blocks: Vec<_> = blocks.iter().filter(|b| {
+                                            let bn = b.sealed_block().header().number;
+                                            bn >= current_batch_start && bn <= batch_end && bn <= log_last_block
+                                        }).collect();
+
+                                        if batch_blocks.is_empty() { current_batch_start += batch_size as u64; continue; }
+
+                                        let batch_state_provider: Arc<dyn reth_provider::StateProvider> = Arc::new(blockchain_db.history_by_block_number(current_batch_start.checked_sub(1).unwrap_or(0))?);
+                                        match batch_log_store::BatchDatabase::from_store(store, current_batch_start, batch_state_provider, None) {
+                                            Ok(mut batch_db) => {
+                                                {
+                                                    let executor = evm_config.batch_executor(&mut batch_db);
+                                                    if let Err(e) = executor.execute_batch(batch_blocks.iter().copied()) {
+                                                        error!("Batch execution error for blocks {}-{}: {}", current_batch_start, batch_end.min(last_block), e);
+                                                    }
+                                                }
+                                                for block in batch_blocks.iter() {
+                                                    let txs = block.sealed_block().body().transaction_count();
+                                                    cumulative_gas.fetch_add(block.sealed_block().header().gas_used, Ordering::Relaxed);
+                                                    txs_counter.fetch_add(txs as u64, Ordering::Relaxed);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!("Batch {} not found in batchlog: {}", current_batch_start, e);
+                                                for block in batch_blocks.iter() {
+                                                    let block_number = block.sealed_block().header().number;
+                                                    let db = StateProviderDatabase::new(blockchain_db.history_by_block_number(block_number.saturating_sub(1))?);
+                                                    let executor = evm_config.batch_executor(db);
+                                                    if let Err(e) = executor.execute_batch(std::iter::once(*block)) {
+                                                        error!("Execution error for block {}: {}", block_number, e);
+                                                    }
+                                                    let txs = block.sealed_block().body().transaction_count();
+                                                    cumulative_gas.fetch_add(block.sealed_block().header().gas_used, Ordering::Relaxed);
+                                                    txs_counter.fetch_add(txs as u64, Ordering::Relaxed);
+                                                }
+                                            }
+                                        }
+                                        store.release_batch(current_batch_start);
+                                        current_batch_start += batch_size as u64;
+                                    }
+                                    block_counter.fetch_add(blocks.len() as u64, Ordering::Relaxed);
+                                }
+                            }
                             // 如果启用了日志记录（--log-block on），为每个块单独执行并记录日志
-                            if log_block_enabled {
+                            else if log_block_enabled {
                                 // 性能优化：批量收集日志数据，减少写入次数和锁竞争
                                 // 先执行所有块并收集日志，然后批量写入
                                 let mut block_logs: Vec<(u64, Vec<ReadLogEntry>)> = Vec::with_capacity(blocks.len());
@@ -2967,6 +3104,21 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             info!("Mmap log database flushed successfully");
                         }
                     }
+                }
+            }
+
+            // 完成批次日志写入器
+            if let Some(writer) = batchlog_writer {
+                match Arc::try_unwrap(writer) {
+                    Ok(mutex) => {
+                        let writer = mutex.into_inner().unwrap();
+                        if let Err(e) = writer.finish() {
+                            error!("Failed to finish batch log writer: {}", e);
+                        } else {
+                            info!("Batch log writer finished successfully");
+                        }
+                    }
+                    Err(_) => { warn!("Could not finish batch log writer: Arc still has multiple references"); }
                 }
             }
         }

@@ -50,3 +50,17 @@ crates/storage/libmdbx-rs/mdbx-sys/libmdbx/cmake-build-debug
 
 # Rust bug report
 rustc-ice-*
+
+# Performance profiling and testing artifacts
+flamegraph.svg
+profile*.json
+profile*.json.gz
+bench_logs/
+compression_test/
+test_bench_logs/
+
+# Test scripts
+compression_test.sh
+test_compression_manual.sh
+test_decompression.sh
+compression_report.md

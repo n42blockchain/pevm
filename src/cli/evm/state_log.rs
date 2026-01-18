@@ -152,17 +152,30 @@ impl MmapStateLogReader {
         #[cfg(unix)]
         {
             unsafe {
+                let file_size = mmap_data.len();
                 // MADV_SEQUENTIAL: 提示内核这是顺序访问模式，启用积极的预读，减少页面故障延迟
-                // MADV_WILLNEED: 提示内核数据即将被访问，预加载到页面缓存（macOS 上很重要）
-                // 这两个提示可以组合使用，显著提升顺序读取性能（尤其是大文件）
+                // 总是使用 SEQUENTIAL，适合所有大小的文件
+                let mut advice = libc::MADV_SEQUENTIAL;
+
+                // MADV_WILLNEED: 提示内核数据即将被访问，预加载到页面缓存
+                // 重要修复：仅对小文件（<1GB）使用 MADV_WILLNEED
+                // 对于大文件（如225GB），MADV_WILLNEED 会阻塞并尝试预加载所有数据到内存，导致启动卡死
+                const WILLNEED_THRESHOLD: usize = 1024 * 1024 * 1024; // 1GB
+                if file_size < WILLNEED_THRESHOLD {
+                    advice |= libc::MADV_WILLNEED;
+                    info!("madvise: SEQUENTIAL | WILLNEED (file size: {:.1} MB < 1GB threshold)",
+                        file_size as f64 / 1024.0 / 1024.0);
+                } else {
+                    info!("madvise: SEQUENTIAL only (file size: {:.1} GB >= 1GB threshold, skipping WILLNEED to avoid blocking)",
+                        file_size as f64 / 1024.0 / 1024.0 / 1024.0);
+                }
+
                 let result = libc::madvise(
                     mmap_data.as_ptr() as *mut libc::c_void,
-                    mmap_data.len(),
-                    libc::MADV_SEQUENTIAL | libc::MADV_WILLNEED,
+                    file_size,
+                    advice,
                 );
-                if result == 0 {
-                    info!("madvise applied successfully: SEQUENTIAL | WILLNEED ({} bytes)", mmap_data.len());
-                } else {
+                if result != 0 {
                     warn!("madvise failed: errno={}", *libc::__error());
                 }
             }

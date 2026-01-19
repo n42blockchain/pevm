@@ -24,7 +24,7 @@ use reth_node_ethereum::{consensus::EthBeaconConsensus, EthEvmConfig};
 use reth_provider::{
     providers::ProviderNodeTypes, BlockNumReader, BlockWriter, ChainSpecProvider,
     DatabaseProviderFactory, LatestStateProviderRef, OriginalValuesKnown, ProviderFactory,
-    StateWriter,
+    StateWriter, StateWriteConfig,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_stages::{
@@ -165,6 +165,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             provider_rw.write_state(
                 &ExecutionOutcome::single(block_number, output),
                 OriginalValuesKnown::Yes,
+                StateWriteConfig::default(),
             )?;
 
             let checkpoint = Some(StageCheckpoint::new(

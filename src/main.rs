@@ -6,8 +6,8 @@
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
 use clap::Parser;
-use pevm::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
 use pevm::cli::chainspec::EthereumChainSpecParser;
+use pevm::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
 use reth_cli_commands::launcher::FnLauncher;
 use reth_node_builder::NodeHandle;
 use reth_node_ethereum::EthereumNode;
@@ -21,11 +21,19 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
-    if let Err(err) =
-        Cli::<EthereumChainSpecParser, RessArgs>::parse().run(FnLauncher::new::<EthereumChainSpecParser, RessArgs>(async move |builder, ress_args| {
+    if let Err(err) = Cli::<EthereumChainSpecParser, RessArgs>::parse().run(FnLauncher::new::<
+        EthereumChainSpecParser,
+        RessArgs,
+    >(
+        async move |builder, ress_args| {
             info!(target: "reth::cli", "Launching node");
-            let NodeHandle { node, node_exit_future } =
-                builder.node(EthereumNode::default()).launch_with_debug_capabilities().await?;
+            let NodeHandle {
+                node,
+                node_exit_future,
+            } = builder
+                .node(EthereumNode::default())
+                .launch_with_debug_capabilities()
+                .await?;
 
             // Install ress subprotocol.
             if ress_args.enabled {
@@ -40,8 +48,8 @@ fn main() {
             }
 
             node_exit_future.await
-        }))
-    {
+        },
+    )) {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
     }

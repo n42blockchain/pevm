@@ -2,7 +2,10 @@
 
 //! CLI definition and entrypoint to executable
 
-use crate::{chainspec::EthereumChainSpecParser, cli::{debug_cmd, evm}};
+use crate::{
+    chainspec::EthereumChainSpecParser,
+    cli::{debug_cmd, evm},
+};
 use clap::{Parser, Subcommand};
 use reth_chainspec::ChainSpec;
 use reth_cli::chainspec::ChainSpecParser;
@@ -133,8 +136,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
     {
         // Add network name if available to the logs dir
         if let Some(chain_spec) = self.command.chain_spec() {
-            self.logs.log_file_directory =
-                self.logs.log_file_directory.join(chain_spec.chain.to_string());
+            self.logs.log_file_directory = self
+                .logs
+                .log_file_directory
+                .join(chain_spec.chain.to_string());
         }
         let _guard = self.init_tracing()?;
         info!(target: "reth::cli", "Initialized tracing, debug log directory: {}", self.logs.log_file_directory);
@@ -171,14 +176,12 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
             Commands::Download(command) => {
                 runner.run_blocking_until_ctrl_c(command.execute::<EthereumNode>())
             }
-            Commands::Stage(command) => runner.run_command_until_exit(|ctx| {
-                command.execute::<EthereumNode, _>(ctx, components)
-            }),
-            Commands::P2P(command) => {
-                runner.run_until_ctrl_c(command.execute::<EthereumNode>())
-            }
-            #[cfg(feature = "dev")]
-            Commands::TestVectors(command) => runner.run_until_ctrl_c(command.execute()),
+            Commands::Stage(command) => runner
+                .run_command_until_exit(|ctx| command.execute::<EthereumNode, _>(ctx, components)),
+            Commands::P2P(command) => runner.run_until_ctrl_c(command.execute::<EthereumNode>()),
+            // Note: TestVectors is temporarily disabled due to reth 1.10.1 requiring 'arbitrary' feature
+            // #[cfg(feature = "dev")]
+            // Commands::TestVectors(command) => runner.run_until_ctrl_c(command.execute()),
             Commands::Config(command) => runner.run_until_ctrl_c(command.execute()),
             Commands::Debug(command) => {
                 runner.run_command_until_exit(|ctx| command.execute::<EthereumNode>(ctx))
@@ -234,9 +237,10 @@ pub enum Commands<C: ChainSpecParser, Ext: clap::Args + fmt::Debug> {
     #[command(name = "p2p")]
     P2P(p2p::Command<C>),
     /// Generate Test Vectors
-    #[cfg(feature = "dev")]
-    #[command(name = "test-vectors")]
-    TestVectors(reth_cli_commands::test_vectors::Command),
+    // Note: TestVectors is temporarily disabled due to reth 1.10.1 requiring 'arbitrary' feature
+    // #[cfg(feature = "dev")]
+    // #[command(name = "test-vectors")]
+    // TestVectors(reth_cli_commands::test_vectors::Command),
     /// Write config to stdout
     #[command(name = "config")]
     Config(config_cmd::Command),
@@ -265,8 +269,9 @@ impl<C: ChainSpecParser, Ext: clap::Args + fmt::Debug> Commands<C, Ext> {
             Self::Download(cmd) => cmd.chain_spec(),
             Self::Stage(cmd) => cmd.chain_spec(),
             Self::P2P(cmd) => cmd.chain_spec(),
-            #[cfg(feature = "dev")]
-            Self::TestVectors(_) => None,
+            // Note: TestVectors is temporarily disabled due to reth 1.10.1 requiring 'arbitrary' feature
+            // #[cfg(feature = "dev")]
+            // Self::TestVectors(_) => None,
             Self::Config(_) => None,
             Self::Debug(cmd) => cmd.chain_spec(),
             Self::Evm(cmd) => cmd.chain_spec(),
@@ -281,6 +286,7 @@ mod tests {
     use crate::chainspec::SUPPORTED_CHAINS;
     use clap::CommandFactory;
     use reth_node_core::args::ColorMode;
+    use tempfile;
 
     #[test]
     fn parse_color_mode() {
@@ -313,8 +319,10 @@ mod tests {
     fn parse_logs_path_node() {
         let mut reth = Cli::try_parse_args_from(["reth", "node"]).unwrap();
         if let Some(chain_spec) = reth.command.chain_spec() {
-            reth.logs.log_file_directory =
-                reth.logs.log_file_directory.join(chain_spec.chain.to_string());
+            reth.logs.log_file_directory = reth
+                .logs
+                .log_file_directory
+                .join(chain_spec.chain.to_string());
         }
         let log_dir = reth.logs.log_file_directory;
         let end = format!("reth/logs/{}", SUPPORTED_CHAINS[0]);
@@ -324,8 +332,11 @@ mod tests {
         iter.next();
         for chain in iter {
             let mut reth = Cli::try_parse_args_from(["reth", "node", "--chain", chain]).unwrap();
-            let chain =
-                reth.command.chain_spec().map(|c| c.chain.to_string()).unwrap_or(String::new());
+            let chain = reth
+                .command
+                .chain_spec()
+                .map(|c| c.chain.to_string())
+                .unwrap_or(String::new());
             reth.logs.log_file_directory = reth.logs.log_file_directory.join(chain.clone());
             let log_dir = reth.logs.log_file_directory;
             let end = format!("reth/logs/{chain}");
@@ -339,8 +350,10 @@ mod tests {
     fn parse_logs_path_init() {
         let mut reth = Cli::try_parse_args_from(["reth", "init"]).unwrap();
         if let Some(chain_spec) = reth.command.chain_spec() {
-            reth.logs.log_file_directory =
-                reth.logs.log_file_directory.join(chain_spec.chain.to_string());
+            reth.logs.log_file_directory = reth
+                .logs
+                .log_file_directory
+                .join(chain_spec.chain.to_string());
         }
         let log_dir = reth.logs.log_file_directory;
         let end = format!("reth/logs/{}", SUPPORTED_CHAINS[0]);
@@ -353,8 +366,10 @@ mod tests {
     fn parse_empty_logs_path() {
         let mut reth = Cli::try_parse_args_from(["reth", "config"]).unwrap();
         if let Some(chain_spec) = reth.command.chain_spec() {
-            reth.logs.log_file_directory =
-                reth.logs.log_file_directory.join(chain_spec.chain.to_string());
+            reth.logs.log_file_directory = reth
+                .logs
+                .log_file_directory
+                .join(chain_spec.chain.to_string());
         }
         let log_dir = reth.logs.log_file_directory;
         let end = "reth/logs".to_string();
@@ -378,6 +393,10 @@ mod tests {
             "debug,net=trace",
         ])
         .unwrap();
-        assert!(reth.run(FnLauncher::new::<EthereumChainSpecParser, NoArgs>(async move |_, _| Ok(()))).is_ok());
+        assert!(reth
+            .run(FnLauncher::new::<EthereumChainSpecParser, NoArgs>(
+                async move |_, _| Ok(())
+            ))
+            .is_ok());
     }
 }

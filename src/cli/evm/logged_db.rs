@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! 日志数据库模块
-//! 
+//!
 //! 提供从日志数据读取的 Database 实现，用于 EVM 执行
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use alloy_primitives::{Address, B256, U256};
 use reth_codecs::Compact;
 use reth_primitives::Account;
 use reth_revm::database::StateProviderDatabase;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tracing::info;
 
-use crate::revm::Database as RevmDatabase;
 use crate::revm::state::{AccountInfo, Bytecode};
+use crate::revm::Database as RevmDatabase;
 
 /// 全局 Bytecode 缓存（合约代码不可变，可以安全缓存）
 /// 使用 DashMap 实现高并发的线程安全访问
@@ -67,10 +67,8 @@ impl Default for BytecodeCache {
 
 /// 空 codehash 常量
 const EMPTY_CODE_HASH_BYTES: &[u8; 32] = &[
-    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c,
-    0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
-    0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b,
-    0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
+    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
+    0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
 ];
 
 /// 获取空 codehash
@@ -112,7 +110,10 @@ impl<'a> DbLoggedDatabase<'a> {
     /// 从数据创建（零拷贝）
     /// data 格式：count(8 bytes) + entries
     #[inline]
-    pub fn new(data: &'a [u8], state_provider: Arc<dyn reth_provider::StateProvider>) -> eyre::Result<Self> {
+    pub fn new(
+        data: &'a [u8],
+        state_provider: Arc<dyn reth_provider::StateProvider>,
+    ) -> eyre::Result<Self> {
         if data.len() < 8 {
             return Err(eyre::eyre!("Invalid data: too short"));
         }
@@ -126,7 +127,7 @@ impl<'a> DbLoggedDatabase<'a> {
             db_fallbacks: 0,
         })
     }
-    
+
     /// 从数据创建，带 Bytecode 缓存（零拷贝）
     /// data 格式：count(8 bytes) + entries
     #[inline]
@@ -148,38 +149,38 @@ impl<'a> DbLoggedDatabase<'a> {
             db_fallbacks: 0,
         })
     }
-    
+
     /// 读取下一个条目数据（零拷贝）
     #[inline]
     fn next_entry(&mut self) -> Option<&'a [u8]> {
         if self.pos >= self.data.len() {
             return None;
         }
-        
+
         let len = self.data[self.pos] as usize;
         let start = self.pos + 1;
         let end = start + len;
-        
+
         if end > self.data.len() {
             return None;
         }
-        
+
         self.pos = end;
         Some(&self.data[start..end])
     }
-    
+
     /// 从 Compact 编码数据解码账户信息
     #[inline]
     fn decode_account_compact(data: &[u8]) -> eyre::Result<AccountInfo> {
         if data.is_empty() || (data.len() == 1 && data[0] == 0x00) {
             return Err(eyre::eyre!("Account does not exist"));
         }
-        
+
         let data_len = data.len();
         let (account, _) = Account::from_compact(data, data_len);
-        
+
         let code_hash = account.bytecode_hash.unwrap_or_else(get_empty_code_hash);
-        
+
         Ok(AccountInfo::new(
             account.balance,
             account.nonce,
@@ -190,15 +191,17 @@ impl<'a> DbLoggedDatabase<'a> {
 }
 
 impl<'a> RevmDatabase for DbLoggedDatabase<'a> {
-    type Error = <StateProviderDatabase<Box<dyn reth_provider::StateProvider>> as RevmDatabase>::Error;
+    type Error =
+        <StateProviderDatabase<Box<dyn reth_provider::StateProvider>> as RevmDatabase>::Error;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         self.account_reads += 1;
 
         if let Some(compact_data) = self.next_entry() {
             // 快速检查空账户标记
-            if compact_data.is_empty() ||
-               (compact_data.len() == 1 && (compact_data[0] == 0x00 || compact_data[0] == 0xc0)) {
+            if compact_data.is_empty()
+                || (compact_data.len() == 1 && (compact_data[0] == 0x00 || compact_data[0] == 0xc0))
+            {
                 return Ok(None);
             }
 
@@ -234,18 +237,18 @@ impl<'a> RevmDatabase for DbLoggedDatabase<'a> {
                 return Ok(bytecode);
             }
         }
-        
+
         // 缓存未命中，查询数据库
         let mut inner_db = StateProviderDatabase::new(
             self.state_provider.as_ref() as &dyn reth_provider::StateProvider
         );
         let bytecode = inner_db.code_by_hash(code_hash)?;
-        
+
         // 写入缓存（合约代码不可变，安全缓存）
         if let Some(ref cache) = self.bytecode_cache {
             cache.insert(code_hash, bytecode.clone());
         }
-        
+
         Ok(bytecode)
     }
 
@@ -278,9 +281,9 @@ impl<'a> RevmDatabase for DbLoggedDatabase<'a> {
 // ============================================================================
 
 /// 带缓存的 StateProviderDatabase 包装器
-/// 
+///
 /// 用于纯 EVM 执行模式，通过缓存减少 MDBX 访问，避免 Windows 上的 STATUS_IN_PAGE_ERROR
-/// 
+///
 /// 缓存策略：
 /// - BytecodeCache：全局共享，合约代码不可变
 /// - AccountCache：线程级别，每个 task 内有效（避免跨 task 状态污染）
@@ -297,7 +300,10 @@ pub struct CachedStateProviderDatabase<'a> {
 impl<'a> std::fmt::Debug for CachedStateProviderDatabase<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedStateProviderDatabase")
-            .field("bytecode_cache", &self.bytecode_cache.as_ref().map(|c| c.len()))
+            .field(
+                "bytecode_cache",
+                &self.bytecode_cache.as_ref().map(|c| c.len()),
+            )
             .field("account_cache_size", &self.account_cache.len())
             .field("storage_cache_size", &self.storage_cache.len())
             .field("block_hash_cache_size", &self.block_hash_cache.len())
@@ -322,21 +328,22 @@ impl<'a> CachedStateProviderDatabase<'a> {
 }
 
 impl<'a> RevmDatabase for CachedStateProviderDatabase<'a> {
-    type Error = <StateProviderDatabase<Box<dyn reth_provider::StateProvider>> as RevmDatabase>::Error;
+    type Error =
+        <StateProviderDatabase<Box<dyn reth_provider::StateProvider>> as RevmDatabase>::Error;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         // 先查本地缓存
         if let Some(cached) = self.account_cache.get(&address) {
             return Ok(cached.clone());
         }
-        
+
         // 缓存未命中，查询数据库
         let mut inner_db = StateProviderDatabase::new(self.state_provider);
         let result = inner_db.basic(address)?;
-        
+
         // 写入本地缓存
         self.account_cache.insert(address, result.clone());
-        
+
         Ok(result)
     }
 
@@ -347,16 +354,16 @@ impl<'a> RevmDatabase for CachedStateProviderDatabase<'a> {
                 return Ok(bytecode);
             }
         }
-        
+
         // 缓存未命中，查询数据库
         let mut inner_db = StateProviderDatabase::new(self.state_provider);
         let bytecode = inner_db.code_by_hash(code_hash)?;
-        
+
         // 写入全局缓存
         if let Some(ref cache) = self.bytecode_cache {
             cache.insert(code_hash, bytecode.clone());
         }
-        
+
         Ok(bytecode)
     }
 
@@ -366,14 +373,14 @@ impl<'a> RevmDatabase for CachedStateProviderDatabase<'a> {
         if let Some(&cached) = self.storage_cache.get(&key) {
             return Ok(cached);
         }
-        
+
         // 缓存未命中，查询数据库
         let mut inner_db = StateProviderDatabase::new(self.state_provider);
         let value = inner_db.storage(address, index)?;
-        
+
         // 写入本地缓存
         self.storage_cache.insert(key, value);
-        
+
         Ok(value)
     }
 
@@ -382,11 +389,11 @@ impl<'a> RevmDatabase for CachedStateProviderDatabase<'a> {
         if let Some(&cached) = self.block_hash_cache.get(&number) {
             return Ok(cached);
         }
-        
+
         // 缓存未命中，查询数据库
         let mut inner_db = StateProviderDatabase::new(self.state_provider);
         let hash = inner_db.block_hash(number)?;
-        
+
         // 写入本地缓存
         self.block_hash_cache.insert(number, hash);
 
@@ -474,9 +481,12 @@ impl LogExecutionStats {
     /// 注意：频繁调用此方法会导致大量原子操作
     /// 建议使用 LocalStatsAccumulator 进行批量累加
     pub fn accumulate(&self, db: &DbLoggedDatabase<'_>) {
-        self.account_reads.fetch_add(db.account_reads, Ordering::Relaxed);
-        self.storage_reads.fetch_add(db.storage_reads, Ordering::Relaxed);
-        self.db_fallbacks.fetch_add(db.db_fallbacks, Ordering::Relaxed);
+        self.account_reads
+            .fetch_add(db.account_reads, Ordering::Relaxed);
+        self.storage_reads
+            .fetch_add(db.storage_reads, Ordering::Relaxed);
+        self.db_fallbacks
+            .fetch_add(db.db_fallbacks, Ordering::Relaxed);
     }
 
     /// 批量累加统计数据（从 LocalStatsAccumulator）
@@ -485,20 +495,25 @@ impl LogExecutionStats {
     #[inline]
     pub fn accumulate_batch(&self, local: &LocalStatsAccumulator) {
         if local.account_reads > 0 {
-            self.account_reads.fetch_add(local.account_reads, Ordering::Relaxed);
+            self.account_reads
+                .fetch_add(local.account_reads, Ordering::Relaxed);
         }
         if local.storage_reads > 0 {
-            self.storage_reads.fetch_add(local.storage_reads, Ordering::Relaxed);
+            self.storage_reads
+                .fetch_add(local.storage_reads, Ordering::Relaxed);
         }
         if local.db_fallbacks > 0 {
-            self.db_fallbacks.fetch_add(local.db_fallbacks, Ordering::Relaxed);
+            self.db_fallbacks
+                .fetch_add(local.db_fallbacks, Ordering::Relaxed);
         }
     }
 
     /// 直接添加统计数据
     pub fn add(&self, account_reads: usize, storage_reads: usize, db_fallbacks: usize) {
-        self.account_reads.fetch_add(account_reads, Ordering::Relaxed);
-        self.storage_reads.fetch_add(storage_reads, Ordering::Relaxed);
+        self.account_reads
+            .fetch_add(account_reads, Ordering::Relaxed);
+        self.storage_reads
+            .fetch_add(storage_reads, Ordering::Relaxed);
         self.db_fallbacks.fetch_add(db_fallbacks, Ordering::Relaxed);
     }
 
@@ -528,4 +543,3 @@ impl LogExecutionStats {
         self.db_fallbacks.store(0, Ordering::Relaxed);
     }
 }
-

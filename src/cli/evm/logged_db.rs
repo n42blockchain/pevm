@@ -395,12 +395,16 @@ impl<'a> RevmDatabase for CachedStateProviderDatabase<'a> {
 }
 
 // ============================================================================
-// LogExecutionStats: 全局统计收集器
+// LogExecutionStats: 全局统计收集器（优化版）
 // ============================================================================
 
-/// 日志执行统计信息（线程安全）
+/// 日志执行统计信息（线程安全，优化批量累加）
 ///
 /// 用于收集所有线程的日志执行统计，在执行结束时显示
+///
+/// 性能优化：
+/// - 支持批量累加，减少原子操作次数
+/// - 线程可以先在本地累加，然后批量提交到全局统计
 #[derive(Debug, Default)]
 pub struct LogExecutionStats {
     /// 总账户读取次数
@@ -409,6 +413,50 @@ pub struct LogExecutionStats {
     pub storage_reads: AtomicUsize,
     /// 退化到数据库读取的次数
     pub db_fallbacks: AtomicUsize,
+}
+
+/// 线程本地统计累加器（零开销）
+///
+/// 用于在线程内部批量累加统计，最后一次性提交到全局 LogExecutionStats
+/// 避免频繁的原子操作
+#[derive(Debug, Default, Clone)]
+pub struct LocalStatsAccumulator {
+    /// 账户读取次数
+    pub account_reads: usize,
+    /// Storage读取次数
+    pub storage_reads: usize,
+    /// 退化到数据库读取的次数
+    pub db_fallbacks: usize,
+}
+
+impl LocalStatsAccumulator {
+    /// 创建新的本地累加器
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 从 DbLoggedDatabase 累加统计（纯本地操作，无原子操作）
+    #[inline]
+    pub fn accumulate(&mut self, db: &DbLoggedDatabase<'_>) {
+        self.account_reads += db.account_reads;
+        self.storage_reads += db.storage_reads;
+        self.db_fallbacks += db.db_fallbacks;
+    }
+
+    /// 重置累加器
+    #[inline]
+    pub fn reset(&mut self) {
+        self.account_reads = 0;
+        self.storage_reads = 0;
+        self.db_fallbacks = 0;
+    }
+
+    /// 检查是否为空
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.account_reads == 0 && self.storage_reads == 0 && self.db_fallbacks == 0
+    }
 }
 
 impl LogExecutionStats {
@@ -422,10 +470,29 @@ impl LogExecutionStats {
     }
 
     /// 累加统计数据（从单个DbLoggedDatabase）
+    ///
+    /// 注意：频繁调用此方法会导致大量原子操作
+    /// 建议使用 LocalStatsAccumulator 进行批量累加
     pub fn accumulate(&self, db: &DbLoggedDatabase<'_>) {
         self.account_reads.fetch_add(db.account_reads, Ordering::Relaxed);
         self.storage_reads.fetch_add(db.storage_reads, Ordering::Relaxed);
         self.db_fallbacks.fetch_add(db.db_fallbacks, Ordering::Relaxed);
+    }
+
+    /// 批量累加统计数据（从 LocalStatsAccumulator）
+    ///
+    /// 性能优化：只需要 3 次原子操作，而不是 N*3 次
+    #[inline]
+    pub fn accumulate_batch(&self, local: &LocalStatsAccumulator) {
+        if local.account_reads > 0 {
+            self.account_reads.fetch_add(local.account_reads, Ordering::Relaxed);
+        }
+        if local.storage_reads > 0 {
+            self.storage_reads.fetch_add(local.storage_reads, Ordering::Relaxed);
+        }
+        if local.db_fallbacks > 0 {
+            self.db_fallbacks.fetch_add(local.db_fallbacks, Ordering::Relaxed);
+        }
     }
 
     /// 直接添加统计数据

@@ -8,7 +8,7 @@ mod state_log;
 mod logged_db;
 
 pub use state_log::{MmapStateLogDatabase, MmapStateLogReader};
-pub use logged_db::{DbLoggedDatabase, BytecodeCache, CachedStateProviderDatabase, LogExecutionStats};
+pub use logged_db::{DbLoggedDatabase, BytecodeCache, CachedStateProviderDatabase, LogExecutionStats, LocalStatsAccumulator};
 
 use clap::Parser;
 use reth_chainspec::ChainSpec;
@@ -2480,20 +2480,26 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                 // 优先使用无锁 mmap reader（零拷贝，无锁，性能最好）
                                 if let Some(ref reader) = mmap_log_reader_clone {
                                     let blocks_len = blocks.len();
-                                    
+
+                                    // 创建线程本地统计累加器（性能优化：避免频繁原子操作）
+                                    let mut local_stats = LocalStatsAccumulator::new();
+                                    // 本地gas和交易计数器（避免频繁原子操作）
+                                    let mut local_gas = 0u64;
+                                    let mut local_txs = 0u64;
+
                                     // 获取所有需要的块号
                                     let block_numbers: Vec<u64> = blocks.iter()
                                         .map(|b| b.sealed_block().header().number)
                                         .collect();
-                                    
+
                                     // 从 mmap 读取（零拷贝，无锁！）
                                     // 返回格式: Vec<(block_number, Option<data>)>，缺失的块返回 None
                                     let batch_data = reader.read_block_logs_batch(&block_numbers);
-                                    
+
                                     // 创建共享的 StateProvider
-                                    let shared_state_provider: Arc<dyn reth_provider::StateProvider> = 
+                                    let shared_state_provider: Arc<dyn reth_provider::StateProvider> =
                                         Arc::new(blockchain_db.history_by_block_number(task.start.checked_sub(1).unwrap_or(0))?);
-                                    
+
                                     // 为每个块创建 DbLoggedDatabase 并执行（零拷贝版本）
                                     // 对于缺失的块，block_db_pairs 中的值为 None
                                     let mut block_db_pairs: Vec<(u64, Option<DbLoggedDatabase<'_>>)> = Vec::with_capacity(blocks_len);
@@ -2537,8 +2543,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                                 if let Err(e) = executor.execute_batch(std::iter::once(block)) {
                                                     error!("Execution error for block {} using mmap DbLoggedDatabase: {}", block_number, e);
                                                 }
-                                                // 收集统计信息
-                                                log_stats_clone.accumulate(&logged_db);
+                                                // 收集统计信息到本地累加器（零开销，无原子操作）
+                                                local_stats.accumulate(&logged_db);
                                             } else {
                                                 // 日志中缺失的块，使用数据库直接执行
                                                 let db = StateProviderDatabase::new(
@@ -2550,16 +2556,23 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                                 }
                                             }
                                             
-                                            // 更新统计（使用原子操作，无锁）
+                                            // 累加到本地计数器（纯本地操作，零开销）
                                             let txs = block.sealed_block().body().transaction_count();
-                                            cumulative_gas.fetch_add(block.sealed_block().header().gas_used, Ordering::Relaxed);
-                                            txs_counter.fetch_add(txs as u64, Ordering::Relaxed);
+                                            local_gas += block.sealed_block().header().gas_used;
+                                            local_txs += txs as u64;
                                         }
                                     }
-                                    
-                                    // 更新 block_counter（使用原子操作，无锁）
+
+                                    // 批量提交本地计数器到全局（性能优化：从 N 次原子操作减少到 3 次）
+                                    cumulative_gas.fetch_add(local_gas, Ordering::Relaxed);
+                                    txs_counter.fetch_add(local_txs, Ordering::Relaxed);
                                     block_counter.fetch_add(blocks.len() as u64, Ordering::Relaxed);
-                                    
+
+                                    // 批量提交本地统计到全局（性能优化：只需3次原子操作，而非 N*3 次）
+                                    if !local_stats.is_empty() {
+                                        log_stats_clone.accumulate_batch(&local_stats);
+                                    }
+
                                 } else if let Some(log_dir) = &log_dir_clone {
                                     // 文件系统模式：从文件读取日志数据
                                     // 注意：StateProvider 不能跨块复用，因为每个块的状态不同

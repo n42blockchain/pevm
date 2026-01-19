@@ -3,7 +3,7 @@
 ## Test Environment
 - **Date**: 2026-01-19
 - **Branch**: main
-- **Commit**: TBD (after commit)
+- **Commit**: 2d5d531
 - **Upgrade**: reth v1.10.0 → v1.10.1, REVM v33→v34, vergen 9.0.4→9.1.0
 
 ## Test Summary

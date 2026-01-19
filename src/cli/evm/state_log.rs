@@ -148,7 +148,7 @@ impl MmapStateLogReader {
 
         info!("MmapStateLogReader opened: {} blocks indexed", index.len());
 
-        // 性能优化：添加 madvise 提示，优化内核页面缓存策略
+        // 性能优化：添加内存访问提示，优化页面缓存策略
         #[cfg(unix)]
         {
             unsafe {
@@ -177,6 +177,67 @@ impl MmapStateLogReader {
                 if result != 0 {
                     warn!("madvise failed: errno={}", *libc::__error());
                 }
+            }
+        }
+
+        // Windows 性能优化：使用 PrefetchVirtualMemory 预加载内存页面
+        // 等效于 Unix 的 madvise(MADV_WILLNEED)
+        #[cfg(windows)]
+        {
+            // Windows API 定义
+            #[repr(C)]
+            struct WIN32_MEMORY_RANGE_ENTRY {
+                virtual_address: *const u8,
+                number_of_bytes: usize,
+            }
+
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GetCurrentProcess() -> *mut std::ffi::c_void;
+                fn PrefetchVirtualMemory(
+                    h_process: *mut std::ffi::c_void,
+                    number_of_entries: usize,
+                    virtual_addresses: *const WIN32_MEMORY_RANGE_ENTRY,
+                    flags: u32,
+                ) -> i32;
+            }
+
+            let file_size = mmap_data.len();
+            const CHUNK_SIZE: usize = 256 * 1024 * 1024; // 256MB per chunk
+
+            // 分块预取：每次预取256MB，避免一次性加载过多数据导致阻塞
+            let num_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            let mut success_count = 0;
+
+            for i in 0..num_chunks {
+                let offset = i * CHUNK_SIZE;
+                let chunk_len = std::cmp::min(CHUNK_SIZE, file_size - offset);
+
+                let entry = WIN32_MEMORY_RANGE_ENTRY {
+                    virtual_address: unsafe { mmap_data.as_ptr().add(offset) },
+                    number_of_bytes: chunk_len,
+                };
+
+                let result = unsafe {
+                    PrefetchVirtualMemory(
+                        GetCurrentProcess(),
+                        1,
+                        &entry,
+                        0, // Flags: 0 = default behavior
+                    )
+                };
+
+                if result != 0 {
+                    success_count += 1;
+                }
+            }
+
+            if success_count == num_chunks {
+                info!("PrefetchVirtualMemory: success ({} chunks x 256MB, total {:.1} MB)",
+                    num_chunks, file_size as f64 / 1024.0 / 1024.0);
+            } else {
+                warn!("PrefetchVirtualMemory: partial success ({}/{} chunks, total {:.1} MB)",
+                    success_count, num_chunks, file_size as f64 / 1024.0 / 1024.0);
             }
         }
 
@@ -922,6 +983,20 @@ impl MmapStateLogDatabase {
             false
         }
     }
+
+    /// 批量检查多个块是否存在（减少锁竞争）
+    /// 返回存在的块号集合
+    #[inline]
+    pub fn blocks_exist_batch(&self, block_numbers: &[u64]) -> std::collections::HashSet<u64> {
+        let mut existing = std::collections::HashSet::with_capacity(block_numbers.len());
+        for &bn in block_numbers {
+            if self.block_exists(bn) {
+                existing.insert(bn);
+            }
+        }
+        existing
+    }
+
 
     /// 检查块数据是否损坏
     /// 返回 true 表示损坏（需要重新生成）

@@ -23,7 +23,7 @@ use reth_node_ethereum::EthEngineTypes;
 
 use reth_cli_commands::common::{AccessRights, Environment, EnvironmentArgs};
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use eyre::{Report, Result};
 use reth_consensus::FullConsensus;
@@ -81,8 +81,8 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// end block number
     #[arg(long, alias = "end", short = 'e')]
     end_number: u64,
-    /// step size for loop
-    #[arg(long, alias = "step", short = 's', default_value = "100")]
+    /// step size for loop (smaller value = better load balancing for mmap mode)
+    #[arg(long, alias = "step", short = 's', default_value = "3")]
     step_size: usize,
     /// Enable logging for blocks (use "on" to log all blocks in range, or a specific block number)
     #[arg(long, alias = "log-block")]
@@ -806,12 +806,7 @@ pub(crate) fn write_read_logs_binary(
 
     let (final_data, algorithm_opt, compressed_size) = if enable_in_memory_mode {
         // 测试模式：不压缩，直接写入原始数据（格式：count(8) + entries）
-        info!(
-            "测试模式：写入未压缩日志数据（块 {}，{} 条目，原始大小: {} bytes）",
-            block_number,
-            read_logs.len(),
-            uncompressed_size
-        );
+        trace!("测试模式：写入未压缩日志数据（块 {}，{} 条目，原始大小: {} bytes）", block_number, read_logs.len(), uncompressed_size);
         (uncompressed_data, None, 0)
     } else {
         // 正常模式：压缩数据
@@ -819,7 +814,7 @@ pub(crate) fn write_read_logs_binary(
             choose_compression_algorithm(&uncompressed_data, compression_algorithm)?;
         let compressed_size = compressed_data.len();
 
-        info!("正常模式：写入压缩日志数据（块 {}，环境变量 PEVM_IN_MEMORY_MODE={:?}，压缩算法: {:?}，原始大小: {} bytes，压缩后: {} bytes）",
+        trace!("正常模式：写入压缩日志数据（块 {}，环境变量 PEVM_IN_MEMORY_MODE={:?}，压缩算法: {:?}，原始大小: {} bytes，压缩后: {} bytes）",
             block_number, env_var, algorithm, uncompressed_size, compressed_size);
 
         // 构建最终数据：压缩算法标识 + 压缩后的数据
@@ -2351,8 +2346,29 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         info!("Using {} worker threads", thread_count);
         let mut threads: Vec<JoinHandle<Result<()>>> = Vec::with_capacity(thread_count);
 
+        // 性能优化：预分配任务给每个线程，避免 Mutex 竞争
+        // 在日志回放模式下，每个块数据独立，不需要同步
+        let use_log_enabled_check = self.use_log.as_ref().map(|s| s == "on").unwrap_or(false);
+        let use_lockfree_mode = use_log_enabled_check && self.use_mmap_log;
+        let tasks_vec: Vec<Task> = tasks.into_iter().collect();
+
+        // 根据模式决定任务分配方式（避免 tasks_vec 被使用两次）
+        let (per_thread_tasks, task_queue_vec): (Vec<Vec<Task>>, Vec<Task>) = if use_lockfree_mode {
+            // 无锁模式：预分配任务给每个线程
+            let mut distributed: Vec<Vec<Task>> = (0..thread_count).map(|_| Vec::new()).collect();
+            for (i, task) in tasks_vec.into_iter().enumerate() {
+                distributed[i % thread_count].push(task);
+            }
+            (distributed, Vec::new())
+        } else {
+            // 兼容模式：使用原来的共享队列
+            (Vec::new(), tasks_vec)
+        };
+
+        // 共享任务队列（仅在非无锁模式下使用）
+        let task_queue = Arc::new(Mutex::new(VecDeque::from(task_queue_vec)));
+
         // 创建共享计数器（使用原子操作避免锁竞争，提高多线程性能）
-        let task_queue = Arc::new(Mutex::new(tasks));
         let cumulative_gas = Arc::new(AtomicU64::new(0));
         let block_counter = Arc::new(AtomicU64::new(self.begin_number - 1));
         let txs_counter = Arc::new(AtomicU64::new(0));
@@ -2439,12 +2455,23 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             });
         }
 
-        for _ in 0..thread_count {
+        // 预分配任务迭代器（无锁模式）
+        let mut per_thread_tasks_iter = per_thread_tasks.into_iter();
+
+        for _thread_idx in 0..thread_count {
             let task_queue = Arc::clone(&task_queue);
             let cumulative_gas = Arc::clone(&cumulative_gas);
             let block_counter = Arc::clone(&block_counter);
             let txs_counter = Arc::clone(&txs_counter);
             let should_stop_worker = Arc::clone(&should_stop);
+
+            // 无锁模式：获取该线程的预分配任务
+            let thread_tasks: Vec<Task> = if use_lockfree_mode {
+                per_thread_tasks_iter.next().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let use_lockfree_mode_thread = use_lockfree_mode;
 
             let chain_spec = chain_spec.clone();
             let blockchain_db = blockchain_db.clone();
@@ -2509,6 +2536,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 #[cfg(windows)]
                 const TASKS_BEFORE_FORCE_REFRESH: u32 = 50; // Windows 上每 50 个 task 强制刷新
 
+                // 无锁模式：使用预分配的任务迭代器
+                let mut thread_tasks_iter = thread_tasks.into_iter();
+
                 loop {
                     // 检查停止标志
                     if should_stop_worker.load(Ordering::Relaxed) {
@@ -2516,7 +2546,15 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                         break;
                     }
 
-                    let task = {
+                    // 获取下一个任务：无锁模式从本地列表获取，否则从共享队列获取
+                    let task = if use_lockfree_mode_thread {
+                        // 无锁模式：直接从本地列表获取，无需锁
+                        match thread_tasks_iter.next() {
+                            Some(t) => Some(t),
+                            None => break, // 本地任务用完，退出循环
+                        }
+                    } else {
+                        // 兼容模式：从共享队列获取（需要锁）
                         let mut queue = task_queue.lock().unwrap();
                         if queue.is_empty() {
                             break;
@@ -2545,45 +2583,48 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             let blocks = blockchain_db.block_with_senders_range(task.start..=task.end).unwrap();
 
                             // 步骤4: 如果使用累加模式且启用了日志记录（--log-block on），过滤掉已存在的块（断点续传）
-                            // 精确检查：使用 mmap_log_db 的 block_exists() 方法
-                            // 这样可以正确处理不连续的块（有缺失块的情况）
-                            // 块存在检查函数（用于补齐模式：跳过已存在且有效的块）
-                            // mmap 模式：使用 block_exists() 精确检查（包括损坏检测）
-                            // 文件系统模式：使用 HashSet 检查
-                            let worker_block_exists = |block_num: u64| -> bool {
+                            // 性能优化：批量检查块存在状态，只获取一次 RwLock 读锁（减少锁竞争）
+                            // 先收集所有块号
+                            let all_block_numbers: Vec<u64> = blocks.iter()
+                                .map(|block| block.sealed_block().header().number)
+                                .collect();
+
+                            // 批量检查块是否存在（一次锁获取）
+                            let existing_in_mmap: std::collections::HashSet<u64> = if log_block_enabled {
                                 if let Some(ref db) = mmap_log_db_clone {
-                                    // mmap 模式：精确检查块是否存在且数据有效（包括损坏检测）
+                                    // mmap 模式：批量检查块是否存在（只获取一次锁）
                                     let db_guard = db.read().unwrap();
-                                    db_guard.block_exists(block_num)
+                                    db_guard.blocks_exist_batch(&all_block_numbers)
                                 } else {
-                                    // 文件系统模式：使用 HashSet 检查
-                                    existing_blocks_clone.contains(&block_num)
+                                    // 文件系统模式：使用已有的 HashSet
+                                    all_block_numbers.iter()
+                                        .filter(|bn| existing_blocks_clone.contains(bn))
+                                        .copied()
+                                        .collect()
                                 }
+                            } else {
+                                std::collections::HashSet::new()
+                            };
+
+                            // 本地检查函数（无锁，使用预计算的结果）
+                            let worker_block_exists = |block_num: u64| -> bool {
+                                existing_in_mmap.contains(&block_num)
                             };
 
                             // 先收集需要处理的块号，用于统计
                             let blocks_to_process_numbers: Vec<u64> = if let Some(_log_dir) = &log_dir_clone {
                                 if log_block_enabled {
                                     // 只在 --log-block on 模式下过滤已存在的块
-                                    blocks.iter()
-                                        .filter(|block| {
-                                            let block_num = block.sealed_block().header().number;
-                                            !worker_block_exists(block_num)
-                                        })
-                                        .map(|block| block.sealed_block().header().number)
-                                        .collect::<Vec<u64>>()
+                                    all_block_numbers.iter()
+                                        .filter(|bn| !worker_block_exists(**bn))
+                                        .copied()
+                                        .collect()
                                 } else {
                                     // --use-log on 或其他模式，不过滤，处理所有块
-                                    // 性能优化：预分配 Vec 容量
-                                    blocks.iter()
-                                        .map(|block| block.sealed_block().header().number)
-                                        .collect::<Vec<u64>>()
+                                    all_block_numbers
                                 }
                             } else {
-                                // 性能优化：预分配 Vec 容量
-                                blocks.iter()
-                                    .map(|block| block.sealed_block().header().number)
-                                    .collect::<Vec<u64>>()
+                                all_block_numbers
                             };
 
                             // 如果使用累加模式且启用了日志记录（--log-block on）且所有块都已存在，跳过执行
@@ -2704,9 +2745,15 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                     // 返回格式: Vec<(block_number, Option<data>)>，缺失的块返回 None
                                     let batch_data = reader.read_block_logs_batch(&block_numbers);
 
-                                    // 创建共享的 StateProvider
+                                    // 性能优化：复用线程级别的 StateProvider（避免每个 task 都调用 history_by_block_number）
+                                    // 在日志重放模式下，StateProvider 只用于 code_by_hash 查询
+                                    // Bytecode 是不可变的，所以使用任何块号的 state provider 都可以
                                     let shared_state_provider: Arc<dyn reth_provider::StateProvider> =
-                                        Arc::new(blockchain_db.history_by_block_number(task.start.checked_sub(1).unwrap_or(0))?);
+                                        if let Some(ref sp) = thread_level_state_provider {
+                                            sp.clone()
+                                        } else {
+                                            Arc::new(blockchain_db.history_by_block_number(task.start.checked_sub(1).unwrap_or(0))?)
+                                        };
 
                                     // 为每个块创建 DbLoggedDatabase 并执行（零拷贝版本）
                                     // 对于缺失的块，block_db_pairs 中的值为 None
@@ -2734,6 +2781,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
                                     // 执行每个块
                                     // block_db_pairs 与 blocks 一一对应（顺序相同）
+                                    // 性能优化：使用本地计数器，减少原子操作竞争（特别是在多 CCX CPU 上）
+                                    let mut local_gas: u64 = 0;
+                                    let mut local_txs: u64 = 0;
+
                                     let mut db_iter = block_db_pairs.into_iter();
                                     for block in blocks.iter() {
                                         let block_number = block.sealed_block().header().number;
@@ -2764,14 +2815,13 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                                 }
                                             }
 
-                                            // 累加到本地计数器（纯本地操作，零开销）
-                                            let txs = block.sealed_block().body().transaction_count();
+                                            // 累积到本地计数器（无原子操作）
                                             local_gas += block.sealed_block().header().gas_used;
-                                            local_txs += txs as u64;
+                                            local_txs += block.sealed_block().body().transaction_count() as u64;
                                         }
                                     }
 
-                                    // 批量提交本地计数器到全局（性能优化：从 N 次原子操作减少到 3 次）
+                                    // 批量更新共享计数器（每个 task 只更新一次，减少原子竞争）
                                     cumulative_gas.fetch_add(local_gas, Ordering::Relaxed);
                                     txs_counter.fetch_add(local_txs, Ordering::Relaxed);
                                     block_counter.fetch_add(blocks.len() as u64, Ordering::Relaxed);

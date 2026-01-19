@@ -89,6 +89,12 @@ pub struct DbLoggedDatabase<'a> {
     state_provider: Arc<dyn reth_provider::StateProvider>,
     /// 全局 Bytecode 缓存（可选，用于减少数据库查询）
     bytecode_cache: Option<Arc<BytecodeCache>>,
+    /// 线程本地 Bytecode 缓存（避免跨线程 DashMap 竞争）
+    /// 性能优化：先查本地缓存，减少 DashMap 分片锁访问
+    local_bytecode_cache: HashMap<B256, Bytecode>,
+    /// 线程本地 block_hash 缓存（避免每次都访问数据库）
+    /// EVM 的 BLOCKHASH 操作码可能在同一交易中多次查询相同块
+    block_hash_cache: HashMap<u64, B256>,
     /// 统计：读取账户的数量
     pub account_reads: usize,
     /// 统计：读取storage的数量
@@ -122,6 +128,8 @@ impl<'a> DbLoggedDatabase<'a> {
             pos: 8, // 跳过 count
             state_provider,
             bytecode_cache: None,
+            local_bytecode_cache: HashMap::new(),
+            block_hash_cache: HashMap::new(),
             account_reads: 0,
             storage_reads: 0,
             db_fallbacks: 0,
@@ -144,6 +152,8 @@ impl<'a> DbLoggedDatabase<'a> {
             pos: 8, // 跳过 count
             state_provider,
             bytecode_cache: Some(bytecode_cache),
+            local_bytecode_cache: HashMap::with_capacity(64), // 预分配，减少 rehash
+            block_hash_cache: HashMap::with_capacity(256), // BLOCKHASH 操作码只能查询最近 256 个块
             account_reads: 0,
             storage_reads: 0,
             db_fallbacks: 0,
@@ -231,9 +241,17 @@ impl<'a> RevmDatabase for DbLoggedDatabase<'a> {
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        // 性能优化：先查缓存（Bytecode 克隆成本很低，内部使用 Bytes 引用计数）
+        // 性能优化层级：1. 线程本地缓存 -> 2. 全局 DashMap -> 3. 数据库
+        // 先查线程本地缓存（零锁开销，避免跨 CCX 竞争）
+        if let Some(bytecode) = self.local_bytecode_cache.get(&code_hash) {
+            return Ok(bytecode.clone());
+        }
+
+        // 查全局 DashMap 缓存（分片锁，但跨 CCX 仍有竞争）
         if let Some(ref cache) = self.bytecode_cache {
             if let Some(bytecode) = cache.get(&code_hash) {
+                // 写入本地缓存，后续查询不再访问 DashMap
+                self.local_bytecode_cache.insert(code_hash, bytecode.clone());
                 return Ok(bytecode);
             }
         }
@@ -244,7 +262,10 @@ impl<'a> RevmDatabase for DbLoggedDatabase<'a> {
         );
         let bytecode = inner_db.code_by_hash(code_hash)?;
 
-        // 写入缓存（合约代码不可变，安全缓存）
+        // 写入本地缓存
+        self.local_bytecode_cache.insert(code_hash, bytecode.clone());
+
+        // 写入全局缓存（合约代码不可变，安全缓存）
         if let Some(ref cache) = self.bytecode_cache {
             cache.insert(code_hash, bytecode.clone());
         }
@@ -269,10 +290,21 @@ impl<'a> RevmDatabase for DbLoggedDatabase<'a> {
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        // 性能优化：先查本地缓存，避免每次都访问数据库
+        // BLOCKHASH 操作码在同一交易中可能多次查询相同块
+        if let Some(hash) = self.block_hash_cache.get(&number) {
+            return Ok(*hash);
+        }
+
+        // 缓存未命中，查询数据库
         let mut inner_db = StateProviderDatabase::new(
             self.state_provider.as_ref() as &dyn reth_provider::StateProvider
         );
-        inner_db.block_hash(number)
+        let hash = inner_db.block_hash(number)?;
+
+        // 写入缓存
+        self.block_hash_cache.insert(number, hash);
+        Ok(hash)
     }
 }
 

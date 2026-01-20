@@ -182,62 +182,71 @@ impl MmapStateLogReader {
 
         // Windows 性能优化：使用 PrefetchVirtualMemory 预加载内存页面
         // 等效于 Unix 的 madvise(MADV_WILLNEED)
+        // 重要修复：仅对小文件（<1GB）使用 PrefetchVirtualMemory
+        // 对于大文件（如300GB），PrefetchVirtualMemory 会阻塞并尝试预加载所有数据，导致启动卡死 80+ 秒
         #[cfg(windows)]
         {
-            // Windows API 定义
-            #[repr(C)]
-            struct WIN32_MEMORY_RANGE_ENTRY {
-                virtual_address: *const u8,
-                number_of_bytes: usize,
-            }
-
-            #[link(name = "kernel32")]
-            extern "system" {
-                fn GetCurrentProcess() -> *mut std::ffi::c_void;
-                fn PrefetchVirtualMemory(
-                    h_process: *mut std::ffi::c_void,
-                    number_of_entries: usize,
-                    virtual_addresses: *const WIN32_MEMORY_RANGE_ENTRY,
-                    flags: u32,
-                ) -> i32;
-            }
-
             let file_size = mmap_data.len();
-            const CHUNK_SIZE: usize = 256 * 1024 * 1024; // 256MB per chunk
+            const PREFETCH_THRESHOLD: usize = 1024 * 1024 * 1024; // 1GB
 
-            // 分块预取：每次预取256MB，避免一次性加载过多数据导致阻塞
-            let num_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
-            let mut success_count = 0;
-
-            for i in 0..num_chunks {
-                let offset = i * CHUNK_SIZE;
-                let chunk_len = std::cmp::min(CHUNK_SIZE, file_size - offset);
-
-                let entry = WIN32_MEMORY_RANGE_ENTRY {
-                    virtual_address: unsafe { mmap_data.as_ptr().add(offset) },
-                    number_of_bytes: chunk_len,
-                };
-
-                let result = unsafe {
-                    PrefetchVirtualMemory(
-                        GetCurrentProcess(),
-                        1,
-                        &entry,
-                        0, // Flags: 0 = default behavior
-                    )
-                };
-
-                if result != 0 {
-                    success_count += 1;
+            if file_size < PREFETCH_THRESHOLD {
+                // Windows API 定义
+                #[repr(C)]
+                struct WIN32_MEMORY_RANGE_ENTRY {
+                    virtual_address: *const u8,
+                    number_of_bytes: usize,
                 }
-            }
 
-            if success_count == num_chunks {
-                info!("PrefetchVirtualMemory: success ({} chunks x 256MB, total {:.1} MB)",
-                    num_chunks, file_size as f64 / 1024.0 / 1024.0);
+                #[link(name = "kernel32")]
+                extern "system" {
+                    fn GetCurrentProcess() -> *mut std::ffi::c_void;
+                    fn PrefetchVirtualMemory(
+                        h_process: *mut std::ffi::c_void,
+                        number_of_entries: usize,
+                        virtual_addresses: *const WIN32_MEMORY_RANGE_ENTRY,
+                        flags: u32,
+                    ) -> i32;
+                }
+
+                const CHUNK_SIZE: usize = 256 * 1024 * 1024; // 256MB per chunk
+
+                // 分块预取：每次预取256MB
+                let num_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+                let mut success_count = 0;
+
+                for i in 0..num_chunks {
+                    let offset = i * CHUNK_SIZE;
+                    let chunk_len = std::cmp::min(CHUNK_SIZE, file_size - offset);
+
+                    let entry = WIN32_MEMORY_RANGE_ENTRY {
+                        virtual_address: unsafe { mmap_data.as_ptr().add(offset) },
+                        number_of_bytes: chunk_len,
+                    };
+
+                    let result = unsafe {
+                        PrefetchVirtualMemory(
+                            GetCurrentProcess(),
+                            1,
+                            &entry,
+                            0, // Flags: 0 = default behavior
+                        )
+                    };
+
+                    if result != 0 {
+                        success_count += 1;
+                    }
+                }
+
+                if success_count == num_chunks {
+                    info!("PrefetchVirtualMemory: success ({} chunks x 256MB, total {:.1} MB)",
+                        num_chunks, file_size as f64 / 1024.0 / 1024.0);
+                } else {
+                    warn!("PrefetchVirtualMemory: partial success ({}/{} chunks, total {:.1} MB)",
+                        success_count, num_chunks, file_size as f64 / 1024.0 / 1024.0);
+                }
             } else {
-                warn!("PrefetchVirtualMemory: partial success ({}/{} chunks, total {:.1} MB)",
-                    success_count, num_chunks, file_size as f64 / 1024.0 / 1024.0);
+                info!("Skipping PrefetchVirtualMemory (file size: {:.1} GB >= 1GB threshold, pages will be loaded on demand)",
+                    file_size as f64 / 1024.0 / 1024.0 / 1024.0);
             }
         }
 
@@ -477,65 +486,74 @@ impl MmapStateLogDatabase {
         }
         drop(data_file); // 关闭文件
 
-        // 读取索引文件
-        let mut index_file = File::open(index_path)?;
-        let mut index_header = [0u8; 32];
-        index_file.read_exact(&mut index_header)?;
+        // 使用 mmap 读取索引文件（避免数百万次系统调用，修复启动缓慢问题）
+        let index_file = File::open(index_path)?;
+        let index_file_size = index_file.metadata()?.len();
 
-        let index_magic = &index_header[0..8];
+        if index_file_size < Self::HEADER_SIZE as u64 {
+            return Err(eyre::eyre!("Index file too small"));
+        }
+
+        // mmap 整个索引文件
+        let mmap_index = unsafe { memmap2::Mmap::map(&index_file)? };
+
+        // 验证头部
+        let index_magic = &mmap_index[0..8];
         if index_magic != Self::MAGIC_INDEX {
             return Err(eyre::eyre!("Invalid index file format (magic mismatch)"));
         }
 
-        let index_version = u32::from_le_bytes(index_header[8..12].try_into().unwrap());
+        let index_version = u32::from_le_bytes(mmap_index[8..12].try_into().unwrap());
         if index_version != Self::VERSION {
             return Err(eyre::eyre!("Unsupported index version: {}", index_version));
         }
 
-        let header_block_count = u64::from_le_bytes(index_header[12..20].try_into().unwrap());
+        let header_block_count = u64::from_le_bytes(mmap_index[12..20].try_into().unwrap());
 
-        // 计算索引文件实际大小，读取所有有效条目（不仅仅依赖头部的 block_count）
-        // 这样即使程序崩溃时索引条目已追加但头部未更新，也能恢复所有条目
-        let index_file_size = index_file.metadata()?.len();
+        // 计算索引文件实际条目数（可能比头部记录的多，用于崩溃恢复）
         let actual_entry_count =
-            (index_file_size.saturating_sub(Self::HEADER_SIZE)) / Self::INDEX_ENTRY_SIZE;
+            (index_file_size.saturating_sub(Self::HEADER_SIZE as u64)) / Self::INDEX_ENTRY_SIZE;
 
         // 使用实际条目数（可能比头部记录的多）
         let entry_count = std::cmp::max(header_block_count, actual_entry_count);
 
-        // 读取所有索引条目
+        // 预分配 HashMap
         let mut index = HashMap::with_capacity(entry_count as usize);
-        let mut entry_buf = [0u8; Self::INDEX_ENTRY_SIZE as usize];
         let mut skipped_invalid = 0u64;
 
-        // 读取到文件末尾，忽略不完整或无效的条目
-        loop {
-            match index_file.read_exact(&mut entry_buf) {
-                Ok(_) => {
-                    let block_number = u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
-                    let offset = u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
-                    let length = u32::from_le_bytes(entry_buf[16..20].try_into().unwrap());
+        // 直接从 mmap 内存中解析索引条目（零拷贝，无系统调用）
+        let entries_data = &mmap_index[Self::HEADER_SIZE as usize..];
+        let entries_count = entries_data.len() / Self::INDEX_ENTRY_SIZE as usize;
 
-                    // 严格验证条目有效性：
-                    // 1. block_number 必须在合理范围内（< 1亿，足够覆盖以太坊历史）
-                    // 2. offset 必须 >= HEADER_SIZE 且 <= data_end
-                    // 3. length 必须 > 0 且 < 10MB（单个块的日志数据不应该超过这个大小）
-                    let is_valid = block_number < 100_000_000
-                        && offset >= Self::HEADER_SIZE
-                        && offset <= data_end
-                        && length > 0
-                        && length < 10_000_000;
+        for i in 0..entries_count {
+            let entry_start = i * Self::INDEX_ENTRY_SIZE as usize;
+            let entry = &entries_data[entry_start..entry_start + Self::INDEX_ENTRY_SIZE as usize];
 
-                    if is_valid {
-                        index.insert(block_number, (offset, length));
-                    } else if block_number != 0 || offset != 0 || length != 0 {
-                        // 跳过明显无效的条目（但不是全零条目）
-                        skipped_invalid += 1;
-                    }
-                }
-                Err(_) => break, // 到达文件末尾或读取不完整
+            let block_number = u64::from_le_bytes(entry[0..8].try_into().unwrap());
+            let offset = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+            let length = u32::from_le_bytes(entry[16..20].try_into().unwrap());
+
+            // 严格验证条目有效性：
+            // 1. block_number 必须在合理范围内（< 1亿，足够覆盖以太坊历史）
+            // 2. offset 必须 >= HEADER_SIZE 且 <= data_end
+            // 3. length 必须 > 0 且 < 10MB（单个块的日志数据不应该超过这个大小）
+            let is_valid = block_number < 100_000_000
+                && offset >= Self::HEADER_SIZE
+                && offset <= data_end
+                && length > 0
+                && length < 10_000_000;
+
+            if is_valid {
+                index.insert(block_number, (offset, length));
+            } else if block_number != 0 || offset != 0 || length != 0 {
+                // 跳过明显无效的条目（但不是全零条目）
+                skipped_invalid += 1;
             }
         }
+
+        // mmap 会在这里自动 unmap
+        drop(mmap_index);
+        drop(index_file);
 
         if skipped_invalid > 0 {
             warn!(

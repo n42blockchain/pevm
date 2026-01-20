@@ -2732,9 +2732,6 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
                                     // 创建线程本地统计累加器（性能优化：避免频繁原子操作）
                                     let mut local_stats = LocalStatsAccumulator::new();
-                                    // 本地gas和交易计数器（避免频繁原子操作）
-                                    let mut local_gas = 0u64;
-                                    let mut local_txs = 0u64;
 
                                     // 获取所有需要的块号
                                     let block_numbers: Vec<u64> = blocks.iter()

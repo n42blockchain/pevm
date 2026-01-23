@@ -490,7 +490,7 @@ impl MmapStateLogDatabase {
         let index_file = File::open(index_path)?;
         let index_file_size = index_file.metadata()?.len();
 
-        if index_file_size < Self::HEADER_SIZE as u64 {
+        if index_file_size < Self::HEADER_SIZE {
             return Err(eyre::eyre!("Index file too small"));
         }
 
@@ -512,7 +512,7 @@ impl MmapStateLogDatabase {
 
         // 计算索引文件实际条目数（可能比头部记录的多，用于崩溃恢复）
         let actual_entry_count =
-            (index_file_size.saturating_sub(Self::HEADER_SIZE as u64)) / Self::INDEX_ENTRY_SIZE;
+            (index_file_size.saturating_sub(Self::HEADER_SIZE)) / Self::INDEX_ENTRY_SIZE;
 
         // 使用实际条目数（可能比头部记录的多）
         let entry_count = std::cmp::max(header_block_count, actual_entry_count);
@@ -812,7 +812,6 @@ impl MmapStateLogDatabase {
 
         // 打开数据文件进行追加写入（使用 BufWriter 提高效率）
         let data_file = OpenOptions::new()
-            .write(true)
             .append(true)
             .open(&self.data_file_path)?;
         let mut data_writer = BufWriter::with_capacity(4 * 1024 * 1024, data_file); // 4MB buffer
@@ -862,7 +861,7 @@ impl MmapStateLogDatabase {
             }
 
             // 每 10000 个块更新头部
-            if total_written % header_update_interval == 0 {
+            if total_written.is_multiple_of(header_update_interval) {
                 // 临时获取内部文件来更新头部
                 let inner = index_writer.get_mut();
                 let current_pos = inner.stream_position()?;
@@ -1183,45 +1182,40 @@ fn analyze_corrupted_entries(index_file_path: &Path, data_end: u64) -> eyre::Res
 
     info!("=== Analyzing index corruption pattern ===");
 
-    loop {
-        match file.read_exact(&mut entry_buf) {
-            Ok(_) => {
-                entry_num += 1;
-                let block_number = u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
-                let offset = u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
-                let length = u32::from_le_bytes(entry_buf[16..20].try_into().unwrap());
+    while file.read_exact(&mut entry_buf).is_ok() {
+        entry_num += 1;
+        let block_number = u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
+        let offset = u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
+        let length = u32::from_le_bytes(entry_buf[16..20].try_into().unwrap());
 
-                let is_valid = block_number < 100_000_000
-                    && offset >= 32
-                    && offset <= data_end
-                    && length > 0
-                    && length < 10_000_000
-                    && (offset + length as u64) <= data_end;
+        let is_valid = block_number < 100_000_000
+            && offset >= 32
+            && offset <= data_end
+            && length > 0
+            && length < 10_000_000
+            && (offset + length as u64) <= data_end;
 
-                if is_valid {
-                    last_valid_offset = offset + length as u64;
-                    consecutive_invalid = 0;
-                } else {
-                    if first_invalid.is_none() {
-                        first_invalid = Some(entry_num);
-                        info!(
-                            "First invalid entry at #{}: block={}, offset={}, length={}",
-                            entry_num, block_number, offset, length
-                        );
-                        info!("Last valid data ended at offset: {}", last_valid_offset);
-                    }
-                    consecutive_invalid += 1;
-
-                    // 检查是否是连续的块号模式（可能是错误写入）
-                    if consecutive_invalid <= 5 {
-                        info!(
-                            "Invalid entry #{}: block={}, offset={}, length={}",
-                            entry_num, block_number, offset, length
-                        );
-                    }
-                }
+        if is_valid {
+            last_valid_offset = offset + length as u64;
+            consecutive_invalid = 0;
+        } else {
+            if first_invalid.is_none() {
+                first_invalid = Some(entry_num);
+                info!(
+                    "First invalid entry at #{}: block={}, offset={}, length={}",
+                    entry_num, block_number, offset, length
+                );
+                info!("Last valid data ended at offset: {}", last_valid_offset);
             }
-            Err(_) => break,
+            consecutive_invalid += 1;
+
+            // 检查是否是连续的块号模式（可能是错误写入）
+            if consecutive_invalid <= 5 {
+                info!(
+                    "Invalid entry #{}: block={}, offset={}, length={}",
+                    entry_num, block_number, offset, length
+                );
+            }
         }
     }
 
@@ -1318,39 +1312,34 @@ impl MmapStateLogDatabase {
         let mut total_entries = 0u64;
         let mut invalid_entries = 0u64;
 
-        loop {
-            match index_file.read_exact(&mut entry_buf) {
-                Ok(_) => {
-                    total_entries += 1;
-                    let block_number = u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
-                    let offset = u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
-                    let length = u32::from_le_bytes(entry_buf[16..20].try_into().unwrap());
+        while index_file.read_exact(&mut entry_buf).is_ok() {
+            total_entries += 1;
+            let block_number = u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
+            let offset = u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
+            let length = u32::from_le_bytes(entry_buf[16..20].try_into().unwrap());
 
-                    // 验证条目
-                    let is_valid = block_number < 100_000_000
-                        && offset >= Self::HEADER_SIZE
-                        && offset <= data_end
-                        && length > 0
-                        && length < 10_000_000
-                        && (offset + length as u64) <= data_end;
+            // 验证条目
+            let is_valid = block_number < 100_000_000
+                && offset >= Self::HEADER_SIZE
+                && offset <= data_end
+                && length > 0
+                && length < 10_000_000
+                && (offset + length as u64) <= data_end;
 
-                    if is_valid {
-                        all_entries.push((block_number, offset, length));
-                    } else {
-                        invalid_entries += 1;
-                        if invalid_entries <= 10 {
-                            warn!(
-                                "Invalid entry #{}: block={}, offset={}, length={}",
-                                total_entries, block_number, offset, length
-                            );
-                        }
-                    }
+            if is_valid {
+                all_entries.push((block_number, offset, length));
+            } else {
+                invalid_entries += 1;
+                if invalid_entries <= 10 {
+                    warn!(
+                        "Invalid entry #{}: block={}, offset={}, length={}",
+                        total_entries, block_number, offset, length
+                    );
                 }
-                Err(_) => break,
             }
 
             // 进度报告
-            if total_entries % 1_000_000 == 0 {
+            if total_entries.is_multiple_of(1_000_000) {
                 info!("Read {} entries...", total_entries);
             }
         }
@@ -1692,7 +1681,7 @@ impl MmapStateLogDatabase {
             processed += 1;
 
             // 进度报告
-            if processed % 1_000_000 == 0 {
+            if processed.is_multiple_of(1_000_000) {
                 info!(
                     "Compacted {} / {} blocks ({:.1}%)...",
                     processed,
@@ -1889,38 +1878,33 @@ impl MmapStateLogDatabase {
                     // 读取所有索引条目
                     let mut entry_buf = [0u8; Self::INDEX_ENTRY_SIZE as usize];
 
-                    loop {
-                        match index_file.read_exact(&mut entry_buf) {
-                            Ok(_) => {
-                                total_index_entries += 1;
-                                let block_number =
-                                    u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
-                                let offset =
-                                    u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
-                                let length =
-                                    u32::from_le_bytes(entry_buf[16..20].try_into().unwrap());
+                    while index_file.read_exact(&mut entry_buf).is_ok() {
+                        total_index_entries += 1;
+                        let block_number =
+                            u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
+                        let offset =
+                            u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
+                        let length =
+                            u32::from_le_bytes(entry_buf[16..20].try_into().unwrap());
 
-                                // 基本索引有效性检查
-                                let is_index_valid = block_number < 100_000_000
-                                    && offset >= Self::HEADER_SIZE
-                                    && offset < data_file_size
-                                    && length > 0
-                                    && length < 10_000_000
-                                    && (offset + length as u64) <= data_file_size;
+                        // 基本索引有效性检查
+                        let is_index_valid = block_number < 100_000_000
+                            && offset >= Self::HEADER_SIZE
+                            && offset < data_file_size
+                            && length > 0
+                            && length < 10_000_000
+                            && (offset + length as u64) <= data_file_size;
 
-                                if is_index_valid {
-                                    all_entries.push((block_number, offset, length));
-                                } else {
-                                    invalid_index_entries += 1;
-                                    if invalid_index_entries <= 10 {
-                                        warn!(
-                                            "Invalid index entry: block={}, offset={}, length={}",
-                                            block_number, offset, length
-                                        );
-                                    }
-                                }
+                        if is_index_valid {
+                            all_entries.push((block_number, offset, length));
+                        } else {
+                            invalid_index_entries += 1;
+                            if invalid_index_entries <= 10 {
+                                warn!(
+                                    "Invalid index entry: block={}, offset={}, length={}",
+                                    block_number, offset, length
+                                );
                             }
-                            Err(_) => break,
                         }
                     }
 

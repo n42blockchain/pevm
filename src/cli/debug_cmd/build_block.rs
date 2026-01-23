@@ -233,7 +233,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                 consensus.validate_header(block.sealed_header())?;
                 consensus.validate_block_pre_execution(block)?;
 
-                let block_with_senders = block.clone().try_recover().unwrap();
+                let block_with_senders = block.clone().try_recover()?;
 
                 let state_provider = blockchain_db.latest()?;
                 let db = StateProviderDatabase::new(&state_provider);

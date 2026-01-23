@@ -57,6 +57,11 @@ impl BytecodeCache {
     pub fn len(&self) -> usize {
         self.cache.len()
     }
+
+    /// 检查缓存是否为空
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
 }
 
 impl Default for BytecodeCache {

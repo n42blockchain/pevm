@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `reth evm` command.
+//!
+//! Note: We use `Arc<Box<dyn StateProvider + Send>>` which triggers clippy::arc_with_non_send_sync
+//! because the trait object lacks `Sync`. However, these Arc instances are actually used within
+//! single-threaded contexts (each worker thread has its own copy), so this is safe.
+#![allow(clippy::arc_with_non_send_sync)]
 
 mod logged_db;
 #[cfg(any(unix, windows))]
@@ -544,7 +549,6 @@ impl BufferedLogWriter {
         let idx_file = OpenOptions::new()
             .create(true)
             .read(true)
-            .write(true)
             .append(true)
             .open(&idx_path)?;
 
@@ -552,7 +556,6 @@ impl BufferedLogWriter {
         let bin_file = OpenOptions::new()
             .create(true)
             .read(true)
-            .write(true)
             .append(true)
             .open(&bin_path)?;
 
@@ -629,7 +632,6 @@ fn open_log_files(log_dir: &Path) -> eyre::Result<(File, File)> {
     let idx_file = OpenOptions::new()
         .create(true)
         .read(true)
-        .write(true)
         .append(true)
         .open(&idx_path)?;
 
@@ -637,7 +639,6 @@ fn open_log_files(log_dir: &Path) -> eyre::Result<(File, File)> {
     let bin_file = OpenOptions::new()
         .create(true)
         .read(true)
-        .write(true)
         .append(true)
         .open(&bin_path)?;
 
@@ -1509,12 +1510,9 @@ pub(crate) fn read_read_logs_binary(
         // 但更准确的方法是尝试解码：如果能解码为 U256 且长度匹配，则是 Storage；否则是 Account
         use alloy_rlp::Decodable;
         let data_copy = data.clone();
-        let is_storage = if let Ok(_) = U256::decode(&mut data_copy.as_slice()) {
-            // 能解码为 U256，且解码后数据应该被消耗完（或接近）
-            data_len <= 33
-        } else {
-            false
-        };
+        // 能解码为 U256，且解码后数据应该被消耗完（或接近）
+        let is_storage =
+            U256::decode(&mut data_copy.as_slice()).is_ok() && data_len <= 33;
 
         if is_storage {
             entries.push(ReadLogEntry::Storage {
@@ -2580,7 +2578,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
                             // 使用共享的 blockchain_db（如 v1.8.4 的方式）
                             // 预先创建的 evm_config 避免重复创建
-                            let blocks = blockchain_db.block_with_senders_range(task.start..=task.end).unwrap();
+                            let blocks = blockchain_db.block_with_senders_range(task.start..=task.end)?;
 
                             // 步骤4: 如果使用累加模式且启用了日志记录（--log-block on），过滤掉已存在的块（断点续传）
                             // 性能优化：批量检查块存在状态，只获取一次 RwLock 读锁（减少锁竞争）
@@ -2664,7 +2662,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                     // 为每个块创建独立的 state provider 和日志记录器
                                     // 注意：必须使用 block_number - 1 的状态，否则执行结果不正确
                                     let state_provider = blockchain_db.history_by_block_number(
-                                        block_number.checked_sub(1).unwrap_or(0)
+                                        block_number.saturating_sub(1)
                                     )?;
                                     let inner_db = StateProviderDatabase::new(&state_provider);
 
@@ -2749,7 +2747,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         if let Some(ref sp) = thread_level_state_provider {
                                             sp.clone()
                                         } else {
-                                            Arc::new(blockchain_db.history_by_block_number(task.start.checked_sub(1).unwrap_or(0))?)
+                                            Arc::new(blockchain_db.history_by_block_number(task.start.saturating_sub(1))?)
                                         };
 
                                     // 为每个块创建 DbLoggedDatabase 并执行（零拷贝版本）
@@ -2860,9 +2858,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                     // 如果使用全局文件句柄，使用批量读取；否则逐个读取
                                     if let Some(file_handle) = global_log_file_handle_clone.as_deref() {
                                         // 性能优化：在 in_memory_mode 下，直接使用共享内存，避免复制
-                                        if enable_in_memory_mode_clone && file_handle.in_memory_data.is_some() {
+                                        if let Some(shared_data) = enable_in_memory_mode_clone
+                                            .then_some(file_handle.in_memory_data.as_ref())
+                                            .flatten()
+                                        {
                                             // 直接从共享内存读取，避免复制
-                                            let shared_data = file_handle.in_memory_data.as_ref().unwrap();
                                             for (entry, block_number) in read_requests {
                                                 let start = entry.offset as usize;
                                                 let end = start + entry.length as usize;
@@ -2940,7 +2940,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         Some(sp) => sp.clone(),
                                         None => {
                                             // 回退：如果线程级别 state provider 创建失败，尝试为当前 task 创建
-                                            Arc::new(blockchain_db.history_by_block_number(task.start.checked_sub(1).unwrap_or(0))?)
+                                            Arc::new(blockchain_db.history_by_block_number(task.start.saturating_sub(1))?)
                                         }
                                     };
 
@@ -3346,7 +3346,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                     // 为避免影响上面的并行执行，这里单独重新构建一次 provider 和 executor
                     let blockchain_db = BlockchainProvider::new(provider_factory.clone())?;
                     let state_provider = blockchain_db
-                        .history_by_block_number(log_block.checked_sub(1).unwrap_or(0))?;
+                        .history_by_block_number(log_block.saturating_sub(1))?;
                     let inner_db = StateProviderDatabase::new(&state_provider);
 
                     // 创建日志收集器
@@ -3456,7 +3456,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 // 创建 state provider
                 let blockchain_db = BlockchainProvider::new(provider_factory.clone())?;
                 let state_provider = blockchain_db
-                    .history_by_block_number(block_number.checked_sub(1).unwrap_or(0))?;
+                    .history_by_block_number(block_number.saturating_sub(1))?;
 
                 // 从压缩数据创建 LoggedDatabase（性能优化：零复制版本）
                 // 直接传递 Vec<u8> 所有权，避免不必要的内存复制

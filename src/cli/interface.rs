@@ -66,7 +66,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```ignore
     /// use reth_ethereum_cli::interface::Cli;
     /// use reth_node_ethereum::EthereumNode;
     ///
@@ -83,7 +83,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
     ///
     /// Parse additional CLI arguments for the node command and use it to configure the node.
     ///
-    /// ```no_run
+    /// ```ignore
     /// use clap::Parser;
     /// use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
     ///
@@ -97,7 +97,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
     ///         // launch the node
     ///         Ok(()))
     ///     .unwrap();
-    /// ````
+    /// ```
     pub fn run<L>(self, launcher: L) -> eyre::Result<()>
     where
         L: Launcher<C, Ext>,
@@ -110,7 +110,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```ignore
     /// use reth_cli_runner::CliRunner;
     /// use reth_ethereum_cli::interface::Cli;
     /// use reth_node_ethereum::EthereumNode;
@@ -205,7 +205,6 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
 
 /// Commands to be executed
 #[derive(Debug, Subcommand)]
-#[expect(clippy::large_enum_variant)]
 pub enum Commands<C: ChainSpecParser, Ext: clap::Args + fmt::Debug> {
     /// Start the node
     #[command(name = "node")]
@@ -286,7 +285,6 @@ mod tests {
     use crate::chainspec::SUPPORTED_CHAINS;
     use clap::CommandFactory;
     use reth_node_core::args::ColorMode;
-    use tempfile;
 
     #[test]
     fn parse_color_mode() {

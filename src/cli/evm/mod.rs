@@ -66,7 +66,7 @@ use std::path::{Path, PathBuf};
 use tokio::signal;
 // 使用 Reth 的 Compact 编码替代 RLP（性能优化）
 use reth_codecs::Compact;
-use reth_primitives::Account;
+use reth_primitives_traits::Account;
 
 // 性能优化：预定义空 codehash 常量，避免重复创建
 const EMPTY_CODE_HASH_BYTES: &[u8; 32] = &[
@@ -1975,6 +1975,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
     >(
         self,
         _ctx: CliContext,
+        runtime: reth_tasks::Runtime,
     ) -> eyre::Result<()> {
         info!("Executing EVM command...");
 
@@ -2020,7 +2021,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         // 步骤1: 获取日志目录（如果指定了 log_dir，使用累加文件系统；否则使用单个文件）
         let Environment {
             provider_factory, ..
-        } = self.env.init::<N>(AccessRights::RO)?;
+            // reth v2.5 moved runtime creation out of `init`; storage I/O runs on it.
+        } = self.env.init::<N>(AccessRights::RO, runtime)?;
         let log_dir = self.log_dir.as_deref();
 
         // 如果启用了 --repair-log，执行修复并退出
@@ -2833,7 +2835,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                             state_provider.as_ref(),
                                             Some(bytecode_cache_clone.clone()),
                                         );
-                                        let replay_db =
+                                        let (replay_db, cursor) =
                                             WitnessReplayDatabase::new(inner_db, witness);
                                         let executor = evm_config.batch_executor(replay_db);
                                         let output = executor.execute(block)?;
@@ -2844,6 +2846,18 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                                 "gas mismatch: replayed {}, header says {}",
                                                 output.gas_used,
                                                 expected_gas
+                                            )
+                                        }
+                                        // Running out of witness is caught by the
+                                        // database; bytes left over are the same
+                                        // mismatch seen from the other side, and
+                                        // nothing else would notice them.
+                                        let consumed = cursor.consumed();
+                                        if consumed != witness.len() {
+                                            eyre::bail!(
+                                                "witness not fully consumed: read {} of {} bytes",
+                                                consumed,
+                                                witness.len()
                                             )
                                         }
                                         Ok(())

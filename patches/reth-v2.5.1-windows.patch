@@ -1,0 +1,142 @@
+--- a/crates/static-file/types/src/lib.rs
++++ b/crates/static-file/types/src/lib.rs
+@@ -15,9 +15,9 @@
+ mod event;
+ mod segment;
+ 
+-#[cfg(all(feature = "std", unix))]
++#[cfg(feature = "std")]
+ mod changeset_offsets;
+-#[cfg(all(feature = "std", unix))]
++#[cfg(feature = "std")]
+ pub use changeset_offsets::{ChangesetOffsetReader, ChangesetOffsetWriter};
+ 
+ use alloy_primitives::BlockNumber;
+--- a/crates/static-file/types/src/changeset_offsets.rs
++++ b/crates/static-file/types/src/changeset_offsets.rs
+@@ -7,10 +7,46 @@
+ use std::{
+     fs::{File, OpenOptions},
+     io::{self, Write},
+-    os::unix::fs::FileExt,
+     path::Path,
+ };
+ 
++/// Positioned read that does not disturb the file cursor, on both platforms.
++///
++/// Unix has `FileExt::read_exact_at`. Windows only offers `seek_read`, a single
++/// positioned read that is allowed to come up short, so it has to be driven to
++/// completion by hand.
++fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::FileExt;
++        file.read_exact_at(buf, offset)
++    }
++    #[cfg(windows)]
++    {
++        use std::os::windows::fs::FileExt;
++
++        let mut remaining = buf;
++        let mut position = offset;
++        while !remaining.is_empty() {
++            match file.seek_read(remaining, position) {
++                Ok(0) => {
++                    return Err(std::io::Error::new(
++                        std::io::ErrorKind::UnexpectedEof,
++                        "failed to fill whole buffer",
++                    ))
++                }
++                Ok(read) => {
++                    remaining = &mut remaining[read..];
++                    position += read as u64;
++                }
++                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
++                Err(error) => return Err(error),
++            }
++        }
++        Ok(())
++    }
++}
++
+ /// Writer for appending changeset offsets to a sidecar file.
+ #[derive(Debug)]
+ pub struct ChangesetOffsetWriter {
+@@ -185,7 +221,7 @@
+ 
+         let byte_pos = block_index * Self::RECORD_SIZE as u64;
+         let mut buf = [0u8; Self::RECORD_SIZE];
+-        self.file.read_exact_at(&mut buf, byte_pos)?;
++        read_exact_at(&self.file, &mut buf, byte_pos)?;
+ 
+         let offset = u64::from_le_bytes(buf[..8].try_into().unwrap());
+         let num_changes = u64::from_le_bytes(buf[8..].try_into().unwrap());
+@@ -208,7 +244,7 @@
+ 
+         for i in 0..count {
+             let pos = byte_pos + (i as u64) * Self::RECORD_SIZE as u64;
+-            self.file.read_exact_at(&mut buf, pos)?;
++            read_exact_at(&self.file, &mut buf, pos)?;
+             let offset = u64::from_le_bytes(buf[..8].try_into().unwrap());
+             let num_changes = u64::from_le_bytes(buf[8..].try_into().unwrap());
+             result.push(ChangesetOffset::new(offset, num_changes));
+--- a/crates/cli/commands/src/download/fetch.rs
++++ b/crates/cli/commands/src/download/fetch.rs
+@@ -731,8 +731,6 @@
+         piece_progress_bytes: &AtomicU64,
+         cancel_token: &CancellationToken,
+     ) -> std::result::Result<(), PieceAttemptFailure> {
+-        use std::os::unix::fs::FileExt;
+-
+         let expected_len = piece.end - piece.start + 1;
+ 
+         let response = match client
+@@ -778,7 +776,7 @@
+             match reader.read(&mut buf) {
+                 Ok(0) => break,
+                 Ok(n) => {
+-                    file.write_all_at(&buf[..n], offset)
++                    write_all_at(file, &buf[..n], offset)
+                         .map_err(|error| PieceAttemptFailure::Terminal(error.into()))?;
+                     offset += n as u64;
+                     if let Some(progress) = shared {
+@@ -1066,3 +1064,39 @@
+         assert!(!cache_dir.join("state.tar.zst.part").exists());
+     }
+ }
++
++/// Positioned write that does not disturb the file cursor, on both platforms.
++///
++/// Unix has `FileExt::write_all_at`. Windows only offers `seek_write`, a single
++/// positioned write that may write less than asked, so it has to be looped.
++fn write_all_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::FileExt;
++        file.write_all_at(buf, offset)
++    }
++    #[cfg(windows)]
++    {
++        use std::os::windows::fs::FileExt;
++
++        let mut remaining = buf;
++        let mut position = offset;
++        while !remaining.is_empty() {
++            match file.seek_write(remaining, position) {
++                Ok(0) => {
++                    return Err(std::io::Error::new(
++                        std::io::ErrorKind::WriteZero,
++                        "failed to write whole buffer",
++                    ))
++                }
++                Ok(written) => {
++                    remaining = &remaining[written..];
++                    position += written as u64;
++                }
++                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
++                Err(error) => return Err(error),
++            }
++        }
++        Ok(())
++    }
++}

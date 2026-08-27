@@ -11,7 +11,7 @@ use eyre::{Context, Result};
 use reth_storage_errors::provider::ProviderError;
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::BTreeMap,
     fmt,
     fs::{self, OpenOptions},
@@ -891,7 +891,23 @@ impl std::error::Error for WitnessUnavailable {}
 pub(super) struct WitnessReplayDatabase<'a, DB> {
     inner: DB,
     stream: &'a [u8],
-    position: usize,
+    /// Shared with the caller: the executor consumes the database, so how far
+    /// the witness was read has to outlive it.
+    position: WitnessCursor,
+}
+
+/// How many witness bytes the replay has consumed so far.
+///
+/// A block that leaves bytes behind read fewer values than were recorded, which
+/// means the witness does not describe this execution either - the same problem
+/// as running out early, just from the other side.
+#[derive(Clone, Debug, Default)]
+pub(super) struct WitnessCursor(Rc<Cell<usize>>);
+
+impl WitnessCursor {
+    pub(super) fn consumed(&self) -> usize {
+        self.0.get()
+    }
 }
 
 impl<DB: fmt::Debug> fmt::Debug for WitnessReplayDatabase<'_, DB> {
@@ -899,35 +915,42 @@ impl<DB: fmt::Debug> fmt::Debug for WitnessReplayDatabase<'_, DB> {
         formatter
             .debug_struct("WitnessReplayDatabase")
             .field("inner", &self.inner)
-            .field("position", &self.position)
+            .field("consumed", &self.position.consumed())
             .field("stream_len", &self.stream.len())
             .finish()
     }
 }
 
 impl<'a, DB> WitnessReplayDatabase<'a, DB> {
-    pub(super) const fn new(inner: DB, stream: &'a [u8]) -> Self {
-        Self {
-            inner,
-            stream,
-            position: 0,
-        }
+    /// Returns the database and a cursor the caller keeps, so it can check
+    /// afterwards that the whole witness was consumed.
+    pub(super) fn new(inner: DB, stream: &'a [u8]) -> (Self, WitnessCursor) {
+        let position = WitnessCursor::default();
+        (
+            Self {
+                inner,
+                stream,
+                position: position.clone(),
+            },
+            position,
+        )
     }
 
     /// Reads the next `[len][value]` record, or `None` once the witness ends.
     fn next_value(&mut self) -> Option<&'a [u8]> {
-        let length = *self.stream.get(self.position)? as usize;
-        let start = self.position + 1;
+        let position = self.position.consumed();
+        let length = *self.stream.get(position)? as usize;
+        let start = position + 1;
         let end = start + length;
         let value = self.stream.get(start..end)?;
-        self.position = end;
+        self.position.0.set(end);
         Some(value)
     }
 
     fn unavailable(&self, reason: &'static str) -> ProviderError {
         ProviderError::other(WitnessUnavailable {
             reason,
-            position: self.position,
+            position: self.position.consumed(),
             length: self.stream.len(),
         })
     }
@@ -1297,7 +1320,7 @@ mod tests {
             account: None,
             storage: U256::from(0xffffu64),
         };
-        let mut replay = WitnessReplayDatabase::new(divergent, &recorded);
+        let (mut replay, _cursor) = WitnessReplayDatabase::new(divergent, &recorded);
 
         let replayed = replay.basic(Address::ZERO).unwrap().expect("account present");
         assert_eq!(replayed.balance, account.balance);
@@ -1319,8 +1342,7 @@ mod tests {
     #[test]
     fn replay_refuses_to_read_state_from_the_database() {
         // An empty witness cannot answer anything.
-        let mut replay = WitnessReplayDatabase::new(
-            MockDatabase {
+        let (mut replay, _cursor) = WitnessReplayDatabase::new(            MockDatabase {
                 account: Some(AccountInfo::default()),
                 storage: U256::from(9u64),
             },
@@ -1339,7 +1361,7 @@ mod tests {
     fn replay_rejects_a_malformed_account_record() {
         // A complete 2-byte record whose field bits claim a 32-byte code hash
         // that is not there.
-        let mut replay = WitnessReplayDatabase::new(MockDatabase::default(), &[2, 8, 1]);
+        let (mut replay, _cursor) = WitnessReplayDatabase::new(MockDatabase::default(), &[2, 8, 1]);
         let error = replay.basic(Address::ZERO).unwrap_err().to_string();
         assert!(error.contains("malformed account record"), "{error}");
     }
@@ -1371,11 +1393,11 @@ mod tests {
         assert_eq!(recorded_absent, vec![0]);
         assert_eq!(recorded_empty, vec![1, 0]);
 
-        let mut replay =
+        let (mut replay, _cursor) =
             WitnessReplayDatabase::new(MockDatabase::default(), &recorded_absent);
         assert!(replay.basic(Address::ZERO).unwrap().is_none());
 
-        let mut replay =
+        let (mut replay, _cursor) =
             WitnessReplayDatabase::new(MockDatabase::default(), &recorded_empty);
         assert!(replay.basic(Address::ZERO).unwrap().is_some());
     }

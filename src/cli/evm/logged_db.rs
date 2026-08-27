@@ -6,7 +6,7 @@
 
 use alloy_primitives::{Address, B256, U256};
 use reth_codecs::Compact;
-use reth_primitives::Account;
+use reth_primitives_traits::Account;
 use reth_revm::database::StateProviderDatabase;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};

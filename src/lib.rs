@@ -100,9 +100,16 @@ pub mod providers {
     pub use reth_provider::*;
 }
 
-/// Re-exported from `reth_primitives`.
+/// Re-exported from `reth_primitives_traits`.
+///
+/// reth v2.5 dropped the `reth-primitives` facade; its types now live in
+/// `reth-primitives-traits` and `reth-ethereum-primitives`.
 pub mod primitives {
-    pub use reth_primitives::*;
+    pub use reth_primitives_traits::*;
+    // Both crates carry these names. The concrete Ethereum types are what the
+    // old `reth-primitives` facade exported, so they win over the generic
+    // trait-side aliases; naming them explicitly also silences the glob clash.
+    pub use reth_ethereum_primitives::{Block, BlockBody, Receipt, Transaction};
 }
 
 /// Re-exported from `reth_ethereum_consensus`.
@@ -179,8 +186,6 @@ pub mod rpc {
     }
 }
 
-/// Ress subprotocol installation.
-pub mod ress;
 
 // re-export for convenience
 #[doc(inline)]

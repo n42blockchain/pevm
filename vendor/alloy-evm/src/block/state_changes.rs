@@ -1,0 +1,177 @@
+//! State changes that are not related to transactions.
+
+use super::calc;
+use alloy_consensus::BlockHeader;
+use alloy_eips::eip4895::Withdrawal;
+use alloy_hardforks::EthereumHardforks;
+use alloy_primitives::{map::AddressMap, Address};
+use revm::context::Block;
+
+/// Collect all balance changes at the end of the block.
+///
+/// Balance changes might include the block reward, uncle rewards, withdrawals, or irregular
+/// state changes (DAO fork).
+#[inline]
+pub fn post_block_balance_increments<H>(
+    spec: impl EthereumHardforks,
+    block_env: impl Block,
+    ommers: &[H],
+    withdrawals: Option<&[Withdrawal]>,
+) -> AddressMap<u128>
+where
+    H: BlockHeader,
+{
+    let mut balance_increments = AddressMap::with_capacity_and_hasher(
+        withdrawals.map_or(ommers.len(), |w| w.len()),
+        Default::default(),
+    );
+
+    // Add block rewards if they are enabled.
+    if let Some(base_block_reward) =
+        calc::base_block_reward(&spec, block_env.number().saturating_to())
+    {
+        // Ommer rewards
+        for ommer in ommers {
+            *balance_increments.entry(ommer.beneficiary()).or_default() += calc::ommer_reward(
+                base_block_reward,
+                block_env.number().saturating_to(),
+                ommer.number(),
+            );
+        }
+
+        // Full block reward
+        *balance_increments.entry(block_env.beneficiary()).or_default() +=
+            calc::block_reward(base_block_reward, ommers.len());
+    }
+
+    // process withdrawals
+    insert_post_block_withdrawals_balance_increments(
+        spec,
+        block_env.timestamp().saturating_to(),
+        withdrawals,
+        &mut balance_increments,
+    );
+
+    balance_increments
+}
+
+/// Same as [`post_block_balance_increments`], but keeps the order the
+/// beneficiaries were computed in: ommers in header order, then the block
+/// beneficiary, then withdrawals in withdrawal order.
+///
+/// The map-returning version loses that order - `AddressMap` is a `HashMap`
+/// whose iteration order depends on a randomly seeded hasher, so
+/// `increment_balances` reads the beneficiary accounts in a different order on
+/// every run. That is invisible to normal execution, but a keyless witness
+/// records state reads as a bare ordered stream, so the same block yields a
+/// different witness each time and a recorded one cannot be replayed reliably.
+///
+/// The order here matches what N42-gov5 does in `EthReplayEngine::Finalize`:
+/// `AddBalance` for each uncle in header order, then the miner.
+pub fn post_block_balance_increments_ordered<H>(
+    spec: impl EthereumHardforks,
+    block_env: impl Block,
+    ommers: &[H],
+    withdrawals: Option<&[Withdrawal]>,
+) -> Vec<(Address, u128)>
+where
+    H: BlockHeader,
+{
+    let mut balance_increments: Vec<(Address, u128)> = Vec::new();
+
+    // Add block rewards if they are enabled.
+    if let Some(base_block_reward) =
+        calc::base_block_reward(&spec, block_env.number().saturating_to())
+    {
+        // Ommer rewards
+        for ommer in ommers {
+            add_increment(
+                &mut balance_increments,
+                ommer.beneficiary(),
+                calc::ommer_reward(
+                    base_block_reward,
+                    block_env.number().saturating_to(),
+                    ommer.number(),
+                ),
+            );
+        }
+
+        // Full block reward
+        add_increment(
+            &mut balance_increments,
+            block_env.beneficiary(),
+            calc::block_reward(base_block_reward, ommers.len()),
+        );
+    }
+
+    // process withdrawals
+    if spec.is_shanghai_active_at_timestamp(block_env.timestamp().saturating_to()) {
+        if let Some(withdrawals) = withdrawals {
+            for withdrawal in withdrawals {
+                if withdrawal.amount > 0 {
+                    add_increment(
+                        &mut balance_increments,
+                        withdrawal.address,
+                        withdrawal.amount_wei().to::<u128>(),
+                    );
+                }
+            }
+        }
+    }
+
+    balance_increments
+}
+
+/// Adds `amount` to `address`, keeping the position of its first appearance.
+///
+/// An address can show up twice - a miner who also authored an ommer, or two
+/// withdrawals to one address - and merging in place keeps one read per
+/// account, matching what the map-based version produced.
+pub fn add_increment(increments: &mut Vec<(Address, u128)>, address: Address, amount: u128) {
+    if let Some(entry) = increments.iter_mut().find(|(existing, _)| *existing == address) {
+        entry.1 += amount;
+    } else {
+        increments.push((address, amount));
+    }
+}
+
+/// Returns a map of addresses to their balance increments if the Shanghai hardfork is active at the
+/// given timestamp.
+///
+/// Zero-valued withdrawals are filtered out.
+#[inline]
+pub fn post_block_withdrawals_balance_increments(
+    spec: impl EthereumHardforks,
+    block_timestamp: u64,
+    withdrawals: &[Withdrawal],
+) -> AddressMap<u128> {
+    let mut balance_increments =
+        AddressMap::with_capacity_and_hasher(withdrawals.len(), Default::default());
+    insert_post_block_withdrawals_balance_increments(
+        spec,
+        block_timestamp,
+        Some(withdrawals),
+        &mut balance_increments,
+    );
+    balance_increments
+}
+
+/// Applies all withdrawal balance increments if shanghai is active at the given timestamp to the
+/// given `balance_increments` map.
+#[inline]
+pub fn insert_post_block_withdrawals_balance_increments(
+    spec: impl EthereumHardforks,
+    block_timestamp: u64,
+    withdrawals: Option<&[Withdrawal]>,
+    balance_increments: &mut AddressMap<u128>,
+) {
+    // Process withdrawals
+    if spec.is_shanghai_active_at_timestamp(block_timestamp) {
+        if let Some(withdrawals) = withdrawals {
+            for withdrawal in withdrawals {
+                *balance_increments.entry(withdrawal.address).or_default() +=
+                    withdrawal.amount_wei().to::<u128>();
+            }
+        }
+    }
+}

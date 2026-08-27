@@ -4,7 +4,7 @@
 
 use crate::{
     chainspec::EthereumChainSpecParser,
-    cli::{debug_cmd, evm},
+    cli::evm,
 };
 use clap::{Parser, Subcommand};
 use reth_chainspec::ChainSpec;
@@ -16,10 +16,10 @@ use reth_cli_commands::{
     p2p, prune, stage,
 };
 use reth_cli_runner::CliRunner;
-use reth_node_core::args::LogArgs;
+use reth_node_core::args::{JitArgs, LogArgs};
 use reth_node_ethereum::{consensus::EthBeaconConsensus, EthEvmConfig, EthereumNode};
 use reth_node_metrics::recorder::install_prometheus_recorder;
-use reth_tracing::FileWorkerGuard;
+use reth_tracing::TracingGuards;
 use std::{ffi::OsString, fmt, sync::Arc};
 use tracing::info;
 
@@ -147,27 +147,31 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
         // Install the prometheus recorder to be sure to record all metrics
         let _ = install_prometheus_recorder();
 
+        // reth v2.5 made EthEvmConfig generic over the EVM factory for its JIT
+        // support, and the node components expect the RethEvmFactory flavour.
+        // With JIT off this builds the same plain configuration as before.
         let components = |spec: Arc<C::ChainSpec>| {
-            (
-                EthEvmConfig::ethereum(spec.clone()),
-                Arc::new(EthBeaconConsensus::new(spec)),
-            )
+            let (evm_config, _) =
+                reth_node_ethereum::node::build_evm_config(spec.clone(), &JitArgs::default(), None)
+                    .expect("failed to build EVM config");
+            (evm_config, Arc::new(EthBeaconConsensus::new(spec)))
         };
+        let rt = runner.runtime();
         match self.command {
             Commands::Node(command) => {
                 runner.run_command_until_exit(|ctx| command.execute(ctx, launcher))
             }
             Commands::Init(command) => {
-                runner.run_blocking_until_ctrl_c(command.execute::<EthereumNode>())
+                runner.run_blocking_until_ctrl_c(command.execute::<EthereumNode>(rt))
             }
             Commands::InitState(command) => {
-                runner.run_blocking_until_ctrl_c(command.execute::<EthereumNode>())
+                runner.run_blocking_until_ctrl_c(command.execute::<EthereumNode>(rt))
             }
             Commands::Import(command) => {
-                runner.run_blocking_until_ctrl_c(command.execute::<EthereumNode, _>(components))
+                runner.run_blocking_until_ctrl_c(command.execute::<EthereumNode, _>(components, rt))
             }
             Commands::ImportEra(command) => {
-                runner.run_blocking_until_ctrl_c(command.execute::<EthereumNode>())
+                runner.run_blocking_until_ctrl_c(command.execute::<EthereumNode>(rt))
             }
             Commands::DumpGenesis(command) => runner.run_blocking_until_ctrl_c(command.execute()),
             Commands::Db(command) => {
@@ -183,11 +187,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
             // #[cfg(feature = "dev")]
             // Commands::TestVectors(command) => runner.run_until_ctrl_c(command.execute()),
             Commands::Config(command) => runner.run_until_ctrl_c(command.execute()),
-            Commands::Debug(command) => {
-                runner.run_command_until_exit(|ctx| command.execute::<EthereumNode>(ctx))
-            }
             Commands::Evm(command) => {
-                runner.run_command_until_exit(|ctx| command.execute::<EthereumNode>(ctx))
+                runner.run_command_until_exit(|ctx| command.execute::<EthereumNode>(ctx, rt))
             }
             Commands::Prune(command) => {
                 runner.run_command_until_exit(|ctx| command.execute::<EthereumNode>(ctx))
@@ -199,9 +200,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
     ///
     /// If file logging is enabled, this function returns a guard that must be kept alive to ensure
     /// that all logs are flushed to disk.
-    pub fn init_tracing(&self) -> eyre::Result<Option<FileWorkerGuard>> {
-        let guard = self.logs.init_tracing()?;
-        Ok(guard)
+    pub fn init_tracing(&self) -> eyre::Result<TracingGuards> {
+        let guards = self.logs.init_tracing()?;
+        Ok(guards)
     }
 }
 
@@ -247,7 +248,6 @@ pub enum Commands<C: ChainSpecParser, Ext: clap::Args + fmt::Debug> {
     Config(config_cmd::Command),
     /// Various debug routines
     #[command(name = "debug")]
-    Debug(Box<debug_cmd::Command<C>>),
     /// Execute EVM commands
     #[command(name = "evm")]
     Evm(Box<evm::EvmCommand<C>>),
@@ -274,7 +274,6 @@ impl<C: ChainSpecParser, Ext: clap::Args + fmt::Debug> Commands<C, Ext> {
             // #[cfg(feature = "dev")]
             // Self::TestVectors(_) => None,
             Self::Config(_) => None,
-            Self::Debug(cmd) => cmd.chain_spec(),
             Self::Evm(cmd) => cmd.chain_spec(),
             Self::Prune(cmd) => cmd.chain_spec(),
         }

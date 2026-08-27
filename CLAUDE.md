@@ -127,7 +127,7 @@ src/
 
 ## Dependencies
 
-All `reth-*` crates are pinned to a specific git revision (`ad476e2b5cb6cbc63fcb707d18a6bc6f3b0d6e38`). When updating Reth, all crates must be updated to the same revision simultaneously. The `revm` version is managed by Reth (not specified directly).
+All `reth-*` crates are pinned to a specific git revision (`a5ced84098497d800a4ba129aaac23dbe5adff3c`). When updating Reth, all crates must be updated to the same revision simultaneously. The `revm` version is managed by Reth (not specified directly).
 
 The project uses `snmalloc-rs` as the global allocator (via `reth_cli_util::allocator`).
 

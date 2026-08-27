@@ -127,7 +127,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         &self,
         config: &Config,
         task_executor: TaskExecutor,
-        provider_factory: ProviderFactory<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>,
+        provider_factory: ProviderFactory<NodeTypesWithDBAdapter<N, DatabaseEnv>>,
         network_secret_path: PathBuf,
         default_peers_path: PathBuf,
     ) -> eyre::Result<NetworkHandle> {
@@ -225,7 +225,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             return Ok(());
         }
 
-        ctx.task_executor.spawn_critical(
+        ctx.task_executor.spawn_critical_task(
             "events task",
             reth_node_events::node::handle_events(
                 Some(Box::new(network)),

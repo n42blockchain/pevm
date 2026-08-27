@@ -32,7 +32,7 @@ where
     let pending_state = PendingState::default();
 
     // Spawn maintenance task for pending state.
-    task_executor.spawn(maintain_pending_state(
+    task_executor.spawn_task(maintain_pending_state(
         engine_events,
         provider.clone(),
         pending_state.clone(),
@@ -60,7 +60,7 @@ where
     );
     info!(target: "reth::cli", "Ress subprotocol support enabled");
 
-    task_executor.spawn(async move {
+    task_executor.spawn_task(async move {
         while let Some(event) = rx.recv().await {
             trace!(target: "reth::ress", ?event, "Received ress event");
         }

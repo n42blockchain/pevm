@@ -124,11 +124,13 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         let blockchain_db = BlockchainProvider::new(provider_factory.clone())?;
         let blob_store = InMemoryBlobStore::default();
 
-        let validator = TransactionValidationTaskExecutor::eth_builder(blockchain_db.clone())
-            .with_head_timestamp(best_block.timestamp)
-            .kzg_settings(self.kzg_settings()?)
-            .with_additional_tasks(1)
-            .build_with_tasks(ctx.task_executor.clone(), blob_store.clone());
+        let validator = TransactionValidationTaskExecutor::eth_builder(
+            blockchain_db.clone(),
+            EthEvmConfig::new(provider_factory.chain_spec()),
+        )
+        .kzg_settings(self.kzg_settings()?)
+        .with_additional_tasks(1)
+        .build_with_tasks(ctx.task_executor.clone(), blob_store.clone());
 
         let transaction_pool = reth_transaction_pool::Pool::eth_pool(
             validator,

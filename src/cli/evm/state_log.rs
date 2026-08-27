@@ -175,7 +175,7 @@ impl MmapStateLogReader {
                 let result =
                     libc::madvise(mmap_data.as_ptr() as *mut libc::c_void, file_size, advice);
                 if result != 0 {
-                    warn!("madvise failed: errno={}", *libc::__error());
+                    warn!("madvise failed: {}", std::io::Error::last_os_error());
                 }
             }
         }

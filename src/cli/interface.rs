@@ -61,7 +61,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
     /// This accepts a closure that is used to launch the node via the
     /// [`NodeCommand`](node::NodeCommand).
     ///
-    /// This command will be run on the [default tokio runtime](reth_cli_runner::tokio_runtime).
+    /// This command will be run on the default runtime created by [`CliRunner`].
     ///
     ///
     /// # Example
@@ -189,7 +189,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
             Commands::Evm(command) => {
                 runner.run_command_until_exit(|ctx| command.execute::<EthereumNode>(ctx))
             }
-            Commands::Prune(command) => runner.run_until_ctrl_c(command.execute::<EthereumNode>()),
+            Commands::Prune(command) => {
+                runner.run_command_until_exit(|ctx| command.execute::<EthereumNode>(ctx))
+            }
         }
     }
 
@@ -380,6 +382,7 @@ mod tests {
         use reth_cli_commands::launcher::FnLauncher;
 
         let temp_dir = tempfile::tempdir().unwrap();
+        let log_dir = temp_dir.path().join("logs");
 
         unsafe { std::env::set_var("RUST_LOG", "info,evm=debug") };
         let reth = Cli::try_parse_args_from([
@@ -387,6 +390,8 @@ mod tests {
             "init",
             "--datadir",
             temp_dir.path().to_str().unwrap(),
+            "--log.file.directory",
+            log_dir.to_str().unwrap(),
             "--log.file.filter",
             "debug,net=trace",
         ])

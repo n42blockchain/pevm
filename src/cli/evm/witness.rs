@@ -9,11 +9,18 @@ use crate::revm::{
 use alloy_primitives::{Address, B256, U256};
 use eyre::{Context, Result};
 use std::{
+    borrow::Cow,
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Condvar, Mutex,
+    },
+    time::Duration,
 };
+use tracing::warn;
 
 const FREEZER_BATCH_SIZE: usize = 64;
 const FREEZER_MAX_FILE_SIZE: u64 = 2_000_000_000;
@@ -469,30 +476,545 @@ fn read_batch(path: &Path, start: u64, end: u64, expected: usize) -> Result<Vec<
     file.seek(SeekFrom::Start(start))?;
     let mut blob = vec![0u8; (end - start) as usize];
     file.read_exact(&mut blob)?;
-    let raw = if blob.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        zstd::stream::decode_all(blob.as_slice()).wrap_err("failed to decode witness batch")?
+    decode_batch(&blob, expected, &path.display().to_string())
+}
+
+/// Splits one freezer batch blob into the block witnesses it holds.
+///
+/// A batch is only stored compressed when that was smaller than the raw
+/// encoding, so the zstd frame magic decides which of the two is on disk.
+fn decode_batch(blob: &[u8], expected: usize, source: &str) -> Result<Vec<Vec<u8>>> {
+    let raw: Cow<'_, [u8]> = if blob.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        Cow::Owned(zstd::stream::decode_all(blob).wrap_err("failed to decode witness batch")?)
     } else {
-        blob
+        Cow::Borrowed(blob)
     };
 
     let mut entries = Vec::with_capacity(expected);
     let mut position = 0;
     for _ in 0..expected {
         if position + 4 > raw.len() {
-            eyre::bail!("truncated witness batch length in {}", path.display())
+            eyre::bail!("truncated witness batch length in {}", source)
         }
         let length = u32::from_le_bytes(raw[position..position + 4].try_into().unwrap()) as usize;
         position += 4;
         if position + length > raw.len() {
-            eyre::bail!("truncated witness batch payload in {}", path.display())
+            eyre::bail!("truncated witness batch payload in {}", source)
         }
         entries.push(raw[position..position + length].to_vec());
         position += length;
     }
     if position != raw.len() {
-        eyre::bail!("witness batch in {} has trailing bytes", path.display())
+        eyre::bail!("witness batch in {} has trailing bytes", source)
     }
     Ok(entries)
+}
+
+// ---------------------------------------------------------------------------
+// Ordered sink: parallel producers -> sequential freezer
+// ---------------------------------------------------------------------------
+
+/// Out-of-order block witnesses held in memory before a submitter has to wait.
+const SINK_MAX_PENDING_ENTRIES: usize = 8192;
+/// Out-of-order witness bytes held in memory before a submitter has to wait.
+const SINK_MAX_PENDING_BYTES: usize = 2 * 1024 * 1024 * 1024;
+/// Wake-up interval used to re-check the shutdown flag while blocked.
+const SINK_WAIT_TICK: Duration = Duration::from_millis(100);
+
+/// Order-restoring bridge between parallel workers and [`WitnessFreezerWriter`].
+///
+/// The freezer index is positional - item N *is* block N - so appends must be
+/// strictly sequential, while workers finish blocks in whatever order the
+/// scheduler hands them out. Each submission is buffered until every lower
+/// block has arrived; the submitting thread then drains the longest contiguous
+/// run into the writer. Buffering is bounded in both entries and bytes so one
+/// slow block cannot let the rest of the fleet grow memory without limit.
+pub(super) struct WitnessSink {
+    state: Mutex<SinkState>,
+    drained: Condvar,
+    should_stop: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for WitnessSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WitnessSink")
+            .finish_non_exhaustive()
+    }
+}
+
+struct SinkState {
+    writer: Option<WitnessFreezerWriter>,
+    pending: BTreeMap<u64, Vec<u8>>,
+    pending_bytes: usize,
+    next_block: u64,
+    /// First write error, latched so every later submission fails the same way.
+    failure: Option<String>,
+}
+
+impl WitnessSink {
+    pub(super) fn new(
+        writer: WitnessFreezerWriter,
+        first_block: u64,
+        should_stop: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            state: Mutex::new(SinkState {
+                writer: Some(writer),
+                pending: BTreeMap::new(),
+                pending_bytes: 0,
+                next_block: first_block,
+                failure: None,
+            }),
+            drained: Condvar::new(),
+            should_stop,
+        }
+    }
+
+    /// Hands one finished block witness to the sink.
+    ///
+    /// Blocks while the reorder buffer is full, except for the block the writer
+    /// is actually waiting on - accepting that one is what lets a full buffer
+    /// drain, so it can never be made to wait.
+    pub(super) fn submit(&self, block_number: u64, witness: Vec<u8>) -> Result<()> {
+        let mut state = self.state.lock().expect("witness sink mutex poisoned");
+        loop {
+            if let Some(failure) = state.failure.as_deref() {
+                eyre::bail!("witness freezer already failed: {}", failure)
+            }
+            if block_number <= state.next_block {
+                break
+            }
+            if state.pending.len() < SINK_MAX_PENDING_ENTRIES
+                && state.pending_bytes < SINK_MAX_PENDING_BYTES
+            {
+                break
+            }
+            if self.should_stop.load(Ordering::Relaxed) {
+                return Ok(())
+            }
+            let (guard, _) = self
+                .drained
+                .wait_timeout(state, SINK_WAIT_TICK)
+                .expect("witness sink mutex poisoned");
+            state = guard;
+        }
+
+        if block_number < state.next_block {
+            eyre::bail!(
+                "block {} was already written to the witness freezer",
+                block_number
+            )
+        }
+        state.pending_bytes += witness.len();
+        if state.pending.insert(block_number, witness).is_some() {
+            eyre::bail!(
+                "block {} was submitted to the witness sink twice",
+                block_number
+            )
+        }
+
+        let result = state.drain_contiguous();
+        self.drained.notify_all();
+        result
+    }
+
+    /// Marks the run as failed and releases everyone blocked on the buffer.
+    ///
+    /// A block that never arrives would stall every worker waiting behind it,
+    /// so an execution error has to poison the sink rather than leave a gap.
+    pub(super) fn abort(&self, reason: String) {
+        let mut state = self.state.lock().expect("witness sink mutex poisoned");
+        if state.failure.is_none() {
+            state.failure = Some(reason);
+        }
+        drop(state);
+        self.drained.notify_all();
+    }
+
+    /// The block the freezer is waiting for; everything below it is on disk.
+    pub(super) fn next_block(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("witness sink mutex poisoned")
+            .next_block
+    }
+
+    /// Flushes the freezer and reports how many items it holds.
+    ///
+    /// Witnesses still buffered above a gap are dropped: they were never
+    /// indexed, so a later run simply re-executes those blocks.
+    pub(super) fn finish(&self) -> Result<u64> {
+        let mut state = self.state.lock().expect("witness sink mutex poisoned");
+        state.drain_contiguous()?;
+
+        if !state.pending.is_empty() {
+            warn!(
+                dropped = state.pending.len(),
+                waiting_for = state.next_block,
+                "Discarding witnesses buffered above an unfinished block"
+            );
+            state.pending.clear();
+            state.pending_bytes = 0;
+        }
+
+        let writer = state
+            .writer
+            .take()
+            .ok_or_else(|| eyre::eyre!("witness freezer was already closed"))?;
+        writer.finish()
+    }
+}
+
+impl SinkState {
+    /// Appends the longest run of blocks that starts at `next_block`.
+    fn drain_contiguous(&mut self) -> Result<()> {
+        while let Some(witness) = self.pending.remove(&self.next_block) {
+            self.pending_bytes -= witness.len();
+            let block_number = self.next_block;
+
+            let writer = match self.writer.as_mut() {
+                Some(writer) => writer,
+                None => {
+                    let message = "witness freezer was already closed".to_string();
+                    self.failure = Some(message.clone());
+                    eyre::bail!(message)
+                }
+            };
+
+            if let Err(error) = writer.push(block_number, witness) {
+                self.failure = Some(error.to_string());
+                return Err(error)
+            }
+            self.next_block += 1;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reader: witness freezer -> parallel replay
+// ---------------------------------------------------------------------------
+
+/// Read-only view over a freezer written by [`WitnessFreezerWriter`].
+///
+/// The `.cidx` repeats one entry per item but its value only changes once per
+/// batch, so only the per-batch entry is kept. Data files are mapped read-only,
+/// which makes the reader `Sync` and lets every worker slice batches without
+/// copying.
+pub(super) struct WitnessFreezerReader {
+    /// One `(file_number, offset)` per batch, in batch order.
+    batches: Vec<(u16, u32)>,
+    /// Mapped `.cdat` files, indexed by file number.
+    data: Vec<memmap2::Mmap>,
+    items: u64,
+}
+
+impl std::fmt::Debug for WitnessFreezerReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WitnessFreezerReader")
+            .field("items", &self.items)
+            .field("batches", &self.batches.len())
+            .field("data_files", &self.data.len())
+            .finish()
+    }
+}
+
+impl WitnessFreezerReader {
+    pub(super) fn open(directory: &Path) -> Result<Self> {
+        let index_path = directory.join("witness.cidx");
+        let mut index_bytes = Vec::new();
+        fs::File::open(&index_path)
+            .wrap_err_with(|| format!("failed to open {}", index_path.display()))?
+            .read_to_end(&mut index_bytes)
+            .wrap_err_with(|| format!("failed to read {}", index_path.display()))?;
+        validate_cidx(&index_bytes, &index_path)?;
+
+        let items = (index_bytes.len() as u64 - CIDX_HEADER_SIZE) / CIDX_ENTRY_SIZE;
+        let batch_count = items.div_ceil(FREEZER_BATCH_SIZE as u64);
+        let batches = (0..batch_count)
+            .map(|batch| read_index_entry(&index_bytes, batch * FREEZER_BATCH_SIZE as u64))
+            .collect::<Vec<_>>();
+
+        let file_count = batches
+            .last()
+            .map(|(file_number, _)| *file_number as usize + 1)
+            .unwrap_or(1);
+        let mut data = Vec::with_capacity(file_count);
+        for file_number in 0..file_count {
+            let path = data_path(directory, file_number as u16);
+            let file = fs::File::open(&path)
+                .wrap_err_with(|| format!("failed to open {}", path.display()))?;
+            // SAFETY: replay opens the freezer read-only and nothing writes to
+            // these files while a replay run holds them mapped.
+            let mapped = unsafe { memmap2::Mmap::map(&file) }
+                .wrap_err_with(|| format!("failed to map {}", path.display()))?;
+            data.push(mapped);
+        }
+
+        Ok(Self {
+            batches,
+            data,
+            items,
+        })
+    }
+
+    /// Number of blocks in the freezer; item N is block N.
+    pub(super) const fn items(&self) -> u64 {
+        self.items
+    }
+
+    /// Batch that holds `block_number`.
+    pub(super) const fn batch_of(block_number: u64) -> u64 {
+        block_number / FREEZER_BATCH_SIZE as u64
+    }
+
+    /// First block stored in `batch`.
+    pub(super) const fn batch_start(batch: u64) -> u64 {
+        batch * FREEZER_BATCH_SIZE as u64
+    }
+
+    /// Decodes one batch into its individual block witnesses.
+    pub(super) fn read_batch(&self, batch: u64) -> Result<Vec<Vec<u8>>> {
+        let (file_number, offset) = *self
+            .batches
+            .get(batch as usize)
+            .ok_or_else(|| eyre::eyre!("witness batch {} is past the end of the freezer", batch))?;
+        let mapped = self
+            .data
+            .get(file_number as usize)
+            .ok_or_else(|| eyre::eyre!("witness data file {} is missing", file_number))?;
+
+        // A batch runs to the next batch in the same file, or to end of file
+        // when the next batch started a new one.
+        let end = match self.batches.get(batch as usize + 1) {
+            Some((next_file, next_offset)) if *next_file == file_number => *next_offset as usize,
+            _ => mapped.len(),
+        };
+        let start = offset as usize;
+        if start > end || end > mapped.len() {
+            eyre::bail!("witness batch {} has an out-of-range offset", batch)
+        }
+
+        let expected = std::cmp::min(
+            FREEZER_BATCH_SIZE as u64,
+            self.items - Self::batch_start(batch),
+        ) as usize;
+        decode_batch(
+            &mapped[start..end],
+            expected,
+            &format!("witness batch {}", batch),
+        )
+    }
+}
+
+/// Caches the batch a worker is currently replaying from.
+///
+/// Blocks are handed out in small consecutive tasks, so a single slot absorbs
+/// almost every repeat lookup without any cross-thread coordination.
+#[derive(Debug, Default)]
+pub(super) struct WitnessBatchCache {
+    loaded: Option<(u64, Vec<Vec<u8>>)>,
+}
+
+impl WitnessBatchCache {
+    /// Returns the recorded witness for `block_number`.
+    pub(super) fn witness_for(
+        &mut self,
+        reader: &WitnessFreezerReader,
+        block_number: u64,
+    ) -> Result<&[u8]> {
+        if block_number >= reader.items() {
+            eyre::bail!(
+                "block {} is not in the witness freezer, which holds blocks 0..{}",
+                block_number,
+                reader.items().saturating_sub(1)
+            )
+        }
+
+        let batch = WitnessFreezerReader::batch_of(block_number);
+        let reload = !matches!(&self.loaded, Some((cached, _)) if *cached == batch);
+        if reload {
+            self.loaded = Some((batch, reader.read_batch(batch)?));
+        }
+
+        let (_, entries) = self.loaded.as_ref().expect("batch was just loaded");
+        let position = (block_number - WitnessFreezerReader::batch_start(batch)) as usize;
+        entries
+            .get(position)
+            .map(Vec::as_slice)
+            .ok_or_else(|| eyre::eyre!("witness batch {} is missing block {}", batch, block_number))
+    }
+}
+
+/// Serves one block's state reads from its recorded witness.
+///
+/// The witness is keyless and ordered, so replay is only correct while the
+/// re-execution issues the same sequence of `basic`/`storage` calls that
+/// produced it. Code and block hashes were never recorded and always come from
+/// `inner`; a witness that runs short or fails to decode also falls back to
+/// `inner` rather than failing the block, and the fallback count says how often
+/// that happened.
+pub(super) struct WitnessReplayDatabase<'a, DB> {
+    inner: DB,
+    stream: &'a [u8],
+    position: usize,
+    /// Shared with the worker: the executor consumes the database, so the
+    /// count has to outlive it.
+    fallbacks: Arc<AtomicUsize>,
+}
+
+impl<DB: std::fmt::Debug> std::fmt::Debug for WitnessReplayDatabase<'_, DB> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WitnessReplayDatabase")
+            .field("inner", &self.inner)
+            .field("position", &self.position)
+            .field("stream_len", &self.stream.len())
+            .field("fallbacks", &self.fallbacks)
+            .finish()
+    }
+}
+
+impl<'a, DB> WitnessReplayDatabase<'a, DB> {
+    /// Reads for this block come from `stream`; `fallbacks` counts the reads
+    /// it could not serve. Anything above zero means the witness did not line
+    /// up with this execution - the run is still correct, but not witness-only.
+    pub(super) const fn new(inner: DB, stream: &'a [u8], fallbacks: Arc<AtomicUsize>) -> Self {
+        Self {
+            inner,
+            stream,
+            position: 0,
+            fallbacks,
+        }
+    }
+
+    fn record_fallback(&self) {
+        self.fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reads the next `[len][value]` record, or `None` once the witness ends.
+    fn next_value(&mut self) -> Option<&'a [u8]> {
+        let length = *self.stream.get(self.position)? as usize;
+        let start = self.position + 1;
+        let end = start + length;
+        let value = self.stream.get(start..end)?;
+        self.position = end;
+        Some(value)
+    }
+}
+
+impl<DB: RevmDatabase> RevmDatabase for WitnessReplayDatabase<'_, DB> {
+    type Error = DB::Error;
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        match self.next_value() {
+            // An absent account was recorded as a zero-length value; an account
+            // that exists always carries at least its field-bits byte.
+            Some([]) => Ok(None),
+            Some(value) => match decode_account_v2(value) {
+                Some(account) => Ok(Some(account)),
+                None => {
+                    self.record_fallback();
+                    self.inner.basic(address)
+                }
+            },
+            None => {
+                self.record_fallback();
+                self.inner.basic(address)
+            }
+        }
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        self.inner.code_by_hash(code_hash)
+    }
+
+    fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        match self.next_value() {
+            Some(value) => Ok(U256::from_be_slice(value)),
+            None => {
+                self.record_fallback();
+                self.inner.storage(address, index)
+            }
+        }
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        self.inner.block_hash(number)
+    }
+}
+
+/// Inverse of [`encode_account_v2`]; `None` means the record was malformed.
+///
+/// Omitted fields carry their zero value and an omitted code hash means the
+/// empty-code hash. The encoding also maps a zero code hash onto the empty-code
+/// hash, which revm never produces for a loaded account.
+fn decode_account_v2(encoded: &[u8]) -> Option<AccountInfo> {
+    const NONCE_BIT: u8 = 1;
+    const BALANCE_BIT: u8 = 2;
+    const CODE_HASH_BIT: u8 = 8;
+
+    let field_bits = *encoded.first()?;
+    let mut cursor = 1;
+
+    let nonce = if field_bits & NONCE_BIT != 0 {
+        read_uvarint(encoded, &mut cursor)?
+    } else {
+        0
+    };
+
+    let balance = if field_bits & BALANCE_BIT != 0 {
+        let length = *encoded.get(cursor)? as usize;
+        cursor += 1;
+        let bytes = encoded.get(cursor..cursor + length)?;
+        cursor += length;
+        U256::from_be_slice(bytes)
+    } else {
+        U256::ZERO
+    };
+
+    let code_hash = if field_bits & CODE_HASH_BIT != 0 {
+        let bytes = encoded.get(cursor..cursor + 32)?;
+        cursor += 32;
+        B256::from_slice(bytes)
+    } else {
+        B256::from_slice(&EMPTY_CODE_HASH)
+    };
+
+    // Trailing bytes mean the record is not the V2 encoding it claims to be.
+    if cursor != encoded.len() {
+        return None
+    }
+
+    // `code` must stay `None`, the way reth's own `basic_ref` returns it. A
+    // `Some(empty)` here would tell revm the account has no code, so every
+    // contract would execute as an EOA and diverge from what was recorded.
+    let mut account = AccountInfo::new(balance, nonce, code_hash, Bytecode::default());
+    account.code = None;
+    Some(account)
+}
+
+/// Go `encoding/binary.Uvarint` compatible decoder.
+fn read_uvarint(input: &[u8], cursor: &mut usize) -> Option<u64> {
+    let mut value: u64 = 0;
+    let mut shift = 0;
+    loop {
+        let byte = *input.get(*cursor)?;
+        *cursor += 1;
+        if byte < 0x80 {
+            if shift > 63 || (shift == 63 && byte > 1) {
+                return None
+            }
+            return Some(value | (u64::from(byte) << shift))
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        shift += 7;
+        if shift > 63 {
+            return None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -646,5 +1168,171 @@ mod tests {
         for (offset, witness) in batch.iter().enumerate() {
             assert_eq!(witness, &(64 + offset as u64).to_le_bytes());
         }
+    }
+
+    #[test]
+    fn sink_writes_blocks_in_order_regardless_of_submission_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let writer = WitnessFreezerWriter::open(directory.path(), 0).unwrap();
+        let sink = Arc::new(WitnessSink::new(
+            writer,
+            0,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        // The low blocks arrive shuffled and the last three arrive before the
+        // long run that has to precede them.
+        for block in [5u64, 3, 0, 6, 1, 2, 4, 130, 129, 128] {
+            sink.submit(block, vec![block as u8; 4]).unwrap();
+        }
+        // Only 0..=6 could be written so far; 128..=130 are still buffered.
+        assert_eq!(sink.next_block(), 7);
+
+        for block in 7..128u64 {
+            sink.submit(block, vec![block as u8; 4]).unwrap();
+        }
+        // Closing the gap releases the buffered tail in one drain.
+        assert_eq!(sink.next_block(), 131);
+        assert_eq!(sink.finish().unwrap(), 131);
+
+        // Two full batches plus a partial one, all in block order.
+        let reader = WitnessFreezerReader::open(directory.path()).unwrap();
+        assert_eq!(reader.items(), 131);
+        let mut cache = WitnessBatchCache::default();
+        for block in 0..131u64 {
+            let witness = cache.witness_for(&reader, block).unwrap();
+            assert_eq!(witness, vec![block as u8; 4]);
+        }
+        let error = cache.witness_for(&reader, 131).unwrap_err().to_string();
+        assert!(error.contains("not in the witness freezer"), "{error}");
+    }
+
+    #[test]
+    fn sink_rejects_a_block_that_was_already_written() {
+        let directory = tempfile::tempdir().unwrap();
+        let writer = WitnessFreezerWriter::open(directory.path(), 0).unwrap();
+        let sink = WitnessSink::new(writer, 0, Arc::new(AtomicBool::new(false)));
+
+        sink.submit(0, vec![1]).unwrap();
+        let error = sink.submit(0, vec![1]).unwrap_err().to_string();
+        assert!(error.contains("already written"), "{error}");
+    }
+
+    #[test]
+    fn sink_stops_accepting_after_an_abort() {
+        let directory = tempfile::tempdir().unwrap();
+        let writer = WitnessFreezerWriter::open(directory.path(), 0).unwrap();
+        let sink = WitnessSink::new(writer, 0, Arc::new(AtomicBool::new(false)));
+
+        sink.abort("block 7 failed to execute".to_string());
+        let error = sink.submit(0, vec![1]).unwrap_err().to_string();
+        assert!(error.contains("block 7 failed to execute"), "{error}");
+    }
+
+    #[test]
+    fn account_v2_survives_an_encode_decode_round_trip() {
+        let cases = [
+            AccountInfo::new(U256::ZERO, 0, B256::from_slice(&EMPTY_CODE_HASH), Bytecode::default()),
+            AccountInfo::new(U256::from(1u64), 1, B256::from_slice(&EMPTY_CODE_HASH), Bytecode::default()),
+            AccountInfo::new(
+                U256::from(12_345_678_901_234_567_890u128),
+                u64::MAX,
+                B256::repeat_byte(0xab),
+                Bytecode::default(),
+            ),
+            AccountInfo::new(U256::MAX, 300, B256::repeat_byte(0x11), Bytecode::default()),
+        ];
+
+        for account in cases {
+            let encoded = encode_account_v2(&account);
+            let decoded = decode_account_v2(&encoded).expect("round trip decodes");
+            assert_eq!(decoded.balance, account.balance);
+            assert_eq!(decoded.nonce, account.nonce);
+            assert_eq!(decoded.code_hash, account.code_hash());
+        }
+    }
+
+    #[test]
+    fn replay_serves_the_recorded_values_in_order() {
+        let account = AccountInfo::new(
+            U256::from(7u64),
+            3,
+            B256::from_slice(&EMPTY_CODE_HASH),
+            Bytecode::default(),
+        );
+        let mock = MockDatabase {
+            account: Some(account.clone()),
+            storage: U256::from(0x1234u64),
+        };
+
+        // Record one account read followed by one storage read.
+        let (mut recorder, stream) = WitnessDatabase::new(mock);
+        recorder.basic(Address::ZERO).unwrap();
+        recorder.storage(Address::ZERO, U256::ZERO).unwrap();
+        let recorded = stream.take();
+
+        // Replay against a database that would answer differently, so any
+        // value that matches must have come from the witness.
+        let divergent = MockDatabase {
+            account: None,
+            storage: U256::from(0xffffu64),
+        };
+        let fallbacks = Arc::new(AtomicUsize::new(0));
+        let mut replay =
+            WitnessReplayDatabase::new(divergent, &recorded, Arc::clone(&fallbacks));
+
+        let replayed = replay.basic(Address::ZERO).unwrap().expect("account present");
+        assert_eq!(replayed.balance, account.balance);
+        assert_eq!(replayed.nonce, account.nonce);
+        assert_eq!(replay.storage(Address::ZERO, U256::ZERO).unwrap(), U256::from(0x1234u64));
+        assert_eq!(fallbacks.load(Ordering::Relaxed), 0);
+
+        // Reading past the end of the witness falls back to the database.
+        assert_eq!(replay.storage(Address::ZERO, U256::ZERO).unwrap(), U256::from(0xffffu64));
+        assert_eq!(fallbacks.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn replay_distinguishes_an_absent_account_from_an_empty_one() {
+        let absent = MockDatabase {
+            account: None,
+            storage: U256::ZERO,
+        };
+        let (mut recorder, stream) = WitnessDatabase::new(absent);
+        recorder.basic(Address::ZERO).unwrap();
+        let recorded_absent = stream.take();
+
+        let empty = MockDatabase {
+            account: Some(AccountInfo::new(
+                U256::ZERO,
+                0,
+                B256::from_slice(&EMPTY_CODE_HASH),
+                Bytecode::default(),
+            )),
+            storage: U256::ZERO,
+        };
+        let (mut recorder, stream) = WitnessDatabase::new(empty);
+        recorder.basic(Address::ZERO).unwrap();
+        let recorded_empty = stream.take();
+
+        // Absent is a zero-length value; empty still carries its field bits.
+        assert_eq!(recorded_absent, vec![0]);
+        assert_eq!(recorded_empty, vec![1, 0]);
+
+        let fallbacks = Arc::new(AtomicUsize::new(0));
+        let mut replay = WitnessReplayDatabase::new(
+            MockDatabase::default(),
+            &recorded_absent,
+            Arc::clone(&fallbacks),
+        );
+        assert!(replay.basic(Address::ZERO).unwrap().is_none());
+
+        let mut replay = WitnessReplayDatabase::new(
+            MockDatabase::default(),
+            &recorded_empty,
+            Arc::clone(&fallbacks),
+        );
+        assert!(replay.basic(Address::ZERO).unwrap().is_some());
+        assert_eq!(fallbacks.load(Ordering::Relaxed), 0);
     }
 }

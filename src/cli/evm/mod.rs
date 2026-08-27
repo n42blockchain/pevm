@@ -18,7 +18,10 @@ pub use logged_db::{
     LogExecutionStats,
 };
 pub use state_log::{MmapStateLogDatabase, MmapStateLogReader};
-use witness::{WitnessDatabase, WitnessFreezerWriter};
+use witness::{
+    WitnessBatchCache, WitnessDatabase, WitnessFreezerReader, WitnessFreezerWriter,
+    WitnessReplayDatabase, WitnessSink,
+};
 
 use clap::Parser;
 use reth_chainspec::ChainSpec;
@@ -43,7 +46,7 @@ use reth_provider::{
 use reth_revm::database::StateProviderDatabase;
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::thread;
@@ -108,6 +111,10 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// Uses the N42 batch-64 index and compression format.
     #[arg(long, alias = "witness-dir")]
     witness_dir: Option<PathBuf>,
+    /// Execute from a previously generated witness freezer instead of the
+    /// database ("on" to replay the whole range). Requires --witness-dir.
+    #[arg(long, alias = "use-witness")]
+    use_witness: Option<String>,
     /// Use single thread for execution (useful for log generation to avoid file locking)
     #[arg(long, alias = "single-thread")]
     single_thread: bool,
@@ -2264,46 +2271,52 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             eyre::bail!("The end block number is higher than the latest block number")
         }
 
-        // Witness generation is a separate wire format and execution mode. Do
-        // not combine it with the keyed state-log recording/replay machinery.
-        if let Some(witness_dir) = self.witness_dir.as_deref() {
-            if self.log_block.is_some()
+        // Witness recording and witness replay use a separate wire format from
+        // the keyed state-log machinery; mixing them produces files that
+        // neither reader understands.
+        let witness_replay = match self.use_witness.as_deref() {
+            None => false,
+            Some("on") => true,
+            Some(other) => {
+                eyre::bail!("--use-witness only accepts \"on\", got \"{}\"", other)
+            }
+        };
+        if (self.witness_dir.is_some() || witness_replay)
+            && (self.log_block.is_some()
                 || self.use_log.is_some()
                 || self.use_mmap_log
                 || self.repair_log
-                || self.rebuild_idx
-            {
-                eyre::bail!(
-                    "--witness-dir cannot be combined with state-log recording, replay, or repair options"
-                );
-            }
-
-            let evm_config = EthEvmConfig::ethereum(chain_spec.clone());
-            let mut witness_writer =
-                WitnessFreezerWriter::open(witness_dir, self.begin_number)?;
-            for block_number in self.begin_number..=self.end_number {
-                let blocks = blockchain_db
-                    .block_with_senders_range(block_number..=block_number)
-                    .map_err(|error| {
-                        eyre::eyre!("failed to load block {}: {}", block_number, error)
-                    })?;
-                let block = blocks.first().ok_or_else(|| {
-                    eyre::eyre!("block {} was not returned by the provider", block_number)
-                })?;
-                let state_provider = blockchain_db
-                    .history_by_block_number(block_number.saturating_sub(1))?;
-                let inner_db = StateProviderDatabase::new(&state_provider);
-                let (witness_db, witness_stream) = WitnessDatabase::new(inner_db);
-                let executor = evm_config.batch_executor(witness_db);
-                executor.execute(block)?;
-
-                let witness = witness_stream.take();
-                witness_writer.push(block_number, witness)?;
-            }
-            let items = witness_writer.finish()?;
-            info!(items, path = %witness_dir.display(), "Wrote N42 witness freezer");
-            return Ok(())
+                || self.rebuild_idx)
+        {
+            eyre::bail!(
+                "--witness-dir/--use-witness cannot be combined with state-log recording, replay, or repair options"
+            );
         }
+        if witness_replay && self.witness_dir.is_none() {
+            eyre::bail!("--use-witness on requires --witness-dir")
+        }
+
+        // Replay maps the freezer read-only, so every worker can slice it
+        // without copying or locking.
+        let witness_reader = if witness_replay {
+            let directory = self.witness_dir.as_deref().expect("checked above");
+            let reader = WitnessFreezerReader::open(directory)?;
+            if self.end_number >= reader.items() {
+                eyre::bail!(
+                    "witness freezer holds blocks 0..{}, but --end {} was requested",
+                    reader.items().saturating_sub(1),
+                    self.end_number
+                )
+            }
+            info!(
+                items = reader.items(),
+                path = %directory.display(),
+                "Replaying blocks from N42 witness freezer"
+            );
+            Some(Arc::new(reader))
+        } else {
+            None
+        };
 
         // 步骤4: 创建任务池
         // 取消续传逻辑：从 --begin 开始创建所有任务
@@ -2415,9 +2428,34 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
         // 创建共享计数器（使用原子操作避免锁竞争，提高多线程性能）
         let cumulative_gas = Arc::new(AtomicU64::new(0));
-        let block_counter = Arc::new(AtomicU64::new(self.begin_number - 1));
+        // The counter tracks the last finished block, so it starts one below
+        // the range. A witness freezer always starts at block 0, where there is
+        // no lower block to name - saturating keeps that from wrapping to
+        // u64::MAX and making the monitor think the run is already done.
+        let block_counter = Arc::new(AtomicU64::new(self.begin_number.saturating_sub(1)));
         let txs_counter = Arc::new(AtomicU64::new(0));
         let should_stop = Arc::new(AtomicBool::new(false));
+
+        // The freezer index is positional - item N is block N - so witnesses
+        // must reach it in block order even though workers finish out of order.
+        // The sink buffers and reorders; opening the writer here also enforces
+        // that --begin continues exactly where the freezer left off.
+        let witness_sink = match (self.witness_dir.as_deref(), witness_replay) {
+            (Some(directory), false) => {
+                let writer = WitnessFreezerWriter::open(directory, self.begin_number)?;
+                info!(
+                    path = %directory.display(),
+                    first_block = self.begin_number,
+                    "Recording N42 witness freezer"
+                );
+                Some(Arc::new(WitnessSink::new(
+                    writer,
+                    self.begin_number,
+                    Arc::clone(&should_stop),
+                )))
+            }
+            _ => None,
+        };
 
         // 创建全局 Bytecode 缓存（合约代码不可变，可安全跨线程共享）
         // 这是最重要的性能优化之一，避免重复查询数据库获取相同的合约代码
@@ -2444,7 +2482,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
             thread::spawn(move || {
                 let mut previous_cumulative_gas: u64 = 0;
-                let mut previous_block_counter: u64 = begin_number - 1;
+                let mut previous_block_counter: u64 = begin_number.saturating_sub(1);
                 let mut previous_txs_counter: u64 = 0;
                 loop {
                     // 检查停止标志
@@ -2460,8 +2498,14 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                     let diff_gas = current_cumulative_gas - previous_cumulative_gas;
                     previous_cumulative_gas = current_cumulative_gas;
 
-                    let current_block_counter = block_counter.load(Ordering::Relaxed);
-                    let diff_block = current_block_counter - previous_block_counter;
+                    // With --begin 0 there is no block below the range for the
+                    // counter to start from, so it starts at 0 and ends up one
+                    // ahead of the block it actually finished. Correct that here
+                    // rather than distorting the counter every worker updates.
+                    let current_block_counter = block_counter
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(u64::from(begin_number == 0));
+                    let diff_block = current_block_counter.saturating_sub(previous_block_counter);
                     previous_block_counter = current_block_counter;
 
                     let current_txs_counter = txs_counter.load(Ordering::Relaxed);
@@ -2540,6 +2584,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             let bytecode_cache_clone = bytecode_cache.clone();
             // 日志执行统计收集器（线程安全，用于聚合所有线程的统计）
             let log_stats_clone = log_stats.clone();
+            // Witness 记录汇聚点（按块号排序后顺序写入 freezer）
+            let witness_sink_clone = witness_sink.clone();
+            // Witness 只读映射（回放模式，无锁共享）
+            let witness_reader_clone = witness_reader.clone();
+            let witness_replay_thread = witness_replay;
 
             // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
             threads.push(thread::spawn(move || {
@@ -2553,8 +2602,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 // code_by_hash 查询的 bytecode 是不可变的，不依赖于具体块号
                 // 所以使用 begin_number - 1 作为基准块号是安全的
                 // 注意：需要定期刷新以避免 MDBX 读事务超时（300秒）
+                // Replay, like log replay, only needs the provider for bytecode
+                // and block hashes - both keyed independently of block number -
+                // so one provider per thread is enough.
                 let mut thread_level_state_provider: Option<Arc<dyn reth_provider::StateProvider>> =
-                    if use_log_enabled {
+                    if use_log_enabled || witness_replay_thread {
                         match blockchain_db.history_by_block_number(0) {
                             Ok(sp) => Some(Arc::new(sp)),
                             Err(e) => {
@@ -2580,6 +2632,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 let mut task_counter: u32 = 0;
                 #[cfg(windows)]
                 const TASKS_BEFORE_FORCE_REFRESH: u32 = 50; // Windows 上每 50 个 task 强制刷新
+
+                // Witness 回放：线程本地的批次缓存与回退计数（跨 task 复用）
+                let mut witness_batch_cache = WitnessBatchCache::default();
+                let witness_fallbacks = Arc::new(AtomicUsize::new(0));
 
                 // 无锁模式：使用预分配的任务迭代器
                 let mut thread_tasks_iter = thread_tasks.into_iter();
@@ -2684,8 +2740,92 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             // 但在执行时可能被其他 worker 跳过，导致统计不准确
                             let mut actually_processed_blocks: Vec<u64> = Vec::new();
 
-                            // 如果启用了日志记录（--log-block on），为每个块单独执行并记录日志
-                            if log_block_enabled {
+                            // Witness 记录：每个块都要用其父块状态执行，因此和
+                            // state-log 记录一样逐块创建 provider。产出交给 sink
+                            // 按块号重排后顺序落盘。
+                            if let Some(ref sink) = witness_sink_clone {
+                                // The freezer cannot tolerate a hole: a block
+                                // that never arrives stalls every worker queued
+                                // behind it until shutdown.
+                                let expected = task.end - task.start + 1;
+                                if blocks.len() as u64 != expected {
+                                    let message = format!(
+                                        "provider returned {} of {} blocks for {}..={}",
+                                        blocks.len(),
+                                        expected,
+                                        task.start,
+                                        task.end
+                                    );
+                                    sink.abort(message.clone());
+                                    should_stop_worker.store(true, Ordering::Relaxed);
+                                    return Err(eyre::eyre!(message));
+                                }
+
+                                for block in blocks.iter() {
+                                    if should_stop_worker.load(Ordering::Relaxed) {
+                                        return Ok(());
+                                    }
+                                    let block_number = block.sealed_block().header().number;
+
+                                    let recorded = (|| -> eyre::Result<Vec<u8>> {
+                                        let state_provider = blockchain_db
+                                            .history_by_block_number(block_number.saturating_sub(1))?;
+                                        let inner_db = StateProviderDatabase::new(&state_provider);
+                                        let (witness_db, witness_stream) =
+                                            WitnessDatabase::new(inner_db);
+                                        let executor = evm_config.batch_executor(witness_db);
+                                        executor.execute(block)?;
+                                        Ok(witness_stream.take())
+                                    })();
+
+                                    match recorded {
+                                        Ok(witness) => sink.submit(block_number, witness)?,
+                                        Err(error) => {
+                                            // A missing block would stall every
+                                            // worker queued behind it, so fail the
+                                            // whole run instead of leaving a gap.
+                                            sink.abort(format!(
+                                                "block {} failed to execute: {}",
+                                                block_number, error
+                                            ));
+                                            should_stop_worker.store(true, Ordering::Relaxed);
+                                            return Err(error);
+                                        }
+                                    }
+                                }
+                            } else if let Some(ref reader) = witness_reader_clone {
+                                // Witness 回放：bytecode 与 block hash 从未被记录，
+                                // 仍需 provider 提供；账户/存储读取全部来自 witness。
+                                let state_provider: Arc<dyn reth_provider::StateProvider> =
+                                    if let Some(ref provider) = thread_level_state_provider {
+                                        provider.clone()
+                                    } else {
+                                        Arc::new(blockchain_db.history_by_block_number(
+                                            task.start.saturating_sub(1),
+                                        )?)
+                                    };
+
+                                for block in blocks.iter() {
+                                    if should_stop_worker.load(Ordering::Relaxed) {
+                                        return Ok(());
+                                    }
+                                    let block_number = block.sealed_block().header().number;
+                                    let witness =
+                                        witness_batch_cache.witness_for(reader, block_number)?;
+
+                                    let inner_db = CachedStateProviderDatabase::new(
+                                        state_provider.as_ref(),
+                                        Some(bytecode_cache_clone.clone()),
+                                    );
+                                    let replay_db = WitnessReplayDatabase::new(
+                                        inner_db,
+                                        witness,
+                                        Arc::clone(&witness_fallbacks),
+                                    );
+                                    let executor = evm_config.batch_executor(replay_db);
+                                    executor.execute(block)?;
+                                }
+                            } else if log_block_enabled {
                                 // 性能优化：批量收集日志数据，减少写入次数和锁竞争
                                 // 先执行所有块并收集日志，然后批量写入
                                 let mut block_logs: Vec<(u64, Vec<ReadLogEntry>)> = Vec::with_capacity(blocks.len());
@@ -3260,8 +3400,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                         }
 
                         if state_provider_created_at.elapsed() > STATE_PROVIDER_REFRESH_INTERVAL {
-                            if use_log_enabled {
-                                // use_log 模式：刷新线程级别的 state_provider
+                            if use_log_enabled || witness_replay_thread {
+                                // use_log / witness 回放模式：刷新线程级 state_provider
                                 thread_level_state_provider = match blockchain_db.history_by_block_number(0) {
                                     Ok(sp) => Some(Arc::new(sp)),
                                     Err(e) => {
@@ -3283,6 +3423,20 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                         }
                     }
                 }
+
+                // A witness that could not serve a read means the recorded
+                // access order no longer matches this execution. The block is
+                // still correct - it fell back to the database - but the run
+                // was not witness-only, so say so instead of failing quietly.
+                let fallbacks = witness_fallbacks.load(Ordering::Relaxed);
+                if fallbacks > 0 {
+                    warn!(
+                        thread_id = ?thread_id,
+                        fallbacks,
+                        "Witness replay fell back to the database"
+                    );
+                }
+
                 Ok(())
             }));
         }
@@ -3330,6 +3484,17 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                     Err(e) => error!("Thread execution error: {:?}", e),
                 };
             }
+            // Flush whatever contiguous run made it through; the trailing
+            // partial batch is rewritten when the next run resumes.
+            if let Some(ref sink) = witness_sink {
+                match sink.finish() {
+                    Ok(items) => info!(items, "Witness freezer flushed on Ctrl+C"),
+                    Err(error) => {
+                        error!("Failed to flush witness freezer on Ctrl+C: {}", error)
+                    }
+                }
+            }
+
             info!("Exiting due to Ctrl+C");
             return Ok(());
         } else {
@@ -3361,6 +3526,12 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                         }
                     }
                 }
+            }
+
+            // Write the trailing partial batch and report what is on disk.
+            if let Some(ref sink) = witness_sink {
+                let items = sink.finish()?;
+                info!(items, next_block = sink.next_block(), "Wrote N42 witness freezer");
             }
         }
 

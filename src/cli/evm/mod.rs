@@ -12,6 +12,8 @@ mod logged_db;
 mod profiling;
 mod state_log;
 mod witness;
+#[cfg(test)]
+mod witness_e2e_test;
 
 pub use logged_db::{
     BytecodeCache, CachedStateProviderDatabase, DbLoggedDatabase, LocalStatsAccumulator,
@@ -19,8 +21,8 @@ pub use logged_db::{
 };
 pub use state_log::{MmapStateLogDatabase, MmapStateLogReader};
 use witness::{
-    WitnessBatchCache, WitnessDatabase, WitnessFreezerReader, WitnessFreezerWriter,
-    WitnessReplayDatabase, WitnessSink,
+    replay_block_verified, verify_execution, WitnessBatchCache, WitnessDatabase,
+    WitnessFreezerReader, WitnessFreezerWriter, WitnessSink,
 };
 
 use clap::Parser;
@@ -46,7 +48,7 @@ use reth_provider::{
 use reth_revm::database::StateProviderDatabase;
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::thread;
@@ -115,6 +117,12 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// database ("on" to replay the whole range). Requires --witness-dir.
     #[arg(long, alias = "use-witness")]
     use_witness: Option<String>,
+    /// While recording, replay every Nth block from its freshly recorded
+    /// witness with a fresh state and check it against the header, so the
+    /// run proves its own output. 0 disables; 1 checks every block (about
+    /// twice the execution cost).
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    witness_verify: u64,
     /// Use single thread for execution (useful for log generation to avoid file locking)
     #[arg(long, alias = "single-thread")]
     single_thread: bool,
@@ -2589,6 +2597,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             // Witness 只读映射（回放模式，无锁共享）
             let witness_reader_clone = witness_reader.clone();
             let witness_replay_thread = witness_replay;
+            let witness_verify_every = self.witness_verify;
 
             // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
             threads.push(thread::spawn(move || {
@@ -2633,9 +2642,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 #[cfg(windows)]
                 const TASKS_BEFORE_FORCE_REFRESH: u32 = 50; // Windows 上每 50 个 task 强制刷新
 
-                // Witness 回放：线程本地的批次缓存与回退计数（跨 task 复用）
+                // Witness 回放：线程本地的批次缓存（跨 task 复用）
                 let mut witness_batch_cache = WitnessBatchCache::default();
-                let witness_fallbacks = Arc::new(AtomicUsize::new(0));
 
                 // 无锁模式：使用预分配的任务迭代器
                 let mut thread_tasks_iter = thread_tasks.into_iter();
@@ -2774,8 +2782,29 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         let (witness_db, witness_stream) =
                                             WitnessDatabase::new(inner_db);
                                         let executor = evm_config.batch_executor(witness_db);
-                                        executor.execute(block)?;
-                                        Ok(witness_stream.take())
+                                        let output = executor.execute(block)?;
+                                        // The witness is only worth keeping if
+                                        // the execution it records reproduced
+                                        // the header. An archive with a hole
+                                        // would otherwise record garbage silently.
+                                        verify_execution(&chain_spec, block, &output.result)?;
+                                        let witness = witness_stream.take();
+                                        if witness_verify_every > 0
+                                            && block_number % witness_verify_every == 0
+                                        {
+                                            // The run proves its own output: the
+                                            // block again, from the witness alone,
+                                            // with the provider serving code and
+                                            // block hashes only.
+                                            replay_block_verified(
+                                                &evm_config,
+                                                &chain_spec,
+                                                block,
+                                                &witness,
+                                                StateProviderDatabase::new(&state_provider),
+                                            )?;
+                                        }
+                                        Ok(witness)
                                     })();
 
                                     match recorded {
@@ -2817,13 +2846,18 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         state_provider.as_ref(),
                                         Some(bytecode_cache_clone.clone()),
                                     );
-                                    let replay_db = WitnessReplayDatabase::new(
-                                        inner_db,
+                                    // Every account and slot comes from the
+                                    // witness, consumed exactly; the result must
+                                    // reproduce the header. Anything else fails
+                                    // the run — a database fallback would only
+                                    // hide a witness that is out of step.
+                                    replay_block_verified(
+                                        &evm_config,
+                                        &chain_spec,
+                                        block,
                                         witness,
-                                        Arc::clone(&witness_fallbacks),
-                                    );
-                                    let executor = evm_config.batch_executor(replay_db);
-                                    executor.execute(block)?;
+                                        inner_db,
+                                    )?;
                                 }
                             } else if log_block_enabled {
                                 // 性能优化：批量收集日志数据，减少写入次数和锁竞争
@@ -3422,19 +3456,6 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             }
                         }
                     }
-                }
-
-                // A witness that could not serve a read means the recorded
-                // access order no longer matches this execution. The block is
-                // still correct - it fell back to the database - but the run
-                // was not witness-only, so say so instead of failing quietly.
-                let fallbacks = witness_fallbacks.load(Ordering::Relaxed);
-                if fallbacks > 0 {
-                    warn!(
-                        thread_id = ?thread_id,
-                        fallbacks,
-                        "Witness replay fell back to the database"
-                    );
                 }
 
                 Ok(())

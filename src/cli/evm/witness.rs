@@ -3,11 +3,18 @@
 //! Keyless, ordered block-witness recording compatible with N42-gov5.
 
 use crate::revm::{
+    revm::database_interface::DBErrorMarker,
     state::{AccountInfo, Bytecode},
     Database as RevmDatabase,
 };
 use alloy_primitives::{Address, B256, U256};
 use eyre::{Context, Result};
+use reth_chainspec::ChainSpec;
+use reth_ethereum_consensus::validate_block_post_execution;
+use reth_ethereum_primitives::{Block, EthPrimitives, Receipt};
+use reth_evm::{execute::Executor, ConfigureEvm};
+use reth_execution_types::BlockExecutionResult;
+use reth_primitives_traits::RecoveredBlock;
 use std::{
     borrow::Cow,
     collections::BTreeMap,
@@ -15,7 +22,7 @@ use std::{
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex,
     },
     time::Duration,
@@ -848,102 +855,209 @@ impl WitnessBatchCache {
     }
 }
 
+/// Why a witness could not serve a block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum WitnessError {
+    /// Execution asked for a value past the end of the witness.
+    Exhausted {
+        /// Bytes consumed before the read that found nothing.
+        consumed: usize,
+    },
+    /// An account record does not decode.
+    Malformed {
+        /// Offset of the record.
+        at: usize,
+    },
+    /// Execution finished with witness left over: it read less than was
+    /// recorded, so it did not execute what was recorded.
+    Unconsumed {
+        /// Bytes left.
+        left: usize,
+    },
+}
+
+impl std::fmt::Display for WitnessError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exhausted { consumed } => write!(
+                formatter,
+                "witness exhausted after {consumed} bytes: execution read more than was recorded"
+            ),
+            Self::Malformed { at } => {
+                write!(formatter, "witness account record at byte {at} does not decode")
+            }
+            Self::Unconsumed { left } => write!(
+                formatter,
+                "{left} bytes of witness were not consumed: execution read less than was recorded"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WitnessError {}
+
+/// The error of a [`WitnessReplayDatabase`]: the witness's own, or the
+/// inner database's (code and block hashes).
+#[derive(Debug)]
+pub(super) enum ReplayError<E> {
+    /// The witness did not line up with this execution.
+    Witness(WitnessError),
+    /// The code / block-hash source failed.
+    Database(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for ReplayError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Witness(error) => write!(formatter, "{error}"),
+            Self::Database(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for ReplayError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Witness(error) => Some(error),
+            Self::Database(error) => Some(error),
+        }
+    }
+}
+
+impl<E: DBErrorMarker> DBErrorMarker for ReplayError<E> {}
+
 /// Serves one block's state reads from its recorded witness.
 ///
 /// The witness is keyless and ordered, so replay is only correct while the
 /// re-execution issues the same sequence of `basic`/`storage` calls that
 /// produced it. Code and block hashes were never recorded and always come from
-/// `inner`; a witness that runs short or fails to decode also falls back to
-/// `inner` rather than failing the block, and the fallback count says how often
-/// that happened.
+/// `inner`. A witness that runs short or fails to decode is an error, never a
+/// fallback: once the stream is out of step every later value is wrong, and a
+/// database answer for one read would hide that.
 pub(super) struct WitnessReplayDatabase<'a, DB> {
     inner: DB,
     stream: &'a [u8],
     position: usize,
-    /// Shared with the worker: the executor consumes the database, so the
-    /// count has to outlive it.
-    fallbacks: Arc<AtomicUsize>,
 }
 
-impl<DB: std::fmt::Debug> std::fmt::Debug for WitnessReplayDatabase<'_, DB> {
+impl<DB> std::fmt::Debug for WitnessReplayDatabase<'_, DB> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("WitnessReplayDatabase")
-            .field("inner", &self.inner)
             .field("position", &self.position)
             .field("stream_len", &self.stream.len())
-            .field("fallbacks", &self.fallbacks)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl<'a, DB> WitnessReplayDatabase<'a, DB> {
-    /// Reads for this block come from `stream`; `fallbacks` counts the reads
-    /// it could not serve. Anything above zero means the witness did not line
-    /// up with this execution - the run is still correct, but not witness-only.
-    pub(super) const fn new(inner: DB, stream: &'a [u8], fallbacks: Arc<AtomicUsize>) -> Self {
+    /// Reads for this block come from `stream`; `inner` answers code and
+    /// block-hash lookups only.
+    pub(super) const fn new(inner: DB, stream: &'a [u8]) -> Self {
         Self {
             inner,
             stream,
             position: 0,
-            fallbacks,
         }
     }
 
-    fn record_fallback(&self) {
-        self.fallbacks.fetch_add(1, Ordering::Relaxed);
+    /// Bytes of the witness not yet consumed.
+    pub(super) const fn remaining(&self) -> usize {
+        self.stream.len() - self.position
     }
 
-    /// Reads the next `[len][value]` record, or `None` once the witness ends.
-    fn next_value(&mut self) -> Option<&'a [u8]> {
-        let length = *self.stream.get(self.position)? as usize;
+    /// Reads the next `[len][value]` record.
+    fn next_value(&mut self) -> Result<&'a [u8], WitnessError> {
+        let exhausted = WitnessError::Exhausted {
+            consumed: self.position,
+        };
+        let length = *self.stream.get(self.position).ok_or(exhausted.clone())? as usize;
         let start = self.position + 1;
         let end = start + length;
-        let value = self.stream.get(start..end)?;
+        let value = self.stream.get(start..end).ok_or(exhausted)?;
         self.position = end;
-        Some(value)
+        Ok(value)
     }
 }
 
 impl<DB: RevmDatabase> RevmDatabase for WitnessReplayDatabase<'_, DB> {
-    type Error = DB::Error;
+    type Error = ReplayError<DB::Error>;
 
-    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        match self.next_value() {
-            // An absent account was recorded as a zero-length value; an account
-            // that exists always carries at least its field-bits byte.
-            Some([]) => Ok(None),
-            Some(value) => match decode_account_v2(value) {
-                Some(account) => Ok(Some(account)),
-                None => {
-                    self.record_fallback();
-                    self.inner.basic(address)
-                }
-            },
-            None => {
-                self.record_fallback();
-                self.inner.basic(address)
-            }
+    fn basic(&mut self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        let at = self.position;
+        let value = self.next_value().map_err(ReplayError::Witness)?;
+        // An absent account was recorded as a zero-length value; an account
+        // that exists always carries at least its field-bits byte.
+        if value.is_empty() {
+            return Ok(None)
         }
+        decode_account_v2(value)
+            .map(Some)
+            .ok_or(ReplayError::Witness(WitnessError::Malformed { at }))
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        self.inner.code_by_hash(code_hash)
+        self.inner.code_by_hash(code_hash).map_err(ReplayError::Database)
     }
 
-    fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        match self.next_value() {
-            Some(value) => Ok(U256::from_be_slice(value)),
-            None => {
-                self.record_fallback();
-                self.inner.storage(address, index)
-            }
-        }
+    fn storage(&mut self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
+        let value = self.next_value().map_err(ReplayError::Witness)?;
+        Ok(U256::from_be_slice(value))
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
-        self.inner.block_hash(number)
+        self.inner.block_hash(number).map_err(ReplayError::Database)
     }
+}
+
+/// Checks what execution produced against the block's header: gas used,
+/// receipts root and logs bloom (and the requests hash from Prague on).
+///
+/// This is the acceptance test for a witness. Recording a block that does
+/// not reproduce its header — an incomplete archive, a pruned history — would
+/// otherwise write a witness that is wrong in the same silent way.
+pub(super) fn verify_execution(
+    chain_spec: &ChainSpec,
+    block: &RecoveredBlock<Block>,
+    result: &BlockExecutionResult<Receipt>,
+) -> Result<()> {
+    validate_block_post_execution(block, chain_spec, &result.receipts, &result.requests, None)
+        .wrap_err_with(|| {
+            format!(
+                "block {} does not reproduce its header",
+                block.sealed_block().header().number
+            )
+        })
+}
+
+/// Re-executes `block` from `witness` with a fresh state and checks the
+/// outcome against the header. `inner` supplies code and block hashes and
+/// nothing else. The witness must be consumed exactly: a read too many or
+/// too few means the execution was not the one recorded.
+pub(super) fn replay_block_verified<E, DB>(
+    evm_config: &E,
+    chain_spec: &ChainSpec,
+    block: &RecoveredBlock<Block>,
+    witness: &[u8],
+    inner: DB,
+) -> Result<()>
+where
+    E: ConfigureEvm<Primitives = EthPrimitives>,
+    DB: RevmDatabase,
+{
+    let block_number = block.sealed_block().header().number;
+    let mut executor = evm_config.batch_executor(WitnessReplayDatabase::new(inner, witness));
+    let result = executor
+        .execute_one(block)
+        .wrap_err_with(|| format!("block {block_number} failed to replay from its witness"))?;
+    let left = executor.into_state().database.remaining();
+    if left != 0 {
+        eyre::bail!(
+            "block {block_number}: {}",
+            WitnessError::Unconsumed { left }
+        )
+    }
+    verify_execution(chain_spec, block, &result)
 }
 
 /// Inverse of [`encode_account_v2`]; `None` means the record was malformed.
@@ -1277,19 +1391,32 @@ mod tests {
             account: None,
             storage: U256::from(0xffffu64),
         };
-        let fallbacks = Arc::new(AtomicUsize::new(0));
-        let mut replay =
-            WitnessReplayDatabase::new(divergent, &recorded, Arc::clone(&fallbacks));
+        let mut replay = WitnessReplayDatabase::new(divergent, &recorded);
 
         let replayed = replay.basic(Address::ZERO).unwrap().expect("account present");
         assert_eq!(replayed.balance, account.balance);
         assert_eq!(replayed.nonce, account.nonce);
         assert_eq!(replay.storage(Address::ZERO, U256::ZERO).unwrap(), U256::from(0x1234u64));
-        assert_eq!(fallbacks.load(Ordering::Relaxed), 0);
+        assert_eq!(replay.remaining(), 0);
 
-        // Reading past the end of the witness falls back to the database.
-        assert_eq!(replay.storage(Address::ZERO, U256::ZERO).unwrap(), U256::from(0xffffu64));
-        assert_eq!(fallbacks.load(Ordering::Relaxed), 1);
+        // Reading past the end of the witness is an error, never a database
+        // answer: the database would say 0xffff and hide the misalignment.
+        assert!(matches!(
+            replay.storage(Address::ZERO, U256::ZERO),
+            Err(ReplayError::Witness(WitnessError::Exhausted { consumed })) if consumed == recorded.len()
+        ));
+    }
+
+    #[test]
+    fn replay_refuses_a_record_that_is_not_an_account() {
+        // A storage value where an account is expected: field bits 0x40 name
+        // no field, so the trailing byte is malformed.
+        let stream = vec![2u8, 0x40, 0x01];
+        let mut replay = WitnessReplayDatabase::new(MockDatabase::default(), &stream);
+        assert!(matches!(
+            replay.basic(Address::ZERO),
+            Err(ReplayError::Witness(WitnessError::Malformed { at: 0 }))
+        ));
     }
 
     #[test]
@@ -1319,20 +1446,14 @@ mod tests {
         assert_eq!(recorded_absent, vec![0]);
         assert_eq!(recorded_empty, vec![1, 0]);
 
-        let fallbacks = Arc::new(AtomicUsize::new(0));
-        let mut replay = WitnessReplayDatabase::new(
-            MockDatabase::default(),
-            &recorded_absent,
-            Arc::clone(&fallbacks),
-        );
+        let mut replay = WitnessReplayDatabase::new(MockDatabase::default(), &recorded_absent);
         assert!(replay.basic(Address::ZERO).unwrap().is_none());
 
-        let mut replay = WitnessReplayDatabase::new(
-            MockDatabase::default(),
-            &recorded_empty,
-            Arc::clone(&fallbacks),
-        );
-        assert!(replay.basic(Address::ZERO).unwrap().is_some());
-        assert_eq!(fallbacks.load(Ordering::Relaxed), 0);
+        let mut replay = WitnessReplayDatabase::new(MockDatabase::default(), &recorded_empty);
+        let replayed = replay.basic(Address::ZERO).unwrap().expect("empty account is present");
+        assert_eq!(replayed.nonce, 0);
+        assert_eq!(replayed.balance, U256::ZERO);
+        assert_eq!(replayed.code_hash.as_slice(), EMPTY_CODE_HASH);
+        assert!(replayed.code.is_none(), "code stays unknown so revm fetches it by hash");
     }
 }

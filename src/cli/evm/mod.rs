@@ -2633,9 +2633,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 #[cfg(windows)]
                 const TASKS_BEFORE_FORCE_REFRESH: u32 = 50; // Windows 上每 50 个 task 强制刷新
 
-                // Witness 回放：线程本地的批次缓存与回退计数（跨 task 复用）
+                // Witness 回放：线程本地的批次缓存与失败计数（跨 task 复用）
                 let mut witness_batch_cache = WitnessBatchCache::default();
-                let witness_fallbacks = Arc::new(AtomicUsize::new(0));
+                let witness_failures = Arc::new(AtomicUsize::new(0));
 
                 // 无锁模式：使用预分配的任务迭代器
                 let mut thread_tasks_iter = thread_tasks.into_iter();
@@ -2774,7 +2774,19 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         let (witness_db, witness_stream) =
                                             WitnessDatabase::new(inner_db);
                                         let executor = evm_config.batch_executor(witness_db);
-                                        executor.execute(block)?;
+                                        let output = executor.execute(block)?;
+                                        // A witness is only worth keeping if the
+                                        // execution that produced it reproduced the
+                                        // block, so check it against the header.
+                                        let expected_gas =
+                                            block.sealed_block().header().gas_used;
+                                        if output.gas_used != expected_gas {
+                                            eyre::bail!(
+                                                "gas mismatch: executed {}, header says {}",
+                                                output.gas_used,
+                                                expected_gas
+                                            )
+                                        }
                                         Ok(witness_stream.take())
                                     })();
 
@@ -2810,20 +2822,40 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         return Ok(());
                                     }
                                     let block_number = block.sealed_block().header().number;
-                                    let witness =
-                                        witness_batch_cache.witness_for(reader, block_number)?;
 
-                                    let inner_db = CachedStateProviderDatabase::new(
-                                        state_provider.as_ref(),
-                                        Some(bytecode_cache_clone.clone()),
-                                    );
-                                    let replay_db = WitnessReplayDatabase::new(
-                                        inner_db,
-                                        witness,
-                                        Arc::clone(&witness_fallbacks),
-                                    );
-                                    let executor = evm_config.batch_executor(replay_db);
-                                    executor.execute(block)?;
+                                    // A block whose witness does not replay is
+                                    // reported and skipped: one bad witness must
+                                    // not hide every block queued behind it.
+                                    let replayed = (|| -> eyre::Result<()> {
+                                        let witness = witness_batch_cache
+                                            .witness_for(reader, block_number)?;
+                                        let inner_db = CachedStateProviderDatabase::new(
+                                            state_provider.as_ref(),
+                                            Some(bytecode_cache_clone.clone()),
+                                        );
+                                        let replay_db =
+                                            WitnessReplayDatabase::new(inner_db, witness);
+                                        let executor = evm_config.batch_executor(replay_db);
+                                        let output = executor.execute(block)?;
+                                        let expected_gas =
+                                            block.sealed_block().header().gas_used;
+                                        if output.gas_used != expected_gas {
+                                            eyre::bail!(
+                                                "gas mismatch: replayed {}, header says {}",
+                                                output.gas_used,
+                                                expected_gas
+                                            )
+                                        }
+                                        Ok(())
+                                    })();
+
+                                    if let Err(error) = replayed {
+                                        witness_failures.fetch_add(1, Ordering::Relaxed);
+                                        error!(
+                                            "Witness replay failed for block {}: {}",
+                                            block_number, error
+                                        );
+                                    }
                                 }
                             } else if log_block_enabled {
                                 // 性能优化：批量收集日志数据，减少写入次数和锁竞争
@@ -3424,16 +3456,15 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                     }
                 }
 
-                // A witness that could not serve a read means the recorded
-                // access order no longer matches this execution. The block is
-                // still correct - it fell back to the database - but the run
-                // was not witness-only, so say so instead of failing quietly.
-                let fallbacks = witness_fallbacks.load(Ordering::Relaxed);
-                if fallbacks > 0 {
-                    warn!(
+                // Replay never reads state from the database, so a failure here
+                // means the witness no longer matches the execution it was
+                // recorded from. Those blocks were skipped, not quietly patched.
+                let failures = witness_failures.load(Ordering::Relaxed);
+                if failures > 0 {
+                    error!(
                         thread_id = ?thread_id,
-                        fallbacks,
-                        "Witness replay fell back to the database"
+                        failures,
+                        "Blocks skipped because their witness did not match"
                     );
                 }
 

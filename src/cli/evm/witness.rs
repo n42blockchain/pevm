@@ -8,14 +8,18 @@ use crate::revm::{
 };
 use alloy_primitives::{Address, B256, U256};
 use eyre::{Context, Result};
+use reth_storage_errors::provider::ProviderError;
 use std::{
     borrow::Cow,
+    cell::RefCell,
     collections::BTreeMap,
+    fmt,
     fs::{self, OpenOptions},
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex,
     },
     time::Duration,
@@ -34,14 +38,18 @@ const EMPTY_CODE_HASH: [u8; 32] = [
     0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
 ];
 
-/// Shared handle to the raw witness bytes produced by [`WitnessDatabase`].
+/// Handle to the raw witness bytes produced by [`WitnessDatabase`].
+///
+/// A block is recorded start to finish on one thread, and the executor consumes
+/// the database, so the handle only has to outlive it - not cross threads. That
+/// makes a plain `Rc<RefCell<_>>` enough; no lock is taken per recorded value.
 #[derive(Clone, Debug)]
-pub(super) struct WitnessStream(Arc<Mutex<Vec<u8>>>);
+pub(super) struct WitnessStream(Rc<RefCell<Vec<u8>>>);
 
 impl WitnessStream {
     /// Removes and returns all bytes currently in the stream.
     pub(super) fn take(&self) -> Vec<u8> {
-        std::mem::take(&mut *self.0.lock().expect("witness stream mutex poisoned"))
+        std::mem::take(&mut *self.0.borrow_mut())
     }
 }
 
@@ -67,7 +75,7 @@ impl<DB: std::fmt::Debug> std::fmt::Debug for WitnessDatabase<DB> {
 
 impl<DB> WitnessDatabase<DB> {
     pub(super) fn new(inner: DB) -> (Self, WitnessStream) {
-        let stream = WitnessStream(Arc::new(Mutex::new(Vec::with_capacity(4096))));
+        let stream = WitnessStream(Rc::new(RefCell::new(Vec::with_capacity(4096))));
         (
             Self {
                 inner,
@@ -84,7 +92,7 @@ impl<DB> WitnessDatabase<DB> {
             value.len() <= u8::MAX as usize,
             "witness value exceeds one-byte length prefix"
         );
-        let mut stream = self.stream.0.lock().expect("witness stream mutex poisoned");
+        let mut stream = self.stream.0.borrow_mut();
         stream.push(value.len() as u8);
         stream.extend_from_slice(value);
     }
@@ -848,50 +856,62 @@ impl WitnessBatchCache {
     }
 }
 
+/// A read the witness could not answer.
+///
+/// Replay is witness-only on purpose. Silently reaching for the database would
+/// paper over a witness that no longer matches the execution it was recorded
+/// from and report a clean run, so the read fails instead and the caller
+/// decides what to do with the block.
+#[derive(Debug)]
+struct WitnessUnavailable {
+    reason: &'static str,
+    position: usize,
+    length: usize,
+}
+
+impl fmt::Display for WitnessUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} at byte {} of a {}-byte witness",
+            self.reason, self.position, self.length
+        )
+    }
+}
+
+impl std::error::Error for WitnessUnavailable {}
+
 /// Serves one block's state reads from its recorded witness.
 ///
 /// The witness is keyless and ordered, so replay is only correct while the
 /// re-execution issues the same sequence of `basic`/`storage` calls that
-/// produced it. Code and block hashes were never recorded and always come from
-/// `inner`; a witness that runs short or fails to decode also falls back to
-/// `inner` rather than failing the block, and the fallback count says how often
-/// that happened.
+/// produced it. Code and block hashes were never recorded and are the only
+/// reads served by `inner`; account and storage reads must come from the
+/// witness or fail.
 pub(super) struct WitnessReplayDatabase<'a, DB> {
     inner: DB,
     stream: &'a [u8],
     position: usize,
-    /// Shared with the worker: the executor consumes the database, so the
-    /// count has to outlive it.
-    fallbacks: Arc<AtomicUsize>,
 }
 
-impl<DB: std::fmt::Debug> std::fmt::Debug for WitnessReplayDatabase<'_, DB> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<DB: fmt::Debug> fmt::Debug for WitnessReplayDatabase<'_, DB> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WitnessReplayDatabase")
             .field("inner", &self.inner)
             .field("position", &self.position)
             .field("stream_len", &self.stream.len())
-            .field("fallbacks", &self.fallbacks)
             .finish()
     }
 }
 
 impl<'a, DB> WitnessReplayDatabase<'a, DB> {
-    /// Reads for this block come from `stream`; `fallbacks` counts the reads
-    /// it could not serve. Anything above zero means the witness did not line
-    /// up with this execution - the run is still correct, but not witness-only.
-    pub(super) const fn new(inner: DB, stream: &'a [u8], fallbacks: Arc<AtomicUsize>) -> Self {
+    pub(super) const fn new(inner: DB, stream: &'a [u8]) -> Self {
         Self {
             inner,
             stream,
             position: 0,
-            fallbacks,
         }
-    }
-
-    fn record_fallback(&self) {
-        self.fallbacks.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Reads the next `[len][value]` record, or `None` once the witness ends.
@@ -903,27 +923,30 @@ impl<'a, DB> WitnessReplayDatabase<'a, DB> {
         self.position = end;
         Some(value)
     }
+
+    fn unavailable(&self, reason: &'static str) -> ProviderError {
+        ProviderError::other(WitnessUnavailable {
+            reason,
+            position: self.position,
+            length: self.stream.len(),
+        })
+    }
 }
 
-impl<DB: RevmDatabase> RevmDatabase for WitnessReplayDatabase<'_, DB> {
-    type Error = DB::Error;
+impl<DB: RevmDatabase<Error = ProviderError>> RevmDatabase for WitnessReplayDatabase<'_, DB> {
+    type Error = ProviderError;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        let _ = address;
         match self.next_value() {
             // An absent account was recorded as a zero-length value; an account
             // that exists always carries at least its field-bits byte.
             Some([]) => Ok(None),
             Some(value) => match decode_account_v2(value) {
                 Some(account) => Ok(Some(account)),
-                None => {
-                    self.record_fallback();
-                    self.inner.basic(address)
-                }
+                None => Err(self.unavailable("malformed account record")),
             },
-            None => {
-                self.record_fallback();
-                self.inner.basic(address)
-            }
+            None => Err(self.unavailable("witness ran out on an account read")),
         }
     }
 
@@ -932,12 +955,10 @@ impl<DB: RevmDatabase> RevmDatabase for WitnessReplayDatabase<'_, DB> {
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        let _ = (address, index);
         match self.next_value() {
             Some(value) => Ok(U256::from_be_slice(value)),
-            None => {
-                self.record_fallback();
-                self.inner.storage(address, index)
-            }
+            None => Err(self.unavailable("witness ran out on a storage read")),
         }
     }
 
@@ -1020,7 +1041,6 @@ fn read_uvarint(input: &[u8], cursor: &mut usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::convert::Infallible;
 
     #[derive(Default)]
     struct MockDatabase {
@@ -1029,7 +1049,7 @@ mod tests {
     }
 
     impl RevmDatabase for MockDatabase {
-        type Error = Infallible;
+        type Error = ProviderError;
 
         fn basic(&mut self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
             Ok(self.account.clone())
@@ -1277,19 +1297,51 @@ mod tests {
             account: None,
             storage: U256::from(0xffffu64),
         };
-        let fallbacks = Arc::new(AtomicUsize::new(0));
-        let mut replay =
-            WitnessReplayDatabase::new(divergent, &recorded, Arc::clone(&fallbacks));
+        let mut replay = WitnessReplayDatabase::new(divergent, &recorded);
 
         let replayed = replay.basic(Address::ZERO).unwrap().expect("account present");
         assert_eq!(replayed.balance, account.balance);
         assert_eq!(replayed.nonce, account.nonce);
-        assert_eq!(replay.storage(Address::ZERO, U256::ZERO).unwrap(), U256::from(0x1234u64));
-        assert_eq!(fallbacks.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            replay.storage(Address::ZERO, U256::ZERO).unwrap(),
+            U256::from(0x1234u64)
+        );
 
-        // Reading past the end of the witness falls back to the database.
-        assert_eq!(replay.storage(Address::ZERO, U256::ZERO).unwrap(), U256::from(0xffffu64));
-        assert_eq!(fallbacks.load(Ordering::Relaxed), 1);
+        // Reading past the end fails rather than quietly using the database,
+        // which would have answered 0xffff here.
+        let error = replay
+            .storage(Address::ZERO, U256::ZERO)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("witness ran out on a storage read"), "{error}");
+    }
+
+    #[test]
+    fn replay_refuses_to_read_state_from_the_database() {
+        // An empty witness cannot answer anything.
+        let mut replay = WitnessReplayDatabase::new(
+            MockDatabase {
+                account: Some(AccountInfo::default()),
+                storage: U256::from(9u64),
+            },
+            &[],
+        );
+
+        let error = replay.basic(Address::ZERO).unwrap_err().to_string();
+        assert!(error.contains("witness ran out on an account read"), "{error}");
+
+        // Code and block hashes were never recorded, so those still resolve.
+        assert!(replay.code_by_hash(B256::ZERO).is_ok());
+        assert!(replay.block_hash(0).is_ok());
+    }
+
+    #[test]
+    fn replay_rejects_a_malformed_account_record() {
+        // A complete 2-byte record whose field bits claim a 32-byte code hash
+        // that is not there.
+        let mut replay = WitnessReplayDatabase::new(MockDatabase::default(), &[2, 8, 1]);
+        let error = replay.basic(Address::ZERO).unwrap_err().to_string();
+        assert!(error.contains("malformed account record"), "{error}");
     }
 
     #[test]
@@ -1319,20 +1371,12 @@ mod tests {
         assert_eq!(recorded_absent, vec![0]);
         assert_eq!(recorded_empty, vec![1, 0]);
 
-        let fallbacks = Arc::new(AtomicUsize::new(0));
-        let mut replay = WitnessReplayDatabase::new(
-            MockDatabase::default(),
-            &recorded_absent,
-            Arc::clone(&fallbacks),
-        );
+        let mut replay =
+            WitnessReplayDatabase::new(MockDatabase::default(), &recorded_absent);
         assert!(replay.basic(Address::ZERO).unwrap().is_none());
 
-        let mut replay = WitnessReplayDatabase::new(
-            MockDatabase::default(),
-            &recorded_empty,
-            Arc::clone(&fallbacks),
-        );
+        let mut replay =
+            WitnessReplayDatabase::new(MockDatabase::default(), &recorded_empty);
         assert!(replay.basic(Address::ZERO).unwrap().is_some());
-        assert_eq!(fallbacks.load(Ordering::Relaxed), 0);
     }
 }

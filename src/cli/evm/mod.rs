@@ -11,12 +11,14 @@ mod logged_db;
 #[cfg(any(unix, windows))]
 mod profiling;
 mod state_log;
+mod witness;
 
 pub use logged_db::{
     BytecodeCache, CachedStateProviderDatabase, DbLoggedDatabase, LocalStatsAccumulator,
     LogExecutionStats,
 };
 pub use state_log::{MmapStateLogDatabase, MmapStateLogReader};
+use witness::{WitnessDatabase, WitnessFreezerWriter};
 
 use clap::Parser;
 use reth_chainspec::ChainSpec;
@@ -102,6 +104,10 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// Uses accumulated format: blocks_log.bin (data) and blocks_log.idx (index with offsets and lengths)
     #[arg(long, alias = "log-dir")]
     log_dir: Option<PathBuf>,
+    /// Generate a keyless N42 witness freezer (`witness.cidx` + segmented `.cdat`).
+    /// Uses the N42 batch-64 index and compression format.
+    #[arg(long, alias = "witness-dir")]
+    witness_dir: Option<PathBuf>,
     /// Use single thread for execution (useful for log generation to avoid file locking)
     #[arg(long, alias = "single-thread")]
     single_thread: bool,
@@ -2256,6 +2262,47 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         }
         if self.end_number > last {
             eyre::bail!("The end block number is higher than the latest block number")
+        }
+
+        // Witness generation is a separate wire format and execution mode. Do
+        // not combine it with the keyed state-log recording/replay machinery.
+        if let Some(witness_dir) = self.witness_dir.as_deref() {
+            if self.log_block.is_some()
+                || self.use_log.is_some()
+                || self.use_mmap_log
+                || self.repair_log
+                || self.rebuild_idx
+            {
+                eyre::bail!(
+                    "--witness-dir cannot be combined with state-log recording, replay, or repair options"
+                );
+            }
+
+            let evm_config = EthEvmConfig::ethereum(chain_spec.clone());
+            let mut witness_writer =
+                WitnessFreezerWriter::open(witness_dir, self.begin_number)?;
+            for block_number in self.begin_number..=self.end_number {
+                let blocks = blockchain_db
+                    .block_with_senders_range(block_number..=block_number)
+                    .map_err(|error| {
+                        eyre::eyre!("failed to load block {}: {}", block_number, error)
+                    })?;
+                let block = blocks.first().ok_or_else(|| {
+                    eyre::eyre!("block {} was not returned by the provider", block_number)
+                })?;
+                let state_provider = blockchain_db
+                    .history_by_block_number(block_number.saturating_sub(1))?;
+                let inner_db = StateProviderDatabase::new(&state_provider);
+                let (witness_db, witness_stream) = WitnessDatabase::new(inner_db);
+                let executor = evm_config.batch_executor(witness_db);
+                executor.execute(block)?;
+
+                let witness = witness_stream.take();
+                witness_writer.push(block_number, witness)?;
+            }
+            let items = witness_writer.finish()?;
+            info!(items, path = %witness_dir.display(), "Wrote N42 witness freezer");
+            return Ok(())
         }
 
         // 步骤4: 创建任务池

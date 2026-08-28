@@ -11,6 +11,7 @@ mod logged_db;
 #[cfg(any(unix, windows))]
 mod profiling;
 mod codes_freezer;
+mod recsplit;
 mod geth_freezer;
 mod state_log;
 mod witness;

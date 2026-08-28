@@ -196,6 +196,8 @@ lto = "fat"
 [dependencies]
 num_cpus = "1.17"
 memmap2 = "0.9.4"
+# Snappy: geth ancient `.cdat` payloads are snappy-compressed.
+snap = "1.1.1"
 
 # jemalloc is in reth v2.5 default features; this project uses snmalloc.
 reth = { git = "https://github.com/paradigmxyz/reth.git", rev = "6dec1b96b625584956883c34ad0eafbe550480ac", default-features = false }
@@ -313,11 +315,11 @@ reth-trie-parallel = { git = "https://github.com/paradigmxyz/reth.git", rev = "6
 # op-revm = { version = "4.0.2", default-features = false }
 
 # eth - only keep direct dependencies used in code
-alloy-consensus = { version = "1.5.2", default-features = false }
-alloy-eips = { version = "1.5.2", default-features = false }
+alloy-consensus = { version = "2.3.0", default-features = false }
+alloy-eips = { version = "2.3.0", default-features = false }
 alloy-primitives = { version = "1.5.2", default-features = false, features = ["map-foldhash"] }
 alloy-rlp = { version = "0.3.10", default-features = false, features = ["core-net"] }
-alloy-rpc-types = { version = "1.5.2", features = ["eth"], default-features = false }
+alloy-rpc-types = { version = "2.3.0", features = ["eth"], default-features = false }
 
 # misc
 aquamarine = "0.6"
@@ -512,7 +514,6 @@ rmp-serde = "1.3"
 roaring = "0.10.2"
 rolling-file = "0.2.0"
 sha3 = "0.10.5"
-snap = "1.1.1"
 socket2 = { version = "0.5", default-features = false }
 sysinfo = { version = "0.37", default-features = false }
 tracing-journald = "0.3"

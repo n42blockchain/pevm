@@ -10,6 +10,8 @@
 mod logged_db;
 #[cfg(any(unix, windows))]
 mod profiling;
+mod codes_freezer;
+mod geth_freezer;
 mod state_log;
 mod witness;
 
@@ -18,6 +20,8 @@ pub use logged_db::{
     LogExecutionStats,
 };
 pub use state_log::{MmapStateLogDatabase, MmapStateLogReader};
+use codes_freezer::{CodesFreezer, ExternalSourceDatabase};
+use geth_freezer::GethBlockSource;
 use witness::{
     WitnessBatchCache, WitnessDatabase, WitnessFreezerReader, WitnessFreezerWriter,
     WitnessReplayDatabase, WitnessSink,
@@ -115,6 +119,18 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// database ("on" to replay the whole range). Requires --witness-dir.
     #[arg(long, alias = "use-witness")]
     use_witness: Option<String>,
+    /// Read blocks from a go-ethereum ancient store instead of the reth
+    /// database (the directory holding `headers.cidx` and `bodies.cidx`).
+    ///
+    /// Replay needs headers, bodies and code but never account or storage
+    /// state, so an ancient store plus --codes-dir covers it without a reth
+    /// archive.
+    #[arg(long, alias = "geth-ancient-dir")]
+    geth_ancient_dir: Option<PathBuf>,
+    /// Read contract bytecode from an N42 codes freezer instead of the reth
+    /// `Bytecodes` table (the directory holding `codes.hoff`).
+    #[arg(long, alias = "codes-dir")]
+    codes_dir: Option<PathBuf>,
     /// Use single thread for execution (useful for log generation to avoid file locking)
     #[arg(long, alias = "single-thread")]
     single_thread: bool,
@@ -2298,6 +2314,41 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             eyre::bail!("--use-witness on requires --witness-dir")
         }
 
+        // Alternative block and code sources. Both are read-only and shared
+        // across workers.
+        let geth_blocks = match self.geth_ancient_dir.as_deref() {
+            Some(directory) => {
+                let source = GethBlockSource::open(directory)?;
+                if self.end_number > source.last_block() {
+                    eyre::bail!(
+                        "ancient store holds blocks 0..{}, but --end {} was requested",
+                        source.last_block(),
+                        self.end_number
+                    )
+                }
+                info!(
+                    last_block = source.last_block(),
+                    path = %directory.display(),
+                    "Reading blocks from the geth ancient store"
+                );
+                Some(Arc::new(source))
+            }
+            None => None,
+        };
+
+        let codes = match self.codes_dir.as_deref() {
+            Some(directory) => {
+                let freezer = CodesFreezer::open(directory)?;
+                info!(
+                    contracts = freezer.entries(),
+                    path = %directory.display(),
+                    "Reading contract code from the codes freezer"
+                );
+                Some(Arc::new(freezer))
+            }
+            None => None,
+        };
+
         // Replay maps the freezer read-only, so every worker can slice it
         // without copying or locking.
         let witness_reader = if witness_replay {
@@ -2591,6 +2642,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             // Witness 只读映射（回放模式，无锁共享）
             let witness_reader_clone = witness_reader.clone();
             let witness_replay_thread = witness_replay;
+            let geth_blocks_clone = geth_blocks.clone();
+            let codes_clone = codes.clone();
 
             // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
             threads.push(thread::spawn(move || {
@@ -2683,7 +2736,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
                             // 使用共享的 blockchain_db（如 v1.8.4 的方式）
                             // 预先创建的 evm_config 避免重复创建
-                            let blocks = blockchain_db.block_with_senders_range(task.start..=task.end)?;
+                            let blocks = match geth_blocks_clone.as_ref() {
+                                Some(source) => source.blocks(task.start..=task.end)?,
+                                None => blockchain_db
+                                    .block_with_senders_range(task.start..=task.end)?,
+                            };
 
                             // 步骤4: 如果使用累加模式且启用了日志记录（--log-block on），过滤掉已存在的块（断点续传）
                             // 性能优化：批量检查块存在状态，只获取一次 RwLock 读锁（减少锁竞争）
@@ -2835,8 +2892,16 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                             state_provider.as_ref(),
                                             Some(bytecode_cache_clone.clone()),
                                         );
+                                        // Code and block hashes are not in the
+                                        // witness; serve them from the freezers
+                                        // when they were given.
+                                        let sourced = ExternalSourceDatabase::new(
+                                            inner_db,
+                                            codes_clone.clone(),
+                                            geth_blocks_clone.clone(),
+                                        );
                                         let (replay_db, cursor) =
-                                            WitnessReplayDatabase::new(inner_db, witness);
+                                            WitnessReplayDatabase::new(sourced, witness);
                                         let executor = evm_config.batch_executor(replay_db);
                                         let output = executor.execute(block)?;
                                         let expected_gas =

@@ -37,6 +37,16 @@ cargo clippy
 cargo flamegraph --profile profiling -- evm -b <begin> -e <end> --datadir <path> --use-log on --log-dir <log_dir>
 ```
 
+### Witness Freezer
+
+Records the state a block reads so it can be re-executed without a database, in
+N42's freezer format. Recording runs either in parallel (needs a reth archive,
+because out-of-order blocks reach their parent state through changesets) or
+forward from genesis (`--state-dir`, no historical lookup, but single-threaded);
+both produce identical bytes. Replay is witness-only and checks every block
+against its header. See `docs/witness.md` for the format, the diagnostic flags,
+and what the checks do and do not catch.
+
 ### Key CLI Parameters
 - `-b` / `--begin`: Start block number
 - `-e` / `--end`: End block number
@@ -50,6 +60,13 @@ cargo flamegraph --profile profiling -- evm -b <begin> -e <end> --datadir <path>
 - `--single-thread`: Force single-thread mode
 - `--repair-log`: Repair corrupted log files
 - `--rebuild-idx`: Rebuild log index files
+- `--witness-dir <DIR>`: Record a witness freezer (item N is block N; `--begin` must continue where it left off)
+- `--use-witness on`: Replay from a witness instead of the database
+- `--state-dir <DIR>`: Record forward from genesis, keeping plain state here
+- `--geth-ancient-dir <DIR>` / `--codes-dir <DIR>`: Read blocks and code without a reth archive
+- `--verify`: Check every block against its header during plain execution
+- `--trace-block <N>` / `--query-account <ADDR>`: Diagnose a block that will not execute
+- `--state-overrides <FILE>`: Declare account values the database reports wrongly
 
 ## Architecture
 

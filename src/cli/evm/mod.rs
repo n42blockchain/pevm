@@ -51,7 +51,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use eyre::{Report, Result};
 use reth_consensus::FullConsensus;
-use reth_evm::{execute::Executor, ConfigureEvm};
+use reth_evm::{block::BlockExecutor, execute::Executor, ConfigureEvm};
 use reth_node_ethereum::{consensus::EthBeaconConsensus, EthEvmConfig};
 use reth_provider::{
     providers::BlockchainProvider, BlockNumReader, BlockReader, ChainSpecProvider,
@@ -2570,8 +2570,43 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             return Ok(())
         }
 
-        // TODO: the inspector path needs the block-executor API worked out.
-        let _ = self.trace_block;
+        if let Some(number) = self.trace_block {
+            let blocks = blockchain_db.block_with_senders_range(number..=number)?;
+            let block = blocks
+                .first()
+                .ok_or_else(|| eyre::eyre!("provider has no block {}", number))?;
+            let state_provider = blockchain_db.history_by_block_number(number.saturating_sub(1))?;
+            let evm_config = EthEvmConfig::ethereum(chain_spec.clone());
+
+            let tracer = trace::CallTracer::default();
+            let mut state = crate::revm::State::builder()
+                .with_database(StateProviderDatabase::new(&state_provider))
+                .with_bundle_update()
+                .build();
+            let evm = evm_config.evm_with_env_and_inspector(
+                &mut state,
+                evm_config.evm_env(block.sealed_block().header())?,
+                tracer.clone(),
+            );
+            let ctx = evm_config.context_for_block(block.sealed_block())?;
+            let executor = evm_config.create_executor(evm, ctx);
+            let result = executor.execute_block(block.transactions_recovered());
+
+            for event in tracer.events() {
+                println!("{event}");
+            }
+            match result {
+                Ok(output) => {
+                    println!(
+                        "gas_used {} (header says {})",
+                        output.gas_used,
+                        block.sealed_block().header().gas_used
+                    );
+                }
+                Err(error) => println!("execution failed: {error}"),
+            }
+            return Ok(())
+        }
 
         // Forward recording is its own execution mode: one block after another,
         // carrying the state along, so it does not go through the worker pool.

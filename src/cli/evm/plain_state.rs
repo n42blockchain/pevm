@@ -118,7 +118,7 @@ impl PlainStateStore {
                 .code
                 .as_ref()
                 .filter(|code| !code.is_empty())
-                .map_or_else(|| B256::from_slice(&EMPTY_CODE_HASH), |code| keccak256(code));
+                .map_or_else(|| B256::from_slice(&EMPTY_CODE_HASH), keccak256);
 
             let info = AccountInfo::new(
                 account.balance,
@@ -136,7 +136,7 @@ impl PlainStateStore {
             if let Some(code) = account.code.as_ref().filter(|code| !code.is_empty()) {
                 batch
                     .transaction
-                    .put(batch.codes, code_hash.as_slice(), code.to_vec(), WriteFlags::UPSERT)?;
+                    .put(batch.codes, code_hash.as_slice(), code, WriteFlags::UPSERT)?;
             }
 
             if let Some(storage) = account.storage.as_ref() {
@@ -260,7 +260,7 @@ impl<'env> PlainStateBatch<'env> {
                 .put(
                     self.codes,
                     hash.as_slice(),
-                    bytecode.original_byte_slice().to_vec(),
+                    bytecode.original_byte_slice(),
                     WriteFlags::NO_OVERWRITE,
                 )
                 .or_else(|error| match error {

@@ -217,7 +217,6 @@ struct DoubleEliasFano {
     upper_bits_cum_keys: Vec<u64>,
     upper_bits_position: Vec<u64>,
     jump: Vec<u64>,
-    num_buckets: u64,
     l_position: u64,
     l_cum_keys: u64,
     lower_bits_mask_cum_keys: u64,
@@ -253,9 +252,9 @@ impl DoubleEliasFano {
         }
 
         let words_lower_bits =
-            ((num_buckets + 1) * (l_cum_keys + l_position) + 63) / 64 + 1;
-        let words_cum_keys = (num_buckets + 1 + (u_cum_keys >> l_cum_keys) + 63) / 64;
-        let words_position = (num_buckets + 1 + (u_position >> l_position) + 63) / 64;
+            ((num_buckets + 1) * (l_cum_keys + l_position)).div_ceil(64) + 1;
+        let words_cum_keys = (num_buckets + 1 + (u_cum_keys >> l_cum_keys)).div_ceil(64);
+        let words_position = (num_buckets + 1 + (u_position >> l_position)).div_ceil(64);
         let jump_words = jump_size_words(num_buckets);
         let total_words = words_lower_bits + words_cum_keys + words_position + jump_words;
 
@@ -278,7 +277,6 @@ impl DoubleEliasFano {
             upper_bits_cum_keys: cum_keys.to_vec(),
             upper_bits_position: position.to_vec(),
             jump: jump.to_vec(),
-            num_buckets,
             l_position,
             l_cum_keys,
             lower_bits_mask_cum_keys: (1u64 << l_cum_keys) - 1,
@@ -391,8 +389,8 @@ impl DoubleEliasFano {
 
 fn jump_size_words(num_buckets: u64) -> u64 {
     let mut size = ((num_buckets + 1) / SUPER_Q) * SUPER_Q_SIZE * 2;
-    if (num_buckets + 1) % SUPER_Q != 0 {
-        size += (1 + ((((num_buckets + 1) % SUPER_Q + Q - 1) / Q + 3) / 4)) * 2;
+    if !(num_buckets + 1).is_multiple_of(SUPER_Q) {
+        size += (1 + ((num_buckets + 1) % SUPER_Q).div_ceil(Q).div_ceil(4)) * 2;
     }
     size
 }
@@ -574,7 +572,10 @@ impl RecSplitIndex {
         while m > self.secondary_aggr_bound {
             let d = reader.read_next(self.golomb_param(m));
             let hmod = remap16(remix(fingerprint.wrapping_add(self.start_seed[level]).wrapping_add(d)), m);
-            let split = ((m + 1) / 2).div_ceil(self.secondary_aggr_bound) * self.secondary_aggr_bound;
+            // `(m + 1) / 2` truncates; div_ceil would round the other way and
+            // pick a different split point.
+            let split = ((m + 1) / 2).div_ceil(self.secondary_aggr_bound) *
+                self.secondary_aggr_bound;
             if hmod < split {
                 m = split;
             } else {
@@ -654,12 +655,12 @@ fn single_elias_fano_size(count: u64, u: u64) -> usize {
     } else {
         63 ^ u64::from((u / count).leading_zeros())
     };
-    let words_lower_bits = (count * l + 63) / 64 + 1;
-    let words_upper_bits = (count + (u >> l) + 63) / 64;
+    let words_lower_bits = (count * l).div_ceil(64) + 1;
+    let words_upper_bits = (count + (u >> l)).div_ceil(64);
     let jump_words = {
         let mut size = (count / SUPER_Q) * SUPER_Q_SIZE;
-        if count % SUPER_Q != 0 {
-            size += 1 + (((count % SUPER_Q + Q - 1) / Q + 3) / 4);
+        if !count.is_multiple_of(SUPER_Q) {
+            size += 1 + (count % SUPER_Q).div_ceil(Q).div_ceil(4);
         }
         size
     };
@@ -722,7 +723,7 @@ fn split_params(
     if m > secondary_aggr_bound {
         (
             2,
-            secondary_aggr_bound * (((m + 1) / 2).div_ceil(secondary_aggr_bound)),
+            secondary_aggr_bound * ((m + 1) / 2).div_ceil(secondary_aggr_bound),
         )
     } else if m > primary_aggr_bound {
         (m.div_ceil(primary_aggr_bound), primary_aggr_bound)

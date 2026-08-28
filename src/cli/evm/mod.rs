@@ -2087,7 +2087,6 @@ pub fn format_gas_throughput_as_ggas(gas: u64, execution_duration: Duration) -> 
 
 impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
     /// Execute `evm` command
-
     /// Records a witness by executing forward from genesis.
     ///
     /// The state is carried in `state_dir` rather than looked up per block, so

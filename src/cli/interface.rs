@@ -17,7 +17,7 @@ use reth_cli_commands::{
 };
 use reth_cli_runner::CliRunner;
 use reth_node_core::args::{JitArgs, LogArgs};
-use reth_node_ethereum::{consensus::EthBeaconConsensus, EthEvmConfig, EthereumNode};
+use reth_node_ethereum::{consensus::EthBeaconConsensus, EthereumNode};
 use reth_node_metrics::recorder::install_prometheus_recorder;
 use reth_tracing::TracingGuards;
 use std::{ffi::OsString, fmt, sync::Arc};

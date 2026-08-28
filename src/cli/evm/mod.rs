@@ -15,6 +15,7 @@ mod plain_state;
 mod recsplit;
 mod geth_freezer;
 mod state_log;
+mod state_override;
 mod trace;
 mod witness;
 
@@ -227,6 +228,14 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// Print what the historical provider reports for this account as of --begin.
     #[arg(long, alias = "query-account")]
     query_account: Option<Address>,
+    /// Substitute account values the database reports incorrectly.
+    ///
+    /// Lines of `block,address,balance,nonce`. Use only where the stored value
+    /// is known to be wrong and the correct one is known - an incomplete
+    /// history index, for instance, resolves to the current value instead of
+    /// the historical one, which execution cannot tell apart from a real read.
+    #[arg(long, alias = "state-overrides")]
+    state_overrides: Option<PathBuf>,
     /// Use single thread for execution (useful for log generation to avoid file locking)
     #[arg(long, alias = "single-thread")]
     single_thread: bool,
@@ -2600,6 +2609,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 .await
         }
 
+        let state_overrides = match self.state_overrides.as_deref() {
+            Some(path) => Some(Arc::new(state_override::StateOverrides::load(path)?)),
+            None => None,
+        };
+
         // Alternative block and code sources. Both are read-only and shared
         // across workers.
         let geth_blocks = match self.geth_ancient_dir.as_deref() {
@@ -2930,6 +2944,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             let witness_replay_thread = witness_replay;
             let verify_blocks = self.verify;
             let geth_blocks_clone = geth_blocks.clone();
+            let state_overrides_clone = state_overrides.clone();
             let codes_clone = codes.clone();
 
             // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
@@ -3117,6 +3132,16 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         let state_provider = blockchain_db
                                             .history_by_block_number(block_number.saturating_sub(1))?;
                                         let inner_db = StateProviderDatabase::new(&state_provider);
+                                        // Declared substitutions sit under the
+                                        // recorder, so what gets written is the
+                                        // corrected value, not the stored one.
+                                        let inner_db = state_override::OverrideDatabase::new(
+                                            inner_db,
+                                            state_overrides_clone
+                                                .as_ref()
+                                                .and_then(|o| o.for_block(block_number))
+                                                .unwrap_or_default(),
+                                        );
                                         let (witness_db, witness_stream) =
                                             WitnessDatabase::new(inner_db);
                                         let executor = evm_config.batch_executor(witness_db);
@@ -3948,6 +3973,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                         }
                     }
                 }
+            }
+
+            if let Some(ref overrides) = state_overrides {
+                overrides.report();
             }
 
             // Write the trailing partial batch and report what is on disk.

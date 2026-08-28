@@ -199,8 +199,15 @@ memmap2 = "0.9.4"
 # Snappy: geth ancient `.cdat` payloads are snappy-compressed.
 snap = "1.1.1"
 
-# jemalloc is in reth v2.5 default features; this project uses snmalloc.
-reth = { git = "https://github.com/paradigmxyz/reth.git", rev = "6dec1b96b625584956883c34ad0eafbe550480ac", default-features = false }
+# reth's default features are the configuration it is tested with, and several
+# of them select the cryptography backend (gmp reaches reth-revm/gmp, asm-keccak
+# reaches alloy-primitives). Turning the whole set off to avoid jemalloc changed
+# execution, so the set is restored minus jemalloc, which this project replaces
+# with snmalloc, and minus jit, which needs the revmc toolchain.
+reth = { git = "https://github.com/paradigmxyz/reth.git", rev = "6dec1b96b625584956883c34ad0eafbe550480ac", default-features = false, features = [
+    "keccak-cache-global",
+    "asm-keccak",
+] }
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", rev = "6dec1b96b625584956883c34ad0eafbe550480ac" }
 #reth-blockchain-tree = { git = "https://github.com/paradigmxyz/reth.git", rev = "6dec1b96b625584956883c34ad0eafbe550480ac" }
 #reth-blockchain-tree-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "6dec1b96b625584956883c34ad0eafbe550480ac" }

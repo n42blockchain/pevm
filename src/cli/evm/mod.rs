@@ -15,6 +15,7 @@ mod plain_state;
 mod recsplit;
 mod geth_freezer;
 mod state_log;
+mod trace;
 mod witness;
 
 pub use logged_db::{
@@ -107,11 +108,19 @@ fn verify_against_header(
     let header = block.sealed_block().header();
 
     if result.gas_used != header.gas_used {
+        // Per-transaction cumulative gas pins the divergence to a transaction
+        // index; the block total alone only says that one exists.
+        let cumulative: Vec<u64> = result
+            .receipts
+            .iter()
+            .map(alloy_consensus::TxReceipt::cumulative_gas_used)
+            .collect();
         eyre::bail!(
-            "gas mismatch: {} {}, header says {}",
+            "gas mismatch: {} {}, header says {}; per-tx cumulative: {:?}",
             what,
             result.gas_used,
-            header.gas_used
+            header.gas_used,
+            cumulative
         )
     }
 
@@ -201,6 +210,23 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// leave the reth database out entirely.
     #[arg(long, alias = "state-dir")]
     state_dir: Option<PathBuf>,
+    /// Check every block against its header (gas, and receipts root plus logs
+    /// bloom from Byzantium on) during plain execution.
+    ///
+    /// Plain execution runs a whole task as one batch, which is faster but only
+    /// reports totals. This runs block by block so a divergence is attributed
+    /// to the block that caused it - the point of the mode is finding one.
+    #[arg(long, alias = "verify")]
+    verify: bool,
+    /// Trace one block's calls, creates and self-destructs, then exit.
+    ///
+    /// A witness only records reads, so a divergence that lives in writes is
+    /// invisible in it. This records what moves value instead.
+    #[arg(long, alias = "trace-block")]
+    trace_block: Option<u64>,
+    /// Print what the historical provider reports for this account as of --begin.
+    #[arg(long, alias = "query-account")]
+    query_account: Option<Address>,
     /// Use single thread for execution (useful for log generation to avoid file locking)
     #[arg(long, alias = "single-thread")]
     single_thread: bool,
@@ -2239,6 +2265,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             provider_factory, ..
             // reth v2.5 moved runtime creation out of `init`; storage I/O runs on it.
         } = self.env.init::<N>(AccessRights::RO, runtime)?;
+
         let log_dir = self.log_dir.as_deref();
 
         // 如果启用了 --repair-log，执行修复并退出
@@ -2513,6 +2540,29 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         if witness_replay && self.witness_dir.is_none() {
             eyre::bail!("--use-witness on requires --witness-dir")
         }
+
+        // Diagnostic: what does the historical provider say an account held at
+        // the end of --begin? Answers whether a divergence starts in the state
+        // handed to execution or inside execution itself.
+        if let Some(address) = self.query_account {
+            let at = self.begin_number;
+            let provider = blockchain_db.history_by_block_number(at)?;
+            let account = reth_provider::AccountReader::basic_account(&provider, &address)?;
+            match account {
+                Some(account) => println!(
+                    "account {address:?} after block {at}: nonce {} balance {} ({:.6} ETH) code {:?}",
+                    account.nonce,
+                    account.balance,
+                    f64::from(account.balance) / 1e18,
+                    account.bytecode_hash
+                ),
+                None => println!("account {address:?} does not exist after block {at}"),
+            }
+            return Ok(())
+        }
+
+        // TODO: the inspector path needs the block-executor API worked out.
+        let _ = self.trace_block;
 
         // Forward recording is its own execution mode: one block after another,
         // carrying the state along, so it does not go through the worker pool.
@@ -2878,6 +2928,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             // Witness 只读映射（回放模式，无锁共享）
             let witness_reader_clone = witness_reader.clone();
             let witness_replay_thread = witness_replay;
+            let verify_blocks = self.verify;
             let geth_blocks_clone = geth_blocks.clone();
             let codes_clone = codes.clone();
 
@@ -3636,15 +3687,56 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                 // Windows 修复：使用 CachedStateProviderDatabase 减少 MDBX 访问
                                 // 通过缓存 bytecode/account/storage 显著减少数据库查询
                                 // 这是 --use-log 模式能稳定运行的关键原因之一
-                                let state_provider = blockchain_db.history_by_block_number(task.start - 1)?;
-                                let db = CachedStateProviderDatabase::new(
-                                    &state_provider,
-                                    Some(bytecode_cache_clone.clone()),
-                                );
-                                let executor = evm_config.batch_executor(db);
-                                let _execute_result = executor.execute_batch(blocks.iter())?;
-                                // 显式释放 state_provider，减少 MDBX mmap 压力
-                                drop(state_provider);
+                                if verify_blocks {
+                                    // One block at a time, each against the state
+                                    // its parent left - the same view the witness
+                                    // recorder uses - so a mismatch names a block.
+                                    for block in blocks.iter() {
+                                        let number = block.sealed_block().header().number;
+                                        let state_provider = blockchain_db
+                                            .history_by_block_number(number.saturating_sub(1))?;
+                                        let db = CachedStateProviderDatabase::new(
+                                            &state_provider,
+                                            Some(bytecode_cache_clone.clone()),
+                                        );
+                                        // Wrapped so a failure can report the
+                                        // values the execution actually read,
+                                        // which is what a divergence is about.
+                                        let (witness_db, witness_stream) =
+                                            WitnessDatabase::new(db);
+                                        let executor = evm_config.batch_executor(witness_db);
+                                        let output = executor.execute(block)?;
+                                        let recorded = witness_stream.take();
+                                        if let Err(error) = verify_against_header(
+                                            &chain_spec,
+                                            block,
+                                            &output.result,
+                                            "executed",
+                                        ) {
+                                            let path = std::path::Path::new(".")
+                                                .join(format!("witness-{number}.bin"));
+                                            std::fs::write(&path, &recorded).ok();
+                                            error!(
+                                                "block {} read {} witness bytes, written to {}",
+                                                number,
+                                                recorded.len(),
+                                                path.display()
+                                            );
+                                            return Err(error.wrap_err(format!("block {number}")))
+                                        }
+                                    }
+                                } else {
+                                    let state_provider =
+                                        blockchain_db.history_by_block_number(task.start - 1)?;
+                                    let db = CachedStateProviderDatabase::new(
+                                        &state_provider,
+                                        Some(bytecode_cache_clone.clone()),
+                                    );
+                                    let executor = evm_config.batch_executor(db);
+                                    let _execute_result = executor.execute_batch(blocks.iter())?;
+                                    // 显式释放 state_provider，减少 MDBX mmap 压力
+                                    drop(state_provider);
+                                }
                             }
 
                             // 通用统计代码（仅用于非 use_log 模式）

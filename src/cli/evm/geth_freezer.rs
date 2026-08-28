@@ -282,6 +282,40 @@ mod tests {
         path.join("headers.cidx").exists().then_some(path)
     }
 
+    /// Diagnostic: who mined a block, and how often that address mined before it.
+    #[test]
+    fn beneficiary_history_around_block_5305() {
+        let Some(directory) = ancient_dir() else { return };
+        let source = GethBlockSource::open(&directory).unwrap();
+
+        for number in [5305u64, 5662, 5748] {
+            let block = source.blocks(number..=number).unwrap().pop().unwrap();
+            println!(
+                "block {} beneficiary {:?} ommers {}",
+                number,
+                block.sealed_block().header().beneficiary,
+                block.body().ommers.len()
+            );
+        }
+
+        let target = source.blocks(5305..=5305).unwrap().pop().unwrap();
+        let miner = target.sealed_block().header().beneficiary;
+        let mut produced = 0usize;
+        let mut as_ommer = 0usize;
+        for number in 0..5305u64 {
+            let block = source.blocks(number..=number).unwrap().pop().unwrap();
+            if block.sealed_block().header().beneficiary == miner {
+                produced += 1;
+            }
+            for ommer in &block.body().ommers {
+                if ommer.beneficiary == miner {
+                    as_ommer += 1;
+                }
+            }
+        }
+        println!("before 5305: mined {produced} blocks, was ommer beneficiary {as_ommer} times");
+    }
+
     #[test]
     fn reads_the_genesis_header_and_body() {
         let Some(directory) = ancient_dir() else { return };

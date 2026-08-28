@@ -11,6 +11,7 @@ mod logged_db;
 #[cfg(any(unix, windows))]
 mod profiling;
 mod codes_freezer;
+mod plain_state;
 mod recsplit;
 mod geth_freezer;
 mod state_log;
@@ -22,6 +23,11 @@ pub use logged_db::{
 };
 pub use state_log::{MmapStateLogDatabase, MmapStateLogReader};
 use codes_freezer::{CodesFreezer, ExternalSourceDatabase};
+use plain_state::PlainStateStore;
+
+/// Blocks per state commit while recording forward.
+const STATE_COMMIT_INTERVAL: u64 = 512;
+use reth_primitives_traits::RecoveredBlock;
 use geth_freezer::GethBlockSource;
 use witness::{
     WitnessBatchCache, WitnessDatabase, WitnessFreezerReader, WitnessFreezerWriter,
@@ -132,6 +138,15 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// `Bytecodes` table (the directory holding `codes.hoff`).
     #[arg(long, alias = "codes-dir")]
     codes_dir: Option<PathBuf>,
+    /// Record the witness by executing forward from genesis, keeping the plain
+    /// state in this directory, instead of reading historical state from reth.
+    ///
+    /// Block order means the parent state of each block is just what the
+    /// previous one left behind, so no historical lookup is needed - but the
+    /// blocks cannot be spread across workers. Pair with --geth-ancient-dir to
+    /// leave the reth database out entirely.
+    #[arg(long, alias = "state-dir")]
+    state_dir: Option<PathBuf>,
     /// Use single thread for execution (useful for log generation to avoid file locking)
     #[arg(long, alias = "single-thread")]
     single_thread: bool,
@@ -1983,6 +1998,143 @@ pub fn format_gas_throughput_as_ggas(gas: u64, execution_duration: Duration) -> 
 
 impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
     /// Execute `evm` command
+
+    /// Records a witness by executing forward from genesis.
+    ///
+    /// The state is carried in `state_dir` rather than looked up per block, so
+    /// this needs no historical index - but it also cannot be spread across
+    /// workers, since block N's input is block N-1's output.
+    async fn record_sequentially(
+        &self,
+        load_block: impl Fn(u64) -> eyre::Result<RecoveredBlock<reth_ethereum_primitives::Block>>,
+        chain_spec: Arc<ChainSpec>,
+        state_dir: &Path,
+        witness_dir: &Path,
+        blocks: Option<Arc<GethBlockSource>>,
+    ) -> eyre::Result<()> {
+        let store = PlainStateStore::open(state_dir)?;
+        let applied = store.last_block()?;
+
+        // The freezer and the state have to agree on where to resume; both are
+        // append-only and neither can be rewound.
+        let next_block = applied.map_or(0, |block| block + 1);
+        if self.begin_number != next_block {
+            eyre::bail!(
+                "state at {} holds blocks 0..{}, so --begin must be {}, got {}",
+                state_dir.display(),
+                next_block.saturating_sub(1),
+                next_block,
+                self.begin_number
+            )
+        }
+
+        if applied.is_none() {
+            let seeded = store.init_genesis(chain_spec.genesis())?;
+            info!(accounts = seeded, "Seeded the genesis allocation");
+        }
+
+        let should_stop = Arc::new(AtomicBool::new(false));
+        let should_stop_signal = Arc::clone(&should_stop);
+        tokio::spawn(async move {
+            if signal::ctrl_c().await.is_ok() {
+                info!("Received Ctrl+C, finishing the current block...");
+                should_stop_signal.store(true, Ordering::Relaxed);
+            }
+        });
+
+        let writer = WitnessFreezerWriter::open(witness_dir, self.begin_number)?;
+        let sink = WitnessSink::new(writer, self.begin_number, Arc::clone(&should_stop));
+        let evm_config = EthEvmConfig::ethereum(chain_spec);
+
+        info!(
+            state = %state_dir.display(),
+            witness = %witness_dir.display(),
+            from = self.begin_number,
+            to = self.end_number,
+            blocks = if blocks.is_some() { "geth ancient store" } else { "reth database" },
+            "Recording the witness in block order"
+        );
+
+        let mut batch = store.batch()?;
+        let start = Instant::now();
+        let mut gas_total: u64 = 0;
+        let mut transactions: u64 = 0;
+        let mut reported = Instant::now();
+
+        for block_number in self.begin_number..=self.end_number {
+            if should_stop.load(Ordering::Relaxed) {
+                break
+            }
+
+            let block = load_block(block_number)?;
+
+            let (output, witness) = {
+                let state_db = batch.database(blocks.clone());
+                let (witness_db, witness_stream) = WitnessDatabase::new(state_db);
+                let executor = evm_config.batch_executor(witness_db);
+                let output = executor.execute(&block)?;
+                let witness = witness_stream.take();
+                (output, witness)
+            };
+
+            let expected_gas = block.sealed_block().header().gas_used;
+            if output.gas_used != expected_gas {
+                eyre::bail!(
+                    "block {}: executed gas {}, header says {}",
+                    block_number,
+                    output.gas_used,
+                    expected_gas
+                )
+            }
+
+            // The genesis block is not executed by a node: its state comes
+            // from the chain spec's allocation. Recording its witness keeps the
+            // freezer aligned, but folding its rewards into the state would
+            // credit a block reward nobody ever received - visible later as
+            // every zero-address beneficiary reading one reward too many.
+            if block_number == 0 {
+                batch.mark_block(0)?;
+            } else {
+                batch.apply(block_number, &output.state)?;
+            }
+            sink.submit(block_number, witness)?;
+
+            // Commit periodically: MDBX holds every dirty page until commit, so
+            // one transaction cannot span the whole range.
+            if block_number.wrapping_sub(self.begin_number) % STATE_COMMIT_INTERVAL
+                == STATE_COMMIT_INTERVAL - 1
+            {
+                batch.commit()?;
+                batch = store.batch()?;
+            }
+
+            gas_total += output.gas_used;
+            transactions += block.sealed_block().body().transaction_count() as u64;
+
+            if reported.elapsed() >= Duration::from_secs(1) {
+                let elapsed = start.elapsed().as_secs_f64().max(0.001);
+                let done = block_number - self.begin_number + 1;
+                info!(
+                    bn = block_number,
+                    txs = transactions,
+                    b_per_s = format!("{:.0}", done as f64 / elapsed),
+                    Ggas_per_s = format!("{:.2}", gas_total as f64 / elapsed / 1e9),
+                    "Recording"
+                );
+                reported = Instant::now();
+            }
+        }
+
+        batch.commit()?;
+        let items = sink.finish()?;
+        info!(
+            items,
+            state_at = store.last_block()?.unwrap_or_default(),
+            "Wrote N42 witness freezer"
+        );
+        Ok(())
+    }
+
     pub async fn execute<
         N: CliNodeTypes<
             Payload = EthEngineTypes,
@@ -2313,6 +2465,42 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         }
         if witness_replay && self.witness_dir.is_none() {
             eyre::bail!("--use-witness on requires --witness-dir")
+        }
+
+        // Forward recording is its own execution mode: one block after another,
+        // carrying the state along, so it does not go through the worker pool.
+        if let Some(state_dir) = self.state_dir.as_deref() {
+            let Some(witness_dir) = self.witness_dir.as_deref() else {
+                eyre::bail!("--state-dir is for recording a witness; pass --witness-dir too")
+            };
+            if witness_replay {
+                eyre::bail!("--state-dir records a witness; it cannot be combined with --use-witness")
+            }
+            let blocks = match self.geth_ancient_dir.as_deref() {
+                Some(directory) => Some(Arc::new(GethBlockSource::open(directory)?)),
+                None => None,
+            };
+            let source = blocks.clone();
+            let provider = blockchain_db.clone();
+            let load_block = move |number: u64| match source.as_ref() {
+                Some(ancient) => ancient
+                    .blocks(number..=number)?
+                    .pop()
+                    .ok_or_else(|| eyre::eyre!("ancient store has no block {}", number)),
+                None => provider
+                    .block_with_senders_range(number..=number)?
+                    .pop()
+                    .ok_or_else(|| eyre::eyre!("provider has no block {}", number)),
+            };
+            return self
+                .record_sequentially(
+                    load_block,
+                    chain_spec.clone(),
+                    state_dir,
+                    witness_dir,
+                    blocks,
+                )
+                .await
         }
 
         // Alternative block and code sources. Both are read-only and shared

@@ -6645,6 +6645,7 @@ dependencies = [
  "ahash",
  "alloy-consensus",
  "alloy-eips",
+ "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types",

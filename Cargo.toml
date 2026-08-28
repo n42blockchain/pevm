@@ -316,6 +316,7 @@ reth-trie-parallel = { git = "https://github.com/paradigmxyz/reth.git", rev = "6
 
 # eth - only keep direct dependencies used in code
 alloy-consensus = { version = "2.3.0", default-features = false }
+alloy-genesis = { version = "2.3.0", default-features = false }
 alloy-eips = { version = "2.3.0", default-features = false }
 alloy-primitives = { version = "1.5.2", default-features = false, features = ["map-foldhash"] }
 alloy-rlp = { version = "0.3.10", default-features = false, features = ["core-net"] }

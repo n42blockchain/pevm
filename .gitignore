@@ -64,3 +64,5 @@ compression_test.sh
 test_compression_manual.sh
 test_decompression.sh
 compression_report.md
+# Local build paths, machine specific
+.cargo/config.toml

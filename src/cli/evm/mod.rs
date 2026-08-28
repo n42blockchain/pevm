@@ -27,6 +27,7 @@ use plain_state::PlainStateStore;
 
 /// Blocks per state commit while recording forward.
 const STATE_COMMIT_INTERVAL: u64 = 512;
+use eyre::Context as _;
 use reth_primitives_traits::RecoveredBlock;
 use geth_freezer::GethBlockSource;
 use witness::{
@@ -35,7 +36,7 @@ use witness::{
 };
 
 use clap::Parser;
-use reth_chainspec::ChainSpec;
+use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_commands::common::CliNodeTypes;
 use reth_cli_runner::CliContext;
@@ -89,6 +90,59 @@ const EMPTY_CODE_HASH_BYTES: &[u8; 32] = &[
 #[inline]
 fn get_empty_code_hash() -> B256 {
     B256::from_slice(EMPTY_CODE_HASH_BYTES)
+}
+
+/// Checks an execution against the block header.
+///
+/// Gas alone is a weak check: it says the block consumed what it should, not
+/// that each transaction produced the right result. The receipts root covers
+/// per-transaction status, cumulative gas and logs, so a witness that fed back
+/// a wrong value shows up here even when the totals happen to line up.
+fn verify_against_header(
+    chain_spec: &ChainSpec,
+    block: &RecoveredBlock<reth_ethereum_primitives::Block>,
+    result: &reth_evm::block::BlockExecutionResult<reth_ethereum_primitives::Receipt>,
+    what: &str,
+) -> eyre::Result<()> {
+    let header = block.sealed_block().header();
+
+    if result.gas_used != header.gas_used {
+        eyre::bail!(
+            "gas mismatch: {} {}, header says {}",
+            what,
+            result.gas_used,
+            header.gas_used
+        )
+    }
+
+    // Before Byzantium a receipt carried the post-transaction state root rather
+    // than a status flag (EIP-658), and execution does not produce a state root
+    // per transaction - so the root simply cannot be rebuilt from these
+    // receipts. reth's own consensus check is gated the same way.
+    if chain_spec.is_byzantium_active_at_block(header.number) {
+        let receipts_root =
+            reth_ethereum_primitives::calculate_receipt_root_no_memo(&result.receipts);
+        if receipts_root != header.receipts_root {
+            eyre::bail!(
+                "receipts root mismatch: {} {:?}, header says {:?}",
+                what,
+                receipts_root,
+                header.receipts_root
+            )
+        }
+
+        let logs_bloom = result
+            .receipts
+            .iter()
+            .fold(alloy_primitives::Bloom::ZERO, |bloom, receipt| {
+                bloom | alloy_consensus::TxReceipt::bloom(receipt)
+            });
+        if logs_bloom != header.logs_bloom {
+            eyre::bail!("logs bloom mismatch: {}", what)
+        }
+    }
+
+    Ok(())
 }
 
 /// EVM commands
@@ -2044,7 +2098,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
         let writer = WitnessFreezerWriter::open(witness_dir, self.begin_number)?;
         let sink = WitnessSink::new(writer, self.begin_number, Arc::clone(&should_stop));
-        let evm_config = EthEvmConfig::ethereum(chain_spec);
+        let evm_config = EthEvmConfig::ethereum(chain_spec.clone());
 
         info!(
             state = %state_dir.display(),
@@ -2077,15 +2131,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 (output, witness)
             };
 
-            let expected_gas = block.sealed_block().header().gas_used;
-            if output.gas_used != expected_gas {
-                eyre::bail!(
-                    "block {}: executed gas {}, header says {}",
-                    block_number,
-                    output.gas_used,
-                    expected_gas
-                )
-            }
+            verify_against_header(&chain_spec, &block, &output.result, "executed")
+                .wrap_err_with(|| format!("block {block_number}"))?;
 
             // The genesis block is not executed by a node: its state comes
             // from the chain spec's allocation. Recording its witness keeps the
@@ -3024,17 +3071,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         let executor = evm_config.batch_executor(witness_db);
                                         let output = executor.execute(block)?;
                                         // A witness is only worth keeping if the
-                                        // execution that produced it reproduced the
-                                        // block, so check it against the header.
-                                        let expected_gas =
-                                            block.sealed_block().header().gas_used;
-                                        if output.gas_used != expected_gas {
-                                            eyre::bail!(
-                                                "gas mismatch: executed {}, header says {}",
-                                                output.gas_used,
-                                                expected_gas
-                                            )
-                                        }
+                                        // execution that produced it reproduced
+                                        // the block.
+                                        verify_against_header(&chain_spec, block, &output.result, "executed")?;
                                         Ok(witness_stream.take())
                                     })();
 
@@ -3093,15 +3132,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                             WitnessReplayDatabase::new(sourced, witness);
                                         let executor = evm_config.batch_executor(replay_db);
                                         let output = executor.execute(block)?;
-                                        let expected_gas =
-                                            block.sealed_block().header().gas_used;
-                                        if output.gas_used != expected_gas {
-                                            eyre::bail!(
-                                                "gas mismatch: replayed {}, header says {}",
-                                                output.gas_used,
-                                                expected_gas
-                                            )
-                                        }
+                                        verify_against_header(&chain_spec, block, &output.result, "replayed")?;
                                         // Running out of witness is caught by the
                                         // database; bytes left over are the same
                                         // mismatch seen from the other side, and

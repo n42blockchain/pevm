@@ -198,6 +198,13 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// archive.
     #[arg(long, alias = "geth-ancient-dir")]
     geth_ancient_dir: Option<PathBuf>,
+    /// Count the transactions and gas the ancient store holds, then exit.
+    ///
+    /// Reads headers and bodies only, so the totals come from the block data
+    /// rather than from an execution run - a run reports what it processed,
+    /// which is the same number only if it processed every block exactly once.
+    #[arg(long, alias = "geth-census", requires = "geth_ancient_dir")]
+    geth_census: bool,
     /// Read contract bytecode from an N42 codes freezer instead of the reth
     /// `Bytecodes` table (the directory holding `codes.hoff`).
     #[arg(long, alias = "codes-dir")]
@@ -2216,6 +2223,21 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         Ok(())
     }
 
+    /// Totals the ancient store holds: transactions, gas, and where it ends.
+    ///
+    /// The cost is reading headers and bodies once, so the walk is spread
+    /// across threads and nothing else is done per block.
+    fn run_census(&self, directory: &Path) -> eyre::Result<()> {
+        let source = geth_freezer::GethBlockSource::open(directory)?;
+        let end = self.end_number.min(source.last_block());
+        let threads = self.thread_count.unwrap_or_else(num_cpus::get).max(1);
+        let census = source.census(self.begin_number..=end, threads)?;
+        println!("transactions {}", census.transactions);
+        println!("gas_used     {}", census.gas_used);
+        println!("last_block   {}", end);
+        Ok(())
+    }
+
     pub async fn execute<
         N: CliNodeTypes<
             Payload = EthEngineTypes,
@@ -2228,6 +2250,17 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         runtime: reth_tasks::Runtime,
     ) -> eyre::Result<()> {
         info!("Executing EVM command...");
+
+        // A census reads headers and bodies and nothing else, so it runs before
+        // the reth environment is opened and works on a machine that has only
+        // the ancient store.
+        if self.geth_census {
+            let directory = self
+                .geth_ancient_dir
+                .as_deref()
+                .expect("clap requires --geth-ancient-dir");
+            return self.run_census(directory)
+        }
 
         // 如果启用了性能分析，启动 CPU profiling（跨平台支持）
         #[cfg(any(unix, windows))]

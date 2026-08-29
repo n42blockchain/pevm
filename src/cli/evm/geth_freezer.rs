@@ -222,6 +222,64 @@ impl GethBlockSource {
         Ok(out)
     }
 
+    /// Sums transactions and gas over `range`.
+    ///
+    /// Headers and bodies only - no state, no execution - so the totals come
+    /// from the block data rather than from a run that could have skipped or
+    /// double-counted a block. Reading them once is the whole cost, which is
+    /// why the range is split across threads.
+    pub(super) fn census(
+        &self,
+        range: std::ops::RangeInclusive<u64>,
+        threads: usize,
+    ) -> Result<Census> {
+        let (first, last) = (*range.start(), *range.end());
+        if last >= self.headers.items() {
+            eyre::bail!(
+                "ancient store holds blocks 0..{}, but {} was requested",
+                self.headers.items().saturating_sub(1),
+                last
+            )
+        }
+        let threads = threads.max(1);
+        let total = last - first + 1;
+        let per_thread = total.div_ceil(threads as u64);
+
+        let results: Vec<Result<Census>> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads);
+            for index in 0..threads as u64 {
+                let start = first + index * per_thread;
+                if start > last {
+                    break
+                }
+                let end = (start + per_thread - 1).min(last);
+                handles.push(scope.spawn(move || {
+                    let mut census = Census::default();
+                    for number in start..=end {
+                        let header_rlp = self.headers.get(number)?;
+                        let header = Header::decode(&mut header_rlp.as_slice())
+                            .wrap_err_with(|| format!("failed to decode header {number}"))?;
+                        let body_rlp = self.bodies.get(number)?;
+                        let transactions = body_transaction_count(&body_rlp)
+                            .wrap_err_with(|| format!("failed to walk body {number}"))?;
+
+                        census.blocks += 1;
+                        census.transactions += transactions;
+                        census.gas_used += u128::from(header.gas_used);
+                    }
+                    Ok(census)
+                }));
+            }
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+        });
+
+        let mut total_census = Census::default();
+        for result in results {
+            total_census.absorb(result?);
+        }
+        Ok(total_census)
+    }
+
     fn block(&self, number: u64) -> Result<RecoveredBlock<Block>> {
         let header_rlp = self.headers.get(number)?;
         let header = Header::decode(&mut header_rlp.as_slice())
@@ -234,6 +292,61 @@ impl GethBlockSource {
         RecoveredBlock::try_recover_unchecked(Block::new(header, body))
             .map_err(|error| eyre::eyre!("failed to recover senders for block {number}: {error}"))
     }
+}
+
+/// What a range of the store holds, counted without executing anything.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct Census {
+    pub(super) blocks: u64,
+    pub(super) transactions: u64,
+    /// `u128` because the chain's cumulative gas passes `u64` territory only
+    /// far in the future, but a sum that silently wraps would be worse than
+    /// one that is obviously too wide.
+    pub(super) gas_used: u128,
+}
+
+impl Census {
+    fn absorb(&mut self, other: Self) {
+        self.blocks += other.blocks;
+        self.transactions += other.transactions;
+        self.gas_used += other.gas_used;
+    }
+}
+
+/// Number of transactions in a body, without decoding them.
+///
+/// Only the count is wanted, so the transaction list is walked by its RLP
+/// headers: every item is either a list (a legacy transaction) or a byte string
+/// (a typed envelope), and both give the payload length needed to step to the
+/// next. Decoding the transactions would cost far more and answer the same
+/// question.
+fn body_transaction_count(raw: &[u8]) -> Result<u64> {
+    let mut buf = raw;
+    let outer = alloy_rlp::Header::decode(&mut buf)?;
+    if !outer.list {
+        eyre::bail!("body is not an RLP list")
+    }
+    let list = alloy_rlp::Header::decode(&mut buf)?;
+    if !list.list {
+        eyre::bail!("body does not start with a transaction list")
+    }
+
+    let mut remaining = list.payload_length;
+    let mut count = 0u64;
+    while remaining > 0 {
+        let before = buf.len();
+        let item = alloy_rlp::Header::decode(&mut buf)?;
+        if buf.len() < item.payload_length {
+            eyre::bail!("transaction payload runs past the end of the body")
+        }
+        buf = &buf[item.payload_length..];
+        let consumed = before - buf.len();
+        remaining = remaining
+            .checked_sub(consumed)
+            .ok_or_else(|| eyre::eyre!("transaction list overruns its own length"))?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 /// Decodes geth's body encoding: `[transactions, uncles, withdrawals?]`.

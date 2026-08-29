@@ -215,6 +215,12 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// contract redeployed with different code.
     #[arg(long)]
     code_mdbx: Option<PathBuf>,
+
+    /// gov5's `senders` freezer (the directory holding `senders.cidx`):
+    /// transaction senders in block order, so none is recovered from its
+    /// signature.
+    #[arg(long)]
+    senders_dir: Option<PathBuf>,
     /// Record the witness by executing forward from genesis, keeping the plain
     /// state in this directory, instead of reading historical state from reth.
     ///
@@ -2705,7 +2711,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         // across workers.
         let geth_blocks = match self.geth_ancient_dir.as_deref() {
             Some(directory) => {
-                let source = GethBlockSource::open(directory)?;
+                let mut source = GethBlockSource::open(directory)?;
+                if let Some(senders) = self.senders_dir.as_deref() {
+                    source = source.with_senders(senders)?;
+                }
                 if self.end_number > source.last_block() {
                     eyre::bail!(
                         "ancient store holds blocks 0..{}, but --end {} was requested",

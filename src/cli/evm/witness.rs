@@ -439,7 +439,11 @@ fn validate_cidx(bytes: &[u8], path: &Path) -> Result<()> {
 }
 
 fn read_index_entry(bytes: &[u8], item: u64) -> (u16, u32) {
-    let position = (CIDX_HEADER_SIZE + item * CIDX_ENTRY_SIZE) as usize;
+    read_index_entry_at(bytes, CIDX_HEADER_SIZE, item)
+}
+
+fn read_index_entry_at(bytes: &[u8], header: u64, item: u64) -> (u16, u32) {
+    let position = (header + item * CIDX_ENTRY_SIZE) as usize;
     (
         u16::from_be_bytes(bytes[position..position + 2].try_into().unwrap()),
         u32::from_be_bytes(bytes[position + 2..position + 6].try_into().unwrap()),
@@ -447,7 +451,11 @@ fn read_index_entry(bytes: &[u8], item: u64) -> (u16, u32) {
 }
 
 fn data_path(output_dir: &Path, file_number: u16) -> PathBuf {
-    output_dir.join(format!("witness.{file_number:04}.cdat"))
+    table_data_path(output_dir, "witness", file_number)
+}
+
+fn table_data_path(directory: &Path, name: &str, file_number: u16) -> PathBuf {
+    directory.join(format!("{name}.{file_number:04}.cdat"))
 }
 
 fn encode_batch(entries: &[Vec<u8>]) -> Result<Vec<u8>> {
@@ -731,18 +739,37 @@ impl std::fmt::Debug for WitnessFreezerReader {
 
 impl WitnessFreezerReader {
     pub(super) fn open(directory: &Path) -> Result<Self> {
-        let index_path = directory.join("witness.cidx");
+        Self::open_table(directory, "witness", false)
+    }
+
+    /// Opens any of gov5's 64-item batched zstd tables by name. `headerless`
+    /// is the legacy layout gov5 still writes for `senders`: no `NCIX`
+    /// header, batch mode implied, and a trailing "next write" sentinel entry
+    /// after the last item, as in geth's own index.
+    pub(super) fn open_table(directory: &Path, name: &str, headerless: bool) -> Result<Self> {
+        let index_path = directory.join(format!("{name}.cidx"));
         let mut index_bytes = Vec::new();
         fs::File::open(&index_path)
             .wrap_err_with(|| format!("failed to open {}", index_path.display()))?
             .read_to_end(&mut index_bytes)
             .wrap_err_with(|| format!("failed to read {}", index_path.display()))?;
-        validate_cidx(&index_bytes, &index_path)?;
+        let header = if headerless {
+            if index_bytes.len() as u64 % CIDX_ENTRY_SIZE != 0 {
+                eyre::bail!("{} ends with a partial cidx entry", index_path.display())
+            }
+            0
+        } else {
+            validate_cidx(&index_bytes, &index_path)?;
+            CIDX_HEADER_SIZE
+        };
 
-        let items = (index_bytes.len() as u64 - CIDX_HEADER_SIZE) / CIDX_ENTRY_SIZE;
+        let entries = (index_bytes.len() as u64 - header) / CIDX_ENTRY_SIZE;
+        let items = if headerless { entries.saturating_sub(1) } else { entries };
         let batch_count = items.div_ceil(FREEZER_BATCH_SIZE as u64);
         let batches = (0..batch_count)
-            .map(|batch| read_index_entry(&index_bytes, batch * FREEZER_BATCH_SIZE as u64))
+            .map(|batch| {
+                read_index_entry_at(&index_bytes, header, batch * FREEZER_BATCH_SIZE as u64)
+            })
             .collect::<Vec<_>>();
 
         let file_count = batches
@@ -751,7 +778,7 @@ impl WitnessFreezerReader {
             .unwrap_or(1);
         let mut data = Vec::with_capacity(file_count);
         for file_number in 0..file_count {
-            let path = data_path(directory, file_number as u16);
+            let path = table_data_path(directory, name, file_number as u16);
             let file = fs::File::open(&path)
                 .wrap_err_with(|| format!("failed to open {}", path.display()))?;
             // SAFETY: replay opens the freezer read-only and nothing writes to

@@ -11,7 +11,7 @@
 //! with a 16-byte header added, which is why the file names look familiar.
 
 use alloy_consensus::{BlockBody, Header};
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use alloy_eips::eip4895::Withdrawals;
 use alloy_rlp::Decodable;
 use eyre::{Context, Result};
@@ -173,6 +173,12 @@ pub(super) struct GethBlockSource {
     /// A store copied without its `hashes` table (headers and bodies are all
     /// a replay needs) has them computed from the headers instead.
     hashes: Option<GethFreezerTable>,
+    /// gov5's `senders` table: one item per block, the transactions' senders
+    /// as `20 × n` bytes in transaction order. Recovering a sender from its
+    /// signature costs tens of microseconds; with nine million transactions
+    /// in fifty thousand blocks that is a quarter of the replay's CPU, and
+    /// reth's recovery also fans out onto rayon from every worker at once.
+    senders: Option<super::witness::WitnessFreezerReader>,
 }
 
 impl GethBlockSource {
@@ -200,7 +206,21 @@ impl GethBlockSource {
             headers,
             bodies,
             hashes,
+            senders: None,
         })
+    }
+
+    /// Reads senders from gov5's `senders` table in `directory` instead of
+    /// recovering them from the signatures.
+    pub(super) fn with_senders(mut self, directory: &Path) -> Result<Self> {
+        let senders = super::witness::WitnessFreezerReader::open_table(directory, "senders", true)?;
+        tracing::info!(
+            items = senders.items(),
+            path = %directory.display(),
+            "Reading transaction senders from the senders table"
+        );
+        self.senders = Some(senders);
+        Ok(self)
     }
 
     /// Canonical hash of `number`, for the BLOCKHASH opcode.
@@ -232,8 +252,11 @@ impl GethBlockSource {
         range: std::ops::RangeInclusive<u64>,
     ) -> Result<Vec<RecoveredBlock<Block>>> {
         let mut out = Vec::with_capacity((range.end() - range.start() + 1) as usize);
+        // The senders batch covering the current block, decoded once per
+        // batch: tasks are short and consecutive, so this is nearly once.
+        let mut senders_batch: Option<(u64, Vec<Vec<u8>>)> = None;
         for number in range {
-            out.push(self.block(number)?);
+            out.push(self.block(number, &mut senders_batch)?);
         }
         Ok(out)
     }
@@ -296,7 +319,11 @@ impl GethBlockSource {
         Ok(total_census)
     }
 
-    fn block(&self, number: u64) -> Result<RecoveredBlock<Block>> {
+    fn block(
+        &self,
+        number: u64,
+        senders_batch: &mut Option<(u64, Vec<Vec<u8>>)>,
+    ) -> Result<RecoveredBlock<Block>> {
         let header_rlp = self.headers.get(number)?;
         let header = Header::decode(&mut header_rlp.as_slice())
             .wrap_err_with(|| format!("failed to decode header {number}"))?;
@@ -305,6 +332,28 @@ impl GethBlockSource {
         let body = decode_body(&body_rlp)
             .wrap_err_with(|| format!("failed to decode body {number}"))?;
 
+        if let Some(table) = self.senders.as_ref() {
+            if number < table.items() {
+                use super::witness::WitnessFreezerReader as Reader;
+                let batch = Reader::batch_of(number);
+                if !matches!(senders_batch, Some((cached, _)) if *cached == batch) {
+                    *senders_batch = Some((batch, table.read_batch(batch)?));
+                }
+                let raw = senders_batch
+                    .as_ref()
+                    .and_then(|(_, entries)| entries.get((number - Reader::batch_start(batch)) as usize))
+                    .ok_or_else(|| eyre::eyre!("senders batch {batch} is missing block {number}"))?;
+                if raw.len() != body.transactions.len() * 20 {
+                    eyre::bail!(
+                        "senders item {number} holds {} bytes for {} transactions",
+                        raw.len(),
+                        body.transactions.len()
+                    )
+                }
+                let senders = raw.chunks_exact(20).map(Address::from_slice).collect();
+                return Ok(RecoveredBlock::new_unhashed(Block::new(header, body), senders))
+            }
+        }
         RecoveredBlock::try_recover_unchecked(Block::new(header, body))
             .map_err(|error| eyre::eyre!("failed to recover senders for block {number}: {error}"))
     }

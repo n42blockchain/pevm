@@ -167,7 +167,7 @@ error on the first full run. And `senders` is gov5's legacy headerless
 batched table, read through the witness reader's batch decoder.
 
 Measured on 128 cores / 256 threads (EPYC 9B45), 25,765,565 blocks,
-3.4 billion transactions, about 286,000 Ggas, every block checked against
+3,678,099,879 transactions and 312,450 Ggas (`--geth-census`), every block checked against
 its header:
 
 | build | wall | CPU | notes |

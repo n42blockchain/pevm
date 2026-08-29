@@ -195,3 +195,14 @@ failed to replay: compiled code does not issue the same sequence of state
 reads as the interpreter, and a keyless witness has no way to absorb that.
 A JIT could only replay a witness that was recorded through the same JIT.
 The feature stays for that experiment; the replay path does not use it.
+
+A full run with `--jit`, failures skipped, did not finish either: after
+2824 s it was at block 21.93M (the interpreter passes 20M at 862 s; the
+JIT run at 2321 s) when glibc aborted the process with "corrupted
+double-linked list" — heap corruption on the LLVM side, which reth itself
+warns the backend may cause. Up to there 11,991 blocks had failed, all
+between 3,130,512 and 7,278,436 (7,632 malformed account records, 368
+witnesses not fully consumed, the rest transactions rejected on nonce or
+funds — the reads that drifted). An earlier attempt aborted at block 4.03M
+on a panic in a host call from a frame that cannot unwind; a storage value
+longer than a word is an error now, not a panic.

@@ -41,14 +41,19 @@ pub(super) struct AccountValue {
 /// Declared substitutions, keyed by the block they apply from.
 #[derive(Debug, Default)]
 pub(super) struct StateOverrides {
-    /// `(from_block, address) -> value`, where the value holds for every block
-    /// at or above `from_block` until another entry supersedes it.
-    entries: Vec<(u64, Address, AccountValue)>,
+    /// `(from_block, to_block, address) -> value`, applying to every block in
+    /// the inclusive range.
+    ///
+    /// The upper bound is required rather than optional. A balance moves, so a
+    /// correction that is right at one height is wrong at a later one, and an
+    /// unbounded entry goes on being applied long after it stopped being true -
+    /// silently, because a stale correction looks exactly like a live one.
+    entries: Vec<(u64, u64, Address, AccountValue)>,
     applied: Arc<AtomicUsize>,
 }
 
 impl StateOverrides {
-    /// Reads a file of `block,address,balance,nonce` lines.
+    /// Reads a file of `from_block,to_block,address,balance,nonce` lines.
     ///
     /// Blank lines and `#` comments are ignored. Balances are decimal wei, so a
     /// value copied out of a witness or an explorer goes in unchanged.
@@ -63,29 +68,41 @@ impl StateOverrides {
                 continue
             }
             let fields: Vec<&str> = line.split(',').map(str::trim).collect();
-            if fields.len() != 4 {
+            if fields.len() != 5 {
                 eyre::bail!(
-                    "{}:{}: expected `block,address,balance,nonce`, got {} fields",
+                    "{}:{}: expected `from_block,to_block,address,balance,nonce`, got {} fields",
                     path.display(),
                     index + 1,
                     fields.len()
                 )
             }
-            let block: u64 = fields[0]
+            let from_block: u64 = fields[0]
                 .parse()
-                .wrap_err_with(|| format!("{}:{}: bad block", path.display(), index + 1))?;
-            let address: Address = fields[1]
+                .wrap_err_with(|| format!("{}:{}: bad from_block", path.display(), index + 1))?;
+            let to_block: u64 = fields[1]
+                .parse()
+                .wrap_err_with(|| format!("{}:{}: bad to_block", path.display(), index + 1))?;
+            if to_block < from_block {
+                eyre::bail!(
+                    "{}:{}: to_block {} is below from_block {}",
+                    path.display(),
+                    index + 1,
+                    to_block,
+                    from_block
+                )
+            }
+            let address: Address = fields[2]
                 .parse()
                 .wrap_err_with(|| format!("{}:{}: bad address", path.display(), index + 1))?;
-            let balance = U256::from_str_radix(fields[2], 10)
+            let balance = U256::from_str_radix(fields[3], 10)
                 .wrap_err_with(|| format!("{}:{}: bad balance", path.display(), index + 1))?;
-            let nonce: u64 = fields[3]
+            let nonce: u64 = fields[4]
                 .parse()
                 .wrap_err_with(|| format!("{}:{}: bad nonce", path.display(), index + 1))?;
-            entries.push((block, address, AccountValue { balance, nonce }));
+            entries.push((from_block, to_block, address, AccountValue { balance, nonce }));
         }
 
-        entries.sort_by_key(|(block, address, _)| (*address, *block));
+        entries.sort_by_key(|(from_block, _, address, _)| (*address, *from_block));
         info!(
             count = entries.len(),
             path = %path.display(),
@@ -100,10 +117,10 @@ impl StateOverrides {
     /// The substitutions that apply when executing `block`, if any.
     pub(super) fn for_block(&self, block: u64) -> Option<BlockOverrides> {
         let mut map: HashMap<Address, AccountValue> = HashMap::new();
-        for (from_block, address, value) in &self.entries {
-            if *from_block <= block {
-                // Entries are sorted by (address, block), so a later match for
-                // the same address supersedes an earlier one.
+        for (from_block, to_block, address, value) in &self.entries {
+            if (*from_block..=*to_block).contains(&block) {
+                // Entries are sorted by (address, from_block), so a later match
+                // for the same address supersedes an earlier one.
                 map.insert(*address, *value);
             }
         }

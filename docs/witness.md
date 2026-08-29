@@ -117,9 +117,16 @@ different branch, and burned 440639 gas more than the header allows.
 `--state-overrides <file>` declares the correct values:
 
 ```
-# block,address,balance,nonce
-17456000,0x0000000000000000000000000000000000000000,11749916056243464802008,0
+# from_block,to_block,address,balance,nonce
+18116189,18116189,0x0000000000000000000000000000000000000000,11749916056243464802008,0
 ```
+
+The upper bound is required, and the reason is the failure it prevents. The
+first version of this entry had no end and applied from 17456000 onward. It
+unblocked 18116189 and then broke 20846649, 2.7M blocks later: by then the
+balance had risen to exactly the value the index was wrongly returning, so the
+stored value was right and the correction was the stale one. A correction is
+true at a height, not forever.
 
 Only `basic` is intercepted - an override says what an account held, which says
 nothing about its storage or code. Every substitution is logged, and one that

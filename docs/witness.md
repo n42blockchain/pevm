@@ -206,3 +206,16 @@ witnesses not fully consumed, the rest transactions rejected on nonce or
 funds — the reads that drifted). An earlier attempt aborted at block 4.03M
 on a panic in a host call from a frame that cannot unwind; a storage value
 longer than a word is an error now, not a panic.
+
+## Contract heat
+
+`--contract-heat <FILE>` writes, after a replay, one CSV row per contract
+whose code ran — the address whose code executed (a DELEGATECALL credits the
+library, not the proxy), its code hash, call frames, gas spent by the frame
+including everything it called, and the first and last block it ran in —
+hottest first. Addresses without code are left out. Over blocks
+0..25,765,564: 83,386,919 contracts and 13.9 billion call frames;
+51.5 million contracts were called exactly once and 93.2% at most eight
+times, while the 10,000 hottest take 79.1% of the frames and 71.2% of the
+inclusive gas (WETH9 alone 1.53 billion frames). The tables and a summary
+sit next to the witness: `/data/witness-rust/contract-heat-20260829*`.

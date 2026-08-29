@@ -29,6 +29,11 @@ pevm evm --chain mainnet -b 0 -e <end> --witness-dir <out> \
 
 Recording 0..300000 both ways produces byte-identical freezers.
 
+Only the parallel mode reads history, so only it can be affected by a bad
+history index - and only it accepts `--state-overrides`. Forward recording
+computes the value itself, so an override there would overwrite a correct
+value with an asserted one; the combination is refused rather than ignored.
+
 ### The freezer is positional
 
 Item N *is* block N, and appends are strictly sequential. `--begin` must equal

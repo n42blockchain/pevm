@@ -3329,9 +3329,22 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         let (replay_db, cursor) =
                                             WitnessReplayDatabase::new(sourced, witness);
                                         let replay_db = replay_db.with_codes(code_resolver_clone.clone());
-                                        let executor = evm_config.batch_executor(replay_db);
-                                        let output = executor.execute(block)?;
-                                        verify_against_header(&chain_spec, block, &output.result, "replayed")?;
+                                        // Replay wants the receipts, not the
+                                        // post-state: a State without bundle
+                                        // updates skips the transition
+                                        // bookkeeping the batch executor keeps
+                                        // for a bundle nobody takes.
+                                        let mut state = crate::revm::State::builder()
+                                            .with_database(replay_db)
+                                            .build();
+                                        let evm = evm_config.evm_with_env(
+                                            &mut state,
+                                            evm_config.evm_env(block.sealed_block().header())?,
+                                        );
+                                        let ctx = evm_config.context_for_block(block.sealed_block())?;
+                                        let executor = evm_config.create_executor(evm, ctx);
+                                        let result = executor.execute_block(block.transactions_recovered())?;
+                                        verify_against_header(&chain_spec, block, &result, "replayed")?;
                                         // Running out of witness is caught by the
                                         // database; bytes left over are the same
                                         // mismatch seen from the other side, and

@@ -10,7 +10,6 @@ use alloy_primitives::{Address, B256, U256};
 use eyre::{Context, Result};
 use reth_storage_errors::provider::ProviderError;
 use std::{
-    borrow::Cow,
     cell::{Cell, RefCell},
     collections::BTreeMap,
     fmt,
@@ -492,21 +491,45 @@ fn read_batch(path: &Path, start: u64, end: u64, expected: usize) -> Result<Vec<
     file.seek(SeekFrom::Start(start))?;
     let mut blob = vec![0u8; (end - start) as usize];
     file.read_exact(&mut blob)?;
-    decode_batch(&blob, expected, &path.display().to_string())
+    Ok(decode_batch(&blob, expected, &path.display().to_string())?.into_entries())
 }
 
 /// Splits one freezer batch blob into the block witnesses it holds.
 ///
 /// A batch is only stored compressed when that was smaller than the raw
 /// encoding, so the zstd frame magic decides which of the two is on disk.
-fn decode_batch(blob: &[u8], expected: usize, source: &str) -> Result<Vec<Vec<u8>>> {
-    let raw: Cow<'_, [u8]> = if blob.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        Cow::Owned(zstd::stream::decode_all(blob).wrap_err("failed to decode witness batch")?)
+/// A decoded batch: the decompressed bytes once, and where each item lies in
+/// them. Every worker decodes the batch its task falls in, so the copy per
+/// item that a `Vec<Vec<u8>>` costs was paid a few thousand times per batch
+/// across the run.
+#[derive(Debug)]
+pub(super) struct DecodedBatch {
+    raw: Vec<u8>,
+    bounds: Vec<(usize, usize)>,
+}
+
+impl DecodedBatch {
+    pub(super) fn get(&self, index: usize) -> Option<&[u8]> {
+        self.bounds.get(index).map(|&(start, end)| &self.raw[start..end])
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.bounds.len()
+    }
+
+    pub(super) fn into_entries(self) -> Vec<Vec<u8>> {
+        self.bounds.iter().map(|&(start, end)| self.raw[start..end].to_vec()).collect()
+    }
+}
+
+fn decode_batch(blob: &[u8], expected: usize, source: &str) -> Result<DecodedBatch> {
+    let raw: Vec<u8> = if blob.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        zstd::stream::decode_all(blob).wrap_err("failed to decode witness batch")?
     } else {
-        Cow::Borrowed(blob)
+        blob.to_vec()
     };
 
-    let mut entries = Vec::with_capacity(expected);
+    let mut bounds = Vec::with_capacity(expected);
     let mut position = 0;
     for _ in 0..expected {
         if position + 4 > raw.len() {
@@ -517,13 +540,13 @@ fn decode_batch(blob: &[u8], expected: usize, source: &str) -> Result<Vec<Vec<u8
         if position + length > raw.len() {
             eyre::bail!("truncated witness batch payload in {}", source)
         }
-        entries.push(raw[position..position + length].to_vec());
+        bounds.push((position, position + length));
         position += length;
     }
     if position != raw.len() {
         eyre::bail!("witness batch in {} has trailing bytes", source)
     }
-    Ok(entries)
+    Ok(DecodedBatch { raw, bounds })
 }
 
 // ---------------------------------------------------------------------------
@@ -811,7 +834,7 @@ impl WitnessFreezerReader {
     }
 
     /// Decodes one batch into its individual block witnesses.
-    pub(super) fn read_batch(&self, batch: u64) -> Result<Vec<Vec<u8>>> {
+    pub(super) fn read_batch(&self, batch: u64) -> Result<DecodedBatch> {
         let (file_number, offset) = *self
             .batches
             .get(batch as usize)
@@ -850,7 +873,7 @@ impl WitnessFreezerReader {
 /// almost every repeat lookup without any cross-thread coordination.
 #[derive(Debug, Default)]
 pub(super) struct WitnessBatchCache {
-    loaded: Option<(u64, Vec<Vec<u8>>)>,
+    loaded: Option<(u64, DecodedBatch)>,
 }
 
 impl WitnessBatchCache {
@@ -878,7 +901,6 @@ impl WitnessBatchCache {
         let position = (block_number - WitnessFreezerReader::batch_start(batch)) as usize;
         entries
             .get(position)
-            .map(Vec::as_slice)
             .ok_or_else(|| eyre::eyre!("witness batch {} is missing block {}", batch, block_number))
     }
 }
@@ -1036,13 +1058,16 @@ impl<DB: RevmDatabase<Error = ProviderError>> RevmDatabase for WitnessReplayData
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         if let Some(codes) = self.codes.as_ref() {
-            match codes.by_hash(code_hash) {
-                Ok(Some(code)) => return Ok(code),
-                Ok(None) => {}
-                Err(error) => {
-                    return Err(ProviderError::other(CodeResolveFailed(error.to_string())))
-                }
-            }
+            // With code sources configured, a code none of them has is an
+            // error: the database behind `inner` would answer with empty
+            // bytecode and the block would run wrong rather than fail.
+            return match codes.by_hash(code_hash) {
+                Ok(Some(code)) => Ok(code),
+                Ok(None) => Err(ProviderError::other(CodeResolveFailed(format!(
+                    "code {code_hash:?} is in none of the code sources"
+                )))),
+                Err(error) => Err(ProviderError::other(CodeResolveFailed(error.to_string()))),
+            };
         }
         self.inner.code_by_hash(code_hash)
     }

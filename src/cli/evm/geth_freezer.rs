@@ -254,7 +254,7 @@ impl GethBlockSource {
         let mut out = Vec::with_capacity((range.end() - range.start() + 1) as usize);
         // The senders batch covering the current block, decoded once per
         // batch: tasks are short and consecutive, so this is nearly once.
-        let mut senders_batch: Option<(u64, Vec<Vec<u8>>)> = None;
+        let mut senders_batch: Option<(u64, super::witness::DecodedBatch)> = None;
         for number in range {
             out.push(self.block(number, &mut senders_batch)?);
         }
@@ -322,7 +322,7 @@ impl GethBlockSource {
     fn block(
         &self,
         number: u64,
-        senders_batch: &mut Option<(u64, Vec<Vec<u8>>)>,
+        senders_batch: &mut Option<(u64, super::witness::DecodedBatch)>,
     ) -> Result<RecoveredBlock<Block>> {
         let header_rlp = self.headers.get(number)?;
         let header = Header::decode(&mut header_rlp.as_slice())

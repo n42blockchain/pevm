@@ -279,6 +279,10 @@ impl CodeMdbx {
                 ..Default::default()
             })
             .set_max_dbs(256)
+            // The one shared transaction lives for the whole run; reth's
+            // default is to time a read transaction out after five minutes,
+            // which turned every code lookup past that into an error.
+            .set_max_read_transaction_duration(reth_libmdbx::MaxReadTransactionDuration::Unbounded)
             .open(directory)
             .wrap_err_with(|| format!("failed to open the code MDBX at {}", directory.display()))?;
         let txn = env.begin_ro_txn()?;
@@ -343,12 +347,22 @@ impl CodeResolver {
         self.by_hash(code_hash)
     }
 
-    /// Code by hash: the cache, the freezer, then the code MDBX.
+    /// Code by hash: this thread's own cache, the shared one, the freezer,
+    /// then the code MDBX.
     pub(super) fn by_hash(&self, code_hash: B256) -> Result<Option<Bytecode>> {
         use std::sync::atomic::Ordering::Relaxed;
+        // A contract account is read a few hundred times per block and the
+        // same contracts recur, so most lookups end here without touching
+        // the shared map's locks. Bytecode is a reference-counted buffer, so
+        // the clone is a pointer.
+        if let Some(code) = LOCAL_CODES.with(|local| local.borrow().get(&code_hash).cloned()) {
+            return Ok(Some(code))
+        }
         if let Some(code) = self.cache.get(&code_hash) {
             self.hits.fetch_add(1, Relaxed);
-            return Ok(Some(code.clone()))
+            let code = code.clone();
+            Self::remember_locally(code_hash, &code);
+            return Ok(Some(code))
         }
         self.misses.fetch_add(1, Relaxed);
         if let Some(codes) = self.by_address.as_ref() {
@@ -370,8 +384,29 @@ impl CodeResolver {
     fn remember(&self, code_hash: B256, code: Vec<u8>) -> Bytecode {
         let bytecode = Bytecode::new_raw(code.into());
         self.cache.insert(code_hash, bytecode.clone());
+        Self::remember_locally(code_hash, &bytecode);
         bytecode
     }
+
+    fn remember_locally(code_hash: B256, code: &Bytecode) {
+        LOCAL_CODES.with(|local| {
+            let mut local = local.borrow_mut();
+            if local.len() >= LOCAL_CODES_CAPACITY {
+                local.clear();
+            }
+            local.insert(code_hash, code.clone());
+        });
+    }
+}
+
+/// Per-thread front of the code cache; cleared wholesale when full rather
+/// than evicted, since a worker's working set turns over with the blocks it
+/// is handed.
+const LOCAL_CODES_CAPACITY: usize = 8192;
+
+thread_local! {
+    static LOCAL_CODES: std::cell::RefCell<std::collections::HashMap<B256, Bytecode>> =
+        std::cell::RefCell::new(std::collections::HashMap::with_capacity(LOCAL_CODES_CAPACITY));
 }
 
 pub(super) struct ExternalSourceDatabase<DB> {

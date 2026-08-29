@@ -15,6 +15,20 @@ use reth_node_ethereum::EthereumNode;
 use tracing::info;
 
 fn main() {
+    // A JIT backend in out-of-process mode re-executes this binary as its
+    // compile helper; that process must answer the job and exit here.
+    #[cfg(feature = "jit")]
+    {
+        match reth_node_ethereum::node::maybe_run_jit_helper() {
+            Ok(std::ops::ControlFlow::Break(())) => return,
+            Ok(std::ops::ControlFlow::Continue(())) => {}
+            Err(err) => {
+                eprintln!("Error: {err:?}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     reth_cli_util::sigsegv_handler::install();
 
     // Enable backtraces unless a RUST_BACKTRACE value has already been explicitly provided.

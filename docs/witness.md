@@ -135,3 +135,63 @@ no longer holds.
 
 Use this only where the stored value is known to be wrong *and* the correct one
 is known. Rebuilding the index is the real fix.
+
+## Replaying the production set on Linux
+
+The Linux host holds the full input set without a reth archive: the Rust
+witness (`/data/witness-rust`, 25,765,567 items, 170 GB, recorded on the
+Windows host), a geth-style ancient store with only `headers` and `bodies`
+(`/data/blockchain/witness-geth`), and gov5's column set
+(`/data/blockchain/witness`) for `senders` and `codes`, with gov5's Code
+MDBX (`/data/blockchain/code-mdbx`) as the fallback for contracts the codes
+freezer predates. The database is an empty datadir made by `init`.
+
+```bash
+pevm init --chain mainnet --datadir /data/pevm-db
+pevm evm --chain mainnet --datadir /data/pevm-db -b 0 -e 25765564 \
+  --witness-dir /data/witness-rust --use-witness on \
+  --geth-ancient-dir /data/blockchain/witness-geth \
+  --codes-dir /data/blockchain/witness --code-mdbx /data/blockchain/code-mdbx \
+  --senders-dir /data/blockchain/witness -t 256
+```
+
+Three things about that set differ from the Windows one. Block hashes for
+BLOCKHASH are computed from the header RLP because the `hashes` table was
+not copied. The codes freezer is the 20-byte-key kind `code-import2fz`
+writes from reth's `Bytecodes` table (NCIX header, 26-byte entries sorted by
+the first 20 bytes of the code hash, one zstd frame per contract); it is
+read by hash prefix, `keccak(code)` settles the hit, and the Code MDBX takes
+the rest through one unbounded read transaction — reth's default
+five-minute read-transaction timeout turned every lookup past that into an
+error on the first full run. And `senders` is gov5's legacy headerless
+batched table, read through the witness reader's batch decoder.
+
+Measured on 128 cores / 256 threads (EPYC 9B45), 25,765,565 blocks,
+3.4 billion transactions, about 286,000 Ggas, every block checked against
+its header:
+
+| build | wall | CPU | notes |
+|---|---|---|---|
+| first run | 27.0 min | 396,850 s | 83,369 blocks failed: code MDBX transaction timed out |
+| senders table, no bundle State, batch without copies, thread-local code cache | **23.9 min** | 351,575 s | 0 failures |
+| same, `maxperf` + `target-cpu=native` | 23.8 min | 352,160 s | no gain at full scale |
+
+gov5's own replay of the same range takes 41 minutes (49m48s in its
+measured notes). Sender recovery was the first bottleneck: reth recovers
+signatures on rayon from every worker at once, and a profile of a dense
+range put 56% of CPU in crossbeam and 22% in secp256k1 before the senders
+table removed both. After it the profile is the EVM itself — interpreter
+dispatch, keccak, revm's State cache, bn254 pairings — at roughly
+1.5 Ggas/s per physical core, which is the interpreter's natural pace;
+substrate-bn in place of arkworks was 10% slower.
+
+### revmc JIT does not fit a positional witness
+
+The `jit` feature (LLVM 22.1, `LLVM_SYS_221_PREFIX`) builds revmc in and
+`--jit` compiles hot contracts in process. On 200,000 dense blocks it
+compiled 1,439 contracts and ran 16 million frames from machine code, took
+3.6× the wall time and 3.8× the CPU of the interpreter, and 84 blocks
+failed to replay: compiled code does not issue the same sequence of state
+reads as the interpreter, and a keyless witness has no way to absorb that.
+A JIT could only replay a witness that was recorded through the same JIT.
+The feature stays for that experiment; the replay path does not use it.

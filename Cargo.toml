@@ -13,6 +13,9 @@ path = "src/main.rs"
 
 [features]
 dev = []
+# revmc JIT for the replay path. Needs LLVM 22.1 at build time
+# (LLVM_SYS_221_PREFIX) and is switched on at run time with --jit.
+jit = ["reth-node-ethereum/jit"]
 
 [lints]
 rust.missing_debug_implementations = "warn"
@@ -660,3 +663,10 @@ reth-trie = { path = "../reth-patched/crates/trie/trie" }
 reth-trie-common = { path = "../reth-patched/crates/trie/common" }
 reth-trie-db = { path = "../reth-patched/crates/trie/db" }
 reth-trie-parallel = { path = "../reth-patched/crates/trie/parallel" }
+
+# revmc's main moved on to alloy-evm 0.39 / revm 43; reth 2.5.1 is on 0.38 /
+# 42, so the JIT is pinned to the last revision built against those.
+[patch."https://github.com/paradigmxyz/revmc"]
+# A copy of revmc at cf68a87f627299a9c49bcc333a8a317c9b312a3d: cargo refuses a
+# patch that names the same git source, so the pin is a path.
+revmc = { path = "../revmc-cf68a87/crates/revmc" }

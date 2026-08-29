@@ -100,6 +100,62 @@ fn get_empty_code_hash() -> B256 {
 /// that each transaction produced the right result. The receipts root covers
 /// per-transaction status, cumulative gas and logs, so a witness that fed back
 /// a wrong value shows up here even when the totals happen to line up.
+/// The EVM configuration every replay worker shares.
+///
+/// With `--jit` the revmc backend compiles in this process: reth's node
+/// configuration compiles in helper processes for the node's isolation, which
+/// a batch replay does not need, and the replay's 256 workers observe
+/// contract calls far faster than the node's default event channel drains,
+/// so the channel and the drain are sized to keep the hotness counts honest.
+/// Nothing is evicted during the run; the resident budget is the only cap.
+#[cfg(feature = "jit")]
+fn replay_evm_config(
+    chain_spec: Arc<ChainSpec>,
+    jit: &reth_node_core::args::JitArgs,
+) -> eyre::Result<EthEvmConfig<ChainSpec, reth_evm_ethereum::factory::RethEvmFactory>> {
+    use reth_evm_ethereum::factory::{JitBackend, JitMode, RethEvmFactory, RuntimeConfig, RuntimeTuning};
+    if !jit.enabled {
+        return Ok(EthEvmConfig::new_with_evm_factory(chain_spec, RethEvmFactory::disabled()));
+    }
+    let defaults = RuntimeTuning::default();
+    let tuning = RuntimeTuning {
+        channel_capacity: jit.channel_capacity.max(1 << 20),
+        max_events_per_drain: 1 << 20,
+        event_drain_interval: Duration::from_millis(10),
+        jit_hot_threshold: jit.hot_threshold,
+        jit_max_bytecode_len: jit.max_bytecode_len,
+        jit_max_pending_jobs: jit.max_pending_jobs,
+        jit_worker_count: jit.worker_count.unwrap_or(32),
+        resident_code_cache_bytes: jit.code_cache_bytes,
+        idle_evict_duration: None,
+        ..defaults
+    };
+    let config = RuntimeConfig {
+        enabled: true,
+        tuning,
+        debug_assertions: jit.debug,
+        blocking: jit.blocking,
+        jit_mode: JitMode::InProcess,
+        ..RuntimeConfig::default()
+    };
+    let backend = JitBackend::new(config)?;
+    info!(
+        hot_threshold = jit.hot_threshold,
+        workers = jit.worker_count.unwrap_or(32),
+        "revmc JIT compiles hot contracts in process"
+    );
+    Ok(EthEvmConfig::new_with_evm_factory(chain_spec, RethEvmFactory::new(backend)).with_jit_support())
+}
+
+#[cfg(not(feature = "jit"))]
+fn replay_evm_config(
+    chain_spec: Arc<ChainSpec>,
+    jit: &reth_node_core::args::JitArgs,
+) -> eyre::Result<EthEvmConfig<ChainSpec, reth_evm_ethereum::factory::RethEvmFactory>> {
+    let (config, _) = reth_node_ethereum::node::build_evm_config(chain_spec, jit, None)?;
+    Ok(config)
+}
+
 fn verify_against_header(
     chain_spec: &ChainSpec,
     block: &RecoveredBlock<reth_ethereum_primitives::Block>,
@@ -221,6 +277,12 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// signature.
     #[arg(long)]
     senders_dir: Option<PathBuf>,
+
+    /// revmc JIT: `--jit` compiles hot contracts to machine code on
+    /// background workers and runs the compiled code from then on. Only
+    /// available in a binary built with the `jit` feature.
+    #[command(flatten)]
+    jit: reth_node_core::args::JitArgs,
     /// Record the witness by executing forward from genesis, keeping the plain
     /// state in this directory, instead of reading historical state from reth.
     ///
@@ -2549,6 +2611,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
         // 提前获取 chain_spec，避免在线程中重复调用（可能有锁）
         let chain_spec = provider_factory.chain_spec();
+        // One EVM configuration for every worker: with `--jit` it owns the
+        // revmc backend and its resident map of compiled contracts, which the
+        // workers share; without it, a thin wrapper over the plain factory.
+        let shared_evm_config = Arc::new(replay_evm_config(chain_spec.clone(), &self.jit)?);
         let _consensus: Arc<dyn FullConsensus<EthPrimitives>> =
             Arc::new(EthBeaconConsensus::new(chain_spec.clone()));
 
@@ -3070,11 +3136,13 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             let codes_clone = codes.clone();
 
             // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
+            let shared_evm_config = shared_evm_config.clone();
             threads.push(thread::spawn(move || {
                 let thread_id = thread::current().id();
 
-                // 预先创建 EVM 配置，避免在循环中重复创建（这是线程级别的，可以复用）
-                let evm_config = EthEvmConfig::ethereum(chain_spec.clone());
+                // The shared configuration; `ConfigureEvm` is implemented for
+                // the `Arc`, so nothing downstream changes.
+                let evm_config = shared_evm_config;
 
                 // 性能关键优化：在 worker 线程开始时只调用一次 history_by_block_number
                 // 而不是在每个 task 中调用（避免大量数据库查询）
@@ -4332,6 +4400,20 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             thread::sleep(Duration::from_secs(1));
             if let Some(resolver) = code_resolver.as_ref() {
                 info!(?resolver, "Code resolution");
+            }
+            #[cfg(feature = "jit")]
+            if self.jit.enabled {
+                let stats = shared_evm_config.executor_factory.evm_factory().backend().stats();
+                info!(
+                    hits = stats.lookup_hits,
+                    misses = stats.lookup_misses,
+                    resident = stats.resident_entries,
+                    compiled = stats.compilations_succeeded,
+                    failed = stats.compilations_failed,
+                    code_mib = stats.jit_code_bytes / (1024 * 1024),
+                    dropped_events = stats.events_dropped,
+                    "JIT"
+                );
             }
             info!("EVM command completed successfully");
         }

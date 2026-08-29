@@ -309,7 +309,9 @@ impl CodeMdbx {
 pub(super) struct CodeResolver {
     by_address: Option<Arc<AddressCodes>>,
     mdbx: Option<Arc<CodeMdbx>>,
-    cache: dashmap::DashMap<B256, Bytecode>,
+    /// Keyed by a hash already, so the map hashes with alloy's fast hasher
+    /// rather than SipHash: this is read on every contract account.
+    cache: dashmap::DashMap<B256, Bytecode, alloy_primitives::map::DefaultHashBuilder>,
     hits: std::sync::atomic::AtomicU64,
     misses: std::sync::atomic::AtomicU64,
     mdbx_hits: std::sync::atomic::AtomicU64,
@@ -332,7 +334,7 @@ impl CodeResolver {
         Self {
             by_address,
             mdbx,
-            cache: dashmap::DashMap::new(),
+            cache: dashmap::DashMap::with_hasher(Default::default()),
             hits: Default::default(),
             misses: Default::default(),
             mdbx_hits: Default::default(),
@@ -405,8 +407,11 @@ impl CodeResolver {
 const LOCAL_CODES_CAPACITY: usize = 8192;
 
 thread_local! {
-    static LOCAL_CODES: std::cell::RefCell<std::collections::HashMap<B256, Bytecode>> =
-        std::cell::RefCell::new(std::collections::HashMap::with_capacity(LOCAL_CODES_CAPACITY));
+    static LOCAL_CODES: std::cell::RefCell<alloy_primitives::map::B256Map<Bytecode>> =
+        std::cell::RefCell::new(alloy_primitives::map::B256Map::with_capacity_and_hasher(
+            LOCAL_CODES_CAPACITY,
+            Default::default(),
+        ));
 }
 
 pub(super) struct ExternalSourceDatabase<DB> {

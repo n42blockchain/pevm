@@ -1075,6 +1075,10 @@ impl<DB: RevmDatabase<Error = ProviderError>> RevmDatabase for WitnessReplayData
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let _ = (address, index);
         match self.next_value() {
+            // A record longer than a word is not a storage value: the read
+            // sequence has drifted from the recording. An error, never a
+            // panic — the read may be on a frame that cannot unwind.
+            Some(value) if value.len() > 32 => Err(self.unavailable("malformed storage record")),
             Some(value) => Ok(U256::from_be_slice(value)),
             None => Err(self.unavailable("witness ran out on a storage read")),
         }

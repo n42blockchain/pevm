@@ -24,7 +24,7 @@ pub use logged_db::{
     LogExecutionStats,
 };
 pub use state_log::{MmapStateLogDatabase, MmapStateLogReader};
-use codes_freezer::{CodesFreezer, ExternalSourceDatabase};
+use codes_freezer::{AddressCodes, CodeMdbx, CodeResolver, CodesFreezer, ExternalSourceDatabase};
 use plain_state::PlainStateStore;
 
 /// Blocks per state commit while recording forward.
@@ -209,6 +209,12 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// `Bytecodes` table (the directory holding `codes.hoff`).
     #[arg(long, alias = "codes-dir")]
     codes_dir: Option<PathBuf>,
+
+    /// gov5's code MDBX (its `Code` table, code hash → bytecode): the fallback
+    /// for code an address-indexed codes freezer does not resolve, such as a
+    /// contract redeployed with different code.
+    #[arg(long)]
+    code_mdbx: Option<PathBuf>,
     /// Record the witness by executing forward from genesis, keeping the plain
     /// state in this directory, instead of reading historical state from reth.
     ///
@@ -2545,7 +2551,12 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
         // 性能修复：限制 provider 的生命周期，避免长时间持有读事务
         // 只用来获取 last_block_number，获取后立即释放
-        let last = {
+        // With an ancient store the blocks come from there and the database
+        // may be an empty one made by `init`; the store's own range is checked
+        // when it is opened.
+        let last = if self.geth_ancient_dir.is_some() {
+            u64::MAX
+        } else {
             let provider = provider_factory.provider()?;
             provider.last_block_number()?
         }; // provider 在这里被 drop，释放读事务
@@ -2712,7 +2723,32 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             None => None,
         };
 
+        // An address-indexed codes freezer resolves code per account as the
+        // witness is read; the content-addressed one answers code_by_hash.
+        let code_resolver = match self.codes_dir.as_deref() {
+            Some(directory) if AddressCodes::is_present(directory) => {
+                let by_address = AddressCodes::open(directory)?;
+                info!(
+                    contracts = by_address.entries(),
+                    path = %directory.display(),
+                    "Reading contract code from the address-indexed codes freezer"
+                );
+                let mdbx = match self.code_mdbx.as_deref() {
+                    Some(directory) => {
+                        info!(path = %directory.display(), "Falling back to the code MDBX for redeployed contracts");
+                        Some(Arc::new(CodeMdbx::open(directory)?))
+                    }
+                    None => None,
+                };
+                Some(Arc::new(CodeResolver::new(Some(Arc::new(by_address)), mdbx)))
+            }
+            _ => match self.code_mdbx.as_deref() {
+                Some(directory) => Some(Arc::new(CodeResolver::new(None, Some(Arc::new(CodeMdbx::open(directory)?))))),
+                None => None,
+            },
+        };
         let codes = match self.codes_dir.as_deref() {
+            Some(directory) if code_resolver.is_some() && AddressCodes::is_present(directory) => None,
             Some(directory) => {
                 let freezer = CodesFreezer::open(directory)?;
                 info!(
@@ -3020,6 +3056,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             let witness_replay_thread = witness_replay;
             let verify_blocks = self.verify;
             let geth_blocks_clone = geth_blocks.clone();
+            let code_resolver_clone = code_resolver.clone();
             let state_overrides_clone = state_overrides.clone();
             let codes_clone = codes.clone();
 
@@ -3282,6 +3319,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         );
                                         let (replay_db, cursor) =
                                             WitnessReplayDatabase::new(sourced, witness);
+                                        let replay_db = replay_db.with_codes(code_resolver_clone.clone());
                                         let executor = evm_config.batch_executor(replay_db);
                                         let output = executor.execute(block)?;
                                         verify_against_header(&chain_spec, block, &output.result, "replayed")?;
@@ -4270,6 +4308,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             info!("EVM command stopped by user");
         } else {
             thread::sleep(Duration::from_secs(1));
+            if let Some(resolver) = code_resolver.as_ref() {
+                info!(?resolver, "Code resolution");
+            }
             info!("EVM command completed successfully");
         }
 

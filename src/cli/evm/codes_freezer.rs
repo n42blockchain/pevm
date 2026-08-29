@@ -141,6 +141,239 @@ fn map_data_files(directory: &Path) -> Result<Vec<memmap2::Mmap>> {
 /// archive for them. With both external sources present, `inner` is only
 /// reached when a lookup misses - which for a store that covers the range
 /// being replayed should not happen.
+
+/// Codes freezer with gov5's 20-byte-key index: `codes.cidx` carries the
+/// `NCIX` header with the "address index" flag and 26-byte entries
+/// `key ‖ file (u16 BE) ‖ offset (u32 BE)`, sorted by key; each item is one
+/// zstd frame in `codes.NNNN.cdat`. The flag's name is historical: exported
+/// from reth's `Bytecodes` table, as the production input set on this host
+/// was, `code-import2fz` writes the first 20 bytes of the *code hash* as the
+/// key (`copy(a[:], k[:20])`), so the lookup is by hash prefix and
+/// `keccak(code) == code_hash` settles a prefix collision or a stale entry;
+/// a miss falls through to the code MDBX.
+pub(super) struct AddressCodes {
+    index: memmap2::Mmap,
+    entries: usize,
+    data: Vec<memmap2::Mmap>,
+}
+
+const NCIX_HEADER: usize = 16;
+const NCIX_FLAG_ADDR_INDEX: u8 = 0x08;
+const ADDR_ENTRY_SIZE: usize = 26;
+
+impl std::fmt::Debug for AddressCodes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AddressCodes")
+            .field("entries", &self.entries)
+            .field("data_files", &self.data.len())
+            .finish()
+    }
+}
+
+impl AddressCodes {
+    /// Whether `directory` holds an address-indexed `codes.cidx`.
+    pub(super) fn is_present(directory: &Path) -> bool {
+        let path = directory.join("codes.cidx");
+        let Ok(mut file) = fs::File::open(path) else { return false };
+        let mut header = [0u8; NCIX_HEADER];
+        std::io::Read::read_exact(&mut file, &mut header).is_ok()
+            && &header[..4] == b"NCIX"
+            && header[5] & NCIX_FLAG_ADDR_INDEX != 0
+    }
+
+    pub(super) fn open(directory: &Path) -> Result<Self> {
+        let path = directory.join("codes.cidx");
+        let file = fs::File::open(&path).wrap_err_with(|| format!("failed to open {}", path.display()))?;
+        let index = unsafe { memmap2::Mmap::map(&file) }
+            .wrap_err_with(|| format!("failed to map {}", path.display()))?;
+        if index.len() < NCIX_HEADER || &index[..4] != b"NCIX" {
+            eyre::bail!("{} is not an NCIX index", path.display())
+        }
+        let (version, flags, entry_size) = (index[4], index[5], index[7] as usize);
+        if version != 1 || flags & NCIX_FLAG_ADDR_INDEX == 0 || entry_size != ADDR_ENTRY_SIZE {
+            eyre::bail!(
+                "{} is not an address index (version {version}, flags {flags:#x}, entry size {entry_size})",
+                path.display()
+            )
+        }
+        let body = index.len() - NCIX_HEADER;
+        if body % ADDR_ENTRY_SIZE != 0 {
+            eyre::bail!("{} ends with a partial entry", path.display())
+        }
+        let entries = body / ADDR_ENTRY_SIZE;
+        let data = map_data_files(directory)?;
+        Ok(Self { index, entries, data })
+    }
+
+    pub(super) const fn entries(&self) -> usize {
+        self.entries
+    }
+
+    fn entry(&self, position: usize) -> &[u8] {
+        let start = NCIX_HEADER + position * ADDR_ENTRY_SIZE;
+        &self.index[start..start + ADDR_ENTRY_SIZE]
+    }
+
+    /// The code stored under the first 20 bytes of `code_hash`, unverified;
+    /// `None` when there is no entry.
+    pub(super) fn code_by_hash_prefix(&self, code_hash: B256) -> Result<Option<Vec<u8>>> {
+        let key = &code_hash.as_slice()[..20];
+        let (mut low, mut high) = (0usize, self.entries);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            match self.entry(middle)[..20].cmp(key) {
+                std::cmp::Ordering::Less => low = middle + 1,
+                std::cmp::Ordering::Greater => high = middle,
+                std::cmp::Ordering::Equal => {
+                    let entry = self.entry(middle);
+                    let file_number = u16::from_be_bytes(entry[20..22].try_into().unwrap());
+                    let offset = u32::from_be_bytes(entry[22..26].try_into().unwrap()) as usize;
+                    let Some(mapped) = self.data.get(file_number as usize) else {
+                        eyre::bail!("codes data file {file_number} is missing")
+                    };
+                    if offset >= mapped.len() {
+                        eyre::bail!("codes entry for {code_hash:?} points past file {file_number}")
+                    }
+                    // One zstd frame per item and no stored length: the
+                    // decoder stops at the frame's end.
+                    let mut decoder = zstd::stream::read::Decoder::with_buffer(&mapped[offset..])
+                        .wrap_err("bad zstd frame in the codes freezer")?;
+                    let mut decoder = decoder.single_frame();
+                    let mut code = Vec::new();
+                    std::io::Read::read_to_end(&mut decoder, &mut code)
+                        .wrap_err_with(|| format!("bad zstd frame for {code_hash:?}"))?;
+                    return Ok(Some(code))
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// gov5's `Code` table (code hash → bytecode) in its own MDBX, the fallback
+/// for a code the address index does not resolve.
+pub(super) struct CodeMdbx {
+    /// One read transaction for the process, taken under a lock: the table
+    /// never changes, lookups are rare (only redeployed contracts get here),
+    /// and a transaction per lookup from every worker exhausts the reader
+    /// slots the environment was created with.
+    txn: std::sync::Mutex<reth_libmdbx::Transaction<reth_libmdbx::RO>>,
+    dbi: reth_libmdbx::ffi::MDBX_dbi,
+    _env: reth_libmdbx::Environment,
+}
+
+impl std::fmt::Debug for CodeMdbx {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("CodeMdbx").finish()
+    }
+}
+
+impl CodeMdbx {
+    pub(super) fn open(directory: &Path) -> Result<Self> {
+        let env = reth_libmdbx::Environment::builder()
+            .set_flags(reth_libmdbx::EnvironmentFlags {
+                mode: reth_libmdbx::Mode::ReadOnly,
+                accede: true,
+                no_rdahead: true,
+                ..Default::default()
+            })
+            .set_max_dbs(256)
+            .open(directory)
+            .wrap_err_with(|| format!("failed to open the code MDBX at {}", directory.display()))?;
+        let txn = env.begin_ro_txn()?;
+        let dbi = txn
+            .open_db(Some("Code"))
+            .wrap_err("the code MDBX has no `Code` table")?
+            .dbi();
+        Ok(Self {
+            txn: std::sync::Mutex::new(txn),
+            dbi,
+            _env: env,
+        })
+    }
+
+    pub(super) fn code_by_hash(&self, code_hash: B256) -> Result<Option<Vec<u8>>> {
+        let txn = self.txn.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(txn.get::<Vec<u8>>(self.dbi, code_hash.as_slice())?)
+    }
+}
+
+/// Resolves the code of an account whose witness record names only the code
+/// hash: the cache first, then the address index (checked against the hash),
+/// then the code MDBX. Shared by every worker.
+pub(super) struct CodeResolver {
+    by_address: Option<Arc<AddressCodes>>,
+    mdbx: Option<Arc<CodeMdbx>>,
+    cache: dashmap::DashMap<B256, Bytecode>,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+    mdbx_hits: std::sync::atomic::AtomicU64,
+}
+
+impl std::fmt::Debug for CodeResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CodeResolver")
+            .field("cached", &self.cache.len())
+            .field("hits", &self.hits.load(std::sync::atomic::Ordering::Relaxed))
+            .field("misses", &self.misses.load(std::sync::atomic::Ordering::Relaxed))
+            .field("mdbx_hits", &self.mdbx_hits.load(std::sync::atomic::Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl CodeResolver {
+    pub(super) fn new(by_address: Option<Arc<AddressCodes>>, mdbx: Option<Arc<CodeMdbx>>) -> Self {
+        Self {
+            by_address,
+            mdbx,
+            cache: dashmap::DashMap::new(),
+            hits: Default::default(),
+            misses: Default::default(),
+            mdbx_hits: Default::default(),
+        }
+    }
+
+    /// Code for the account at `address` whose hash is `code_hash`; `None`
+    /// when no source has it. The address is not needed by the sources this
+    /// host has, but a true address index would be.
+    pub(super) fn code_for(&self, address: Address, code_hash: B256) -> Result<Option<Bytecode>> {
+        let _ = address;
+        self.by_hash(code_hash)
+    }
+
+    /// Code by hash: the cache, the freezer, then the code MDBX.
+    pub(super) fn by_hash(&self, code_hash: B256) -> Result<Option<Bytecode>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some(code) = self.cache.get(&code_hash) {
+            self.hits.fetch_add(1, Relaxed);
+            return Ok(Some(code.clone()))
+        }
+        self.misses.fetch_add(1, Relaxed);
+        if let Some(codes) = self.by_address.as_ref() {
+            if let Some(code) = codes.code_by_hash_prefix(code_hash)? {
+                if keccak256(&code) == code_hash {
+                    return Ok(Some(self.remember(code_hash, code)))
+                }
+            }
+        }
+        if let Some(mdbx) = self.mdbx.as_ref() {
+            if let Some(code) = mdbx.code_by_hash(code_hash)? {
+                self.mdbx_hits.fetch_add(1, Relaxed);
+                return Ok(Some(self.remember(code_hash, code)))
+            }
+        }
+        Ok(None)
+    }
+
+    fn remember(&self, code_hash: B256, code: Vec<u8>) -> Bytecode {
+        let bytecode = Bytecode::new_raw(code.into());
+        self.cache.insert(code_hash, bytecode.clone());
+        bytecode
+    }
+}
+
 pub(super) struct ExternalSourceDatabase<DB> {
     inner: DB,
     codes: Option<Arc<CodesFreezer>>,

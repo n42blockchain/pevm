@@ -170,14 +170,25 @@ pub(super) struct GethBlockSource {
     headers: GethFreezerTable,
     bodies: GethFreezerTable,
     /// Canonical hashes, so BLOCKHASH does not need a state provider either.
-    hashes: GethFreezerTable,
+    /// A store copied without its `hashes` table (headers and bodies are all
+    /// a replay needs) has them computed from the headers instead.
+    hashes: Option<GethFreezerTable>,
 }
 
 impl GethBlockSource {
     pub(super) fn open(directory: &Path) -> Result<Self> {
         let headers = GethFreezerTable::open(directory, "headers")?;
         let bodies = GethFreezerTable::open(directory, "bodies")?;
-        let hashes = GethFreezerTable::open(directory, "hashes")?;
+        let hashes = match GethFreezerTable::open(directory, "hashes") {
+            Ok(table) => Some(table),
+            Err(error) => {
+                tracing::info!(
+                    %error,
+                    "no hashes table in the ancient store; block hashes are computed from the headers"
+                );
+                None
+            }
+        };
         if headers.items() != bodies.items() {
             eyre::bail!(
                 "ancient store is inconsistent: {} headers but {} bodies",
@@ -194,7 +205,12 @@ impl GethBlockSource {
 
     /// Canonical hash of `number`, for the BLOCKHASH opcode.
     pub(super) fn block_hash(&self, number: u64) -> Result<B256> {
-        let raw = self.hashes.get(number)?;
+        let Some(hashes) = self.hashes.as_ref() else {
+            // The hash of a block is the hash of its header's RLP, which the
+            // headers table holds verbatim.
+            return Ok(alloy_primitives::keccak256(self.headers.get(number)?));
+        };
+        let raw = hashes.get(number)?;
         if raw.len() != 32 {
             eyre::bail!("hash for block {} is {} bytes, not 32", number, raw.len())
         }

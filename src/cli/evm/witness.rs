@@ -863,6 +863,17 @@ impl WitnessBatchCache {
 /// from and report a clean run, so the read fails instead and the caller
 /// decides what to do with the block.
 #[derive(Debug)]
+struct CodeResolveFailed(String);
+
+impl fmt::Display for CodeResolveFailed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CodeResolveFailed {}
+
+#[derive(Debug)]
 struct WitnessUnavailable {
     reason: &'static str,
     position: usize,
@@ -891,6 +902,9 @@ impl std::error::Error for WitnessUnavailable {}
 pub(super) struct WitnessReplayDatabase<'a, DB> {
     inner: DB,
     stream: &'a [u8],
+    /// Attaches an account's code as the account is read, by address, so the
+    /// executor never has to look code up by hash alone.
+    codes: Option<Arc<super::codes_freezer::CodeResolver>>,
     /// Shared with the caller: the executor consumes the database, so how far
     /// the witness was read has to outlive it.
     position: WitnessCursor,
@@ -930,10 +944,19 @@ impl<'a, DB> WitnessReplayDatabase<'a, DB> {
             Self {
                 inner,
                 stream,
+                codes: None,
                 position: position.clone(),
             },
             position,
         )
+    }
+
+    pub(super) fn with_codes(
+        mut self,
+        codes: Option<Arc<super::codes_freezer::CodeResolver>>,
+    ) -> Self {
+        self.codes = codes;
+        self
     }
 
     /// Reads the next `[len][value]` record, or `None` once the witness ends.
@@ -960,13 +983,24 @@ impl<DB: RevmDatabase<Error = ProviderError>> RevmDatabase for WitnessReplayData
     type Error = ProviderError;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let _ = address;
         match self.next_value() {
             // An absent account was recorded as a zero-length value; an account
             // that exists always carries at least its field-bits byte.
             Some([]) => Ok(None),
             Some(value) => match decode_account_v2(value) {
-                Some(account) => Ok(Some(account)),
+                Some(mut account) => {
+                    // The record names the code hash; the code itself comes
+                    // by address, which only this read knows.
+                    if account.code_hash != alloy_primitives::KECCAK256_EMPTY {
+                        if let Some(codes) = self.codes.as_ref() {
+                            account.code =
+                                codes.code_for(address, account.code_hash).map_err(|error| {
+                                    ProviderError::other(CodeResolveFailed(error.to_string()))
+                                })?;
+                        }
+                    }
+                    Ok(Some(account))
+                }
                 None => Err(self.unavailable("malformed account record")),
             },
             None => Err(self.unavailable("witness ran out on an account read")),
@@ -974,6 +1008,15 @@ impl<DB: RevmDatabase<Error = ProviderError>> RevmDatabase for WitnessReplayData
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        if let Some(codes) = self.codes.as_ref() {
+            match codes.by_hash(code_hash) {
+                Ok(Some(code)) => return Ok(code),
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(ProviderError::other(CodeResolveFailed(error.to_string())))
+                }
+            }
+        }
         self.inner.code_by_hash(code_hash)
     }
 

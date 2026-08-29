@@ -14,6 +14,7 @@ mod codes_freezer;
 mod plain_state;
 mod recsplit;
 mod geth_freezer;
+mod heat;
 mod state_log;
 mod state_override;
 mod trace;
@@ -277,6 +278,12 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// signature.
     #[arg(long)]
     senders_dir: Option<PathBuf>,
+
+    /// Write contract heat — calls, inclusive gas and the block span of every
+    /// contract whose code ran, by bytecode address, hottest first — to this
+    /// CSV at the end of a witness replay.
+    #[arg(long)]
+    contract_heat: Option<PathBuf>,
 
     /// revmc JIT: `--jit` compiles hot contracts to machine code on
     /// background workers and runs the compiled code from then on. Only
@@ -2615,6 +2622,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         // revmc backend and its resident map of compiled contracts, which the
         // workers share; without it, a thin wrapper over the plain factory.
         let shared_evm_config = Arc::new(replay_evm_config(chain_spec.clone(), &self.jit)?);
+        let contract_heat: Option<Arc<Mutex<heat::HeatMap>>> = self
+            .contract_heat
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(heat::HeatMap::new())));
         let _consensus: Arc<dyn FullConsensus<EthPrimitives>> =
             Arc::new(EthBeaconConsensus::new(chain_spec.clone()));
 
@@ -3137,6 +3148,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
             // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
             let shared_evm_config = shared_evm_config.clone();
+            let contract_heat_clone = contract_heat.clone();
             threads.push(thread::spawn(move || {
                 let thread_id = thread::current().id();
 
@@ -3182,6 +3194,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
                 // Witness 回放：线程本地的批次缓存与失败计数（跨 task 复用）
                 let mut witness_batch_cache = WitnessBatchCache::default();
+                // Contract heat, when asked for: this worker's share, merged
+                // into the shared map once its tasks are done.
+                let mut heat_local = heat::HeatMap::new();
+                let heat_wanted = contract_heat_clone.is_some();
                 let witness_failures = Arc::new(AtomicUsize::new(0));
 
                 // 无锁模式：使用预分配的任务迭代器
@@ -3405,13 +3421,18 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         let mut state = crate::revm::State::builder()
                                             .with_database(replay_db)
                                             .build();
-                                        let evm = evm_config.evm_with_env(
-                                            &mut state,
-                                            evm_config.evm_env(block.sealed_block().header())?,
-                                        );
+                                        let evm_env = evm_config.evm_env(block.sealed_block().header())?;
                                         let ctx = evm_config.context_for_block(block.sealed_block())?;
-                                        let executor = evm_config.create_executor(evm, ctx);
-                                        let result = executor.execute_block(block.transactions_recovered())?;
+                                        let result = if heat_wanted {
+                                            let inspector = heat::HeatInspector::new(&mut heat_local, block_number);
+                                            let evm = evm_config.evm_with_env_and_inspector(&mut state, evm_env, inspector);
+                                            let executor = evm_config.create_executor(evm, ctx);
+                                            executor.execute_block(block.transactions_recovered())?
+                                        } else {
+                                            let evm = evm_config.evm_with_env(&mut state, evm_env);
+                                            let executor = evm_config.create_executor(evm, ctx);
+                                            executor.execute_block(block.transactions_recovered())?
+                                        };
                                         verify_against_header(&chain_spec, block, &result, "replayed")?;
                                         // Running out of witness is caught by the
                                         // database; bytes left over are the same
@@ -4076,6 +4097,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                     }
                 }
 
+                if let Some(shared) = contract_heat_clone.as_ref() {
+                    let mut total = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    heat::merge(&mut total, &heat_local);
+                }
+
                 // Replay never reads state from the database, so a failure here
                 // means the witness no longer matches the execution it was
                 // recorded from. Those blocks were skipped, not quietly patched.
@@ -4400,6 +4426,12 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             thread::sleep(Duration::from_secs(1));
             if let Some(resolver) = code_resolver.as_ref() {
                 info!(?resolver, "Code resolution");
+            }
+            if let (Some(path), Some(shared)) = (self.contract_heat.as_deref(), contract_heat.as_ref()) {
+                let total = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let calls: u64 = total.values().map(|heat| heat.calls).sum();
+                heat::write_csv(path, &total)?;
+                info!(contracts = total.len(), calls, path = %path.display(), "Contract heat written");
             }
             #[cfg(feature = "jit")]
             if self.jit.enabled {

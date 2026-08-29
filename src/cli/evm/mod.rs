@@ -2616,6 +2616,15 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             if witness_replay {
                 eyre::bail!("--state-dir records a witness; it cannot be combined with --use-witness")
             }
+            // Forward recording derives state by executing, so it never consults
+            // the history index an override exists to correct. Applying one here
+            // would replace a value this mode computed correctly with an
+            // externally asserted one.
+            if self.state_overrides.is_some() {
+                eyre::bail!(
+                    "--state-overrides corrects historical lookups; --state-dir builds state by                      executing forward and does not perform any"
+                )
+            }
             let blocks = match self.geth_ancient_dir.as_deref() {
                 Some(directory) => Some(Arc::new(GethBlockSource::open(directory)?)),
                 None => None,

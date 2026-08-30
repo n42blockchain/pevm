@@ -78,3 +78,17 @@ cd vendor/alloy-evm && git apply ../../patches/alloy-evm-0.38.0-deterministic-or
 The DAO fork refund (block 1920000) is applied by alloy-evm during
 post-execution, while gov5 applies it in `internal/consensus/misc/dao.go`.
 Only that one block is affected; it has not been compared byte for byte.
+
+## revmc-cf68a87-runtime.patch
+
+Applied to the copy of revmc at `../revmc-cf68a87` (revision
+cf68a87f627299a9c49bcc333a8a317c9b312a3d, the last one on alloy-evm 0.38 /
+revm 42) that the `jit` feature builds against:
+
+- `RuntimeTuning::observe_lookups`: when `false`, a lookup no longer pushes an
+  event to the backend thread. The events feed the hotness counts; a runtime
+  whose resident map was filled ahead of time has no use for them, and with
+  256 execution threads the bounded event queue was 53% of all CPU.
+- Artifacts are `dlopen`ed with `RTLD_NOW`: a lazily bound artifact resolves
+  each builtin on its first call under glibc's global load lock.
+

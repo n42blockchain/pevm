@@ -137,6 +137,12 @@ fn replay_evm_config(
         jit_worker_count: jit.worker_count.unwrap_or(32),
         resident_code_cache_bytes: jit.code_cache_bytes,
         idle_evict_duration: None,
+        // The machine code is the point; revmc's default is LLVM -O2.
+        // Everything that will ever be compiled is compiled up front; the
+        // lookup events only feed hotness counts nobody reads.
+        observe_lookups: jit.hot_threshold < 1_000_000_000,
+        jit_opt_level: revmc::OptimizationLevel::Aggressive,
+        aot_opt_level: revmc::OptimizationLevel::Aggressive,
         ..defaults
     };
     let config = RuntimeConfig {

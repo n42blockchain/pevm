@@ -1,0 +1,103 @@
+diff -ru /home/n42/.cargo/git/checkouts/revmc-a025a14c10e51806/cf68a87/crates/revmc-runtime/src/runtime/backend.rs /home/n42/src/n42/revmc-cf68a87/crates/revmc-runtime/src/runtime/backend.rs
+--- /home/n42/.cargo/git/checkouts/revmc-a025a14c10e51806/cf68a87/crates/revmc-runtime/src/runtime/backend.rs	2026-08-23 10:49:31.714185060 +0000
++++ /home/n42/src/n42/revmc-cf68a87/crates/revmc-runtime/src/runtime/backend.rs	2026-08-30 04:37:51.685141564 +0000
+@@ -405,7 +405,7 @@
+         match store.load(&artifact_key) {
+             Ok(Some(stored)) => {
+                 match (|| -> eyre::Result<CompiledProgram> {
+-                    let library = unsafe { libloading::Library::new(&stored.dylib_path) }
++                    let library = unsafe { super::open_artifact(&stored.dylib_path) }
+                         .map_err(|e| eyre::eyre!("dlopen {:?}: {e}", stored.dylib_path))?;
+                     let func: EvmCompilerFn = unsafe {
+                         let sym: libloading::Symbol<'_, EvmCompilerFn> =
+@@ -652,7 +652,7 @@
+             match store.load(&artifact_key) {
+                 Ok(Some(stored)) => {
+                     match (|| -> eyre::Result<CompiledProgram> {
+-                        let library = unsafe { libloading::Library::new(&stored.dylib_path) }
++                        let library = unsafe { super::open_artifact(&stored.dylib_path) }
+                             .map_err(|e| eyre::eyre!("dlopen {:?}: {e}", stored.dylib_path))?;
+                         let func: EvmCompilerFn = unsafe {
+                             let sym: libloading::Symbol<'_, EvmCompilerFn> =
+diff -ru /home/n42/.cargo/git/checkouts/revmc-a025a14c10e51806/cf68a87/crates/revmc-runtime/src/runtime/config.rs /home/n42/src/n42/revmc-cf68a87/crates/revmc-runtime/src/runtime/config.rs
+--- /home/n42/.cargo/git/checkouts/revmc-a025a14c10e51806/cf68a87/crates/revmc-runtime/src/runtime/config.rs	2026-08-23 10:49:31.714279010 +0000
++++ /home/n42/src/n42/revmc-cf68a87/crates/revmc-runtime/src/runtime/config.rs	2026-08-30 04:22:34.669531936 +0000
+@@ -253,6 +253,16 @@
+     /// Defaults to `8`.
+     pub jit_hot_threshold: usize,
+ 
++    /// Whether lookups report themselves to the backend thread as events.
++    ///
++    /// The events feed the hotness counts that promote a key to compilation.
++    /// A runtime whose resident map was filled ahead of time and that compiles
++    /// nothing more has no use for them, and with hundreds of execution
++    /// threads the bounded event queue is the hottest lock in the process.
++    ///
++    /// Defaults to `true`.
++    pub observe_lookups: bool,
++
+     /// Maximum bytecode length eligible for compilation. `0` = no limit.
+     ///
+     /// Defaults to `24 KiB`.
+@@ -358,6 +368,7 @@
+             event_drain_interval: Duration::from_millis(100),
+             shutdown_timeout: Duration::from_secs(5),
+             jit_hot_threshold: 8,
++            observe_lookups: true,
+             jit_max_bytecode_len: DEFAULT_JIT_MAX_BYTECODE_LEN,
+             jit_max_pending_jobs: 2048,
+             jit_worker_count: worker_count,
+diff -ru /home/n42/.cargo/git/checkouts/revmc-a025a14c10e51806/cf68a87/crates/revmc-runtime/src/runtime/mod.rs /home/n42/src/n42/revmc-cf68a87/crates/revmc-runtime/src/runtime/mod.rs
+--- /home/n42/.cargo/git/checkouts/revmc-a025a14c10e51806/cf68a87/crates/revmc-runtime/src/runtime/mod.rs	2026-08-23 10:49:31.714412940 +0000
++++ /home/n42/src/n42/revmc-cf68a87/crates/revmc-runtime/src/runtime/mod.rs	2026-08-30 04:37:51.678813485 +0000
+@@ -25,6 +25,26 @@
+ };
+ use worker::SyncNotifier;
+ 
++
++/// Opens an artifact with every symbol bound at load. A lazily bound artifact
++/// resolves each builtin on its first call, and glibc records that dependency
++/// under the global load lock; with tens of thousands of artifacts and
++/// hundreds of executing threads that serialises the process on the lock.
++pub(crate) unsafe fn open_artifact(path: &std::path::Path) -> Result<libloading::Library, libloading::Error> {
++    #[cfg(unix)]
++    {
++        libloading::os::unix::Library::open(
++            Some(path),
++            libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_LOCAL,
++        )
++        .map(libloading::Library::from)
++    }
++    #[cfg(not(unix))]
++    {
++        libloading::Library::new(path)
++    }
++}
++
+ mod api;
+ pub use api::{
+     AotRequest, CompiledProgram, InterpretReason, LookupDecision, LookupRequest, ProgramKind,
+@@ -231,9 +251,11 @@
+             LookupDecision::Interpret(InterpretReason::NotReady)
+         };
+ 
+-        if let Err(_v) = shared.events.push(req) {
+-            cold_path();
+-            shared.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
++        if inner.tuning.observe_lookups {
++            if let Err(_v) = shared.events.push(req) {
++                cold_path();
++                shared.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
++            }
+         }
+ 
+         decision
+@@ -541,7 +563,7 @@
+ 
+     /// Loads a single artifact: `dlopen`s the dylib path and resolves the symbol.
+     fn load_artifact(key: &ArtifactKey, stored: &StoredArtifact) -> eyre::Result<CompiledProgram> {
+-        let library = unsafe { libloading::Library::new(&stored.dylib_path) }
++        let library = unsafe { open_artifact(&stored.dylib_path) }
+             .wrap_err_with(|| format!("dlopen {:?}", stored.dylib_path))?;
+ 
+         let func: EvmCompilerFn = unsafe {

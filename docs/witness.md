@@ -219,3 +219,48 @@ hottest first. Addresses without code are left out. Over blocks
 times, while the 10,000 hottest take 79.1% of the frames and 71.2% of the
 inclusive gas (WETH9 alone 1.53 billion frames). The tables and a summary
 sit next to the witness: `/data/witness-rust/contract-heat-20260829*`.
+
+## AOT of the hottest contracts: expected against measured
+
+The literature sets the expectation. Paradigm's revmc announcement
+([paradigm.xyz/2024/06/revmc](https://www.paradigm.xyz/2024/06/revmc))
+measured 19× on Fibonacci, 1.85–2.77× on WETH and a counter, and
+"O(1–10%) depending on the block range" on an Ethereum L1 historical sync,
+because most of L1's work is host operations a bytecode compiler cannot
+touch; BNB Chain's deep-dive
+([bnbchain.org](https://www.bnbchain.org/en/blog/a-technical-deep-dive-on-the-jit-aot-compiler-for-revm-of-bnb-chain))
+put it at 6.9× for fibonacci_255, 1.6× for a merkle hash, 1.13× for WBNB
+and 1.01× for a PancakeSwap pair read, with the speedup "inversely
+proportional to the number of stateful opcodes". Nethermind's IL-EVM
+([PR #3888](https://github.com/NethermindEth/nethermind/pull/3888),
+[PR #6985](https://github.com/NethermindEth/nethermind/pull/6985)) saw 15×
+on a spin loop and 1.0–1.7× on mixed bytecode, and neither was merged;
+megaeth's evmone-compiler
+([github](https://github.com/megaeth-labs/evmone-compiler)) is archived
+without numbers; Ipsilon's report
+([Geth vs evmone](https://notes.ethereum.org/@ipsilon/evm-performance-report-geth-vs-evmone))
+shows the spread among *interpreters* (evmone 784 Mgas/s against geth's
+161 on synthetic loops) is larger than what compilation adds on real blocks.
+Replay of Ethereum history is the state-heavy case, so the expectation for
+whole blocks is a few percent.
+
+Measured here, with the 10,000 hottest contracts of the heat table (79.1%
+of all call frames) compiled ahead of time — 8,123 distinct codes, 39,783
+(code, spec) artifacts, 3.79 GB of machine code at LLVM -O3, 10.4× the
+bytecode, 334 s to build on 128 workers — and loaded before the replay:
+
+| 20.0M–20.2M, 200,000 blocks, 3,027 Ggas | replay phase | failed blocks |
+|---|---|---|
+| interpreter | 19.0 s | 0 |
+| top-10k AOT, 74% of frames compiled | 19.0 s | 165 |
+
+The same wall time, after two fixes to the revmc runtime that the first
+attempts needed (`patches/revmc-cf68a87-runtime.patch`): every lookup
+pushed an event to the backend's bounded queue, which was 53% of CPU across
+256 threads, and each artifact was `dlopen`ed lazily, so its builtins were
+bound under glibc's global load lock. Loading 39,783 artifacts takes 51 s
+and unloading them at exit tens of seconds more, both fixed costs. The 165
+failures are the same read-order divergence as the JIT: compiled code does
+not issue the interpreter's sequence of state reads, which a positional
+witness cannot absorb. Contract heat is not the lever for this workload; the
+replay stays on the interpreter.

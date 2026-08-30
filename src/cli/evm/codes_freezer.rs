@@ -237,7 +237,7 @@ impl AddressCodes {
                     }
                     // One zstd frame per item and no stored length: the
                     // decoder stops at the frame's end.
-                    let mut decoder = zstd::stream::read::Decoder::with_buffer(&mapped[offset..])
+                    let decoder = zstd::stream::read::Decoder::with_buffer(&mapped[offset..])
                         .wrap_err("bad zstd frame in the codes freezer")?;
                     let mut decoder = decoder.single_frame();
                     let mut code = Vec::new();
@@ -396,7 +396,12 @@ impl CodeResolver {
             if local.len() >= LOCAL_CODES_CAPACITY {
                 local.clear();
             }
-            local.insert(code_hash, code.clone());
+            // A private copy: a clone would share the reference count with
+            // every other thread running the same contract, and a hot
+            // contract's count then bounces between all their caches on
+            // every account load.
+            let private = Bytecode::new_raw(alloy_primitives::Bytes::copy_from_slice(code.original_byte_slice()));
+            local.insert(code_hash, private);
         });
     }
 }

@@ -327,7 +327,9 @@ impl GethBlockSource {
         Ok(total_census)
     }
 
-    fn block(
+    /// One block, with `senders_batch` carrying the decoded senders batch
+    /// between consecutive calls.
+    pub(super) fn block(
         &self,
         number: u64,
         senders_batch: &mut Option<(u64, super::witness::DecodedBatch)>,

@@ -3222,6 +3222,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
             let shared_evm_config = shared_evm_config.clone();
             let contract_heat_clone = contract_heat.clone();
+            // Witness replay reads one block at a time from the ancient store:
+            // decoding a whole task's blocks up front holds every body of a
+            // 64-block task in memory at once, per thread, and the point of a
+            // 64-block task is that its witness batch is decoded once.
+            let lazy_blocks = witness_replay && geth_blocks.is_some();
             threads.push(thread::spawn(move || {
                 let thread_id = thread::current().id();
 
@@ -3271,6 +3276,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 // into the shared map once its tasks are done.
                 let mut heat_local = heat::HeatMap::new();
                 let heat_wanted = contract_heat_clone.is_some();
+                let mut reusable_cache = crate::revm::db::CacheState {
+                    accounts: crate::revm::primitives::HashMap::with_capacity_and_hasher(512, Default::default()),
+                    contracts: crate::revm::primitives::HashMap::with_capacity_and_hasher(64, Default::default()),
+                };
                 let witness_failures = Arc::new(AtomicUsize::new(0));
 
                 // 无锁模式：使用预分配的任务迭代器
@@ -3318,6 +3327,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                             // 使用共享的 blockchain_db（如 v1.8.4 的方式）
                             // 预先创建的 evm_config 避免重复创建
                             let blocks = match geth_blocks_clone.as_ref() {
+                                Some(_) if lazy_blocks => Vec::new(),
                                 Some(source) => source.blocks(task.start..=task.end)?,
                                 None => blockchain_db
                                     .block_with_senders_range(task.start..=task.end)?,
@@ -3459,11 +3469,24 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         )?)
                                     };
 
-                                for block in blocks.iter() {
+                                let mut senders_batch = None;
+                                let mut lazy_block;
+                                for block_number in task.start..=task.end {
                                     if should_stop_worker.load(Ordering::Relaxed) {
                                         return Ok(());
                                     }
-                                    let block_number = block.sealed_block().header().number;
+                                    let block = if lazy_blocks {
+                                        lazy_block = geth_blocks_clone
+                                            .as_ref()
+                                            .expect("lazy blocks need the ancient store")
+                                            .block(block_number, &mut senders_batch)?;
+                                        &lazy_block
+                                    } else {
+                                        match blocks.iter().find(|b| b.sealed_block().header().number == block_number) {
+                                            Some(block) => block,
+                                            None => continue,
+                                        }
+                                    };
 
                                     // A block whose witness does not replay is
                                     // reported and skipped: one bad witness must
@@ -3491,8 +3514,19 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         // updates skips the transition
                                         // bookkeeping the batch executor keeps
                                         // for a bundle nobody takes.
+                                        // Pre-sized cache: a block touches a
+                                        // few hundred accounts, and a table
+                                        // that doubles its way there rehashes
+                                        // several times per block.
+                                        // This worker's cache, emptied and
+                                        // handed back after every block: the
+                                        // tables keep their capacity and stay
+                                        // warm instead of being allocated and
+                                        // freed a few hundred entries at a time.
+                                        let prestate = std::mem::take(&mut reusable_cache);
                                         let mut state = crate::revm::State::builder()
                                             .with_database(replay_db)
+                                            .with_cached_prestate(prestate)
                                             .build();
                                         let evm_env = evm_config.evm_env(block.sealed_block().header())?;
                                         let ctx = evm_config.context_for_block(block.sealed_block())?;
@@ -3507,6 +3541,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                             executor.execute_block(block.transactions_recovered())?
                                         };
                                         verify_against_header(&chain_spec, block, &result, "replayed")?;
+                                        let mut cache = std::mem::take(&mut state.cache);
+                                        cache.clear();
+                                        reusable_cache = cache;
                                         // Running out of witness is caught by the
                                         // database; bytes left over are the same
                                         // mismatch seen from the other side, and

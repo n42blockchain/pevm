@@ -174,7 +174,8 @@ checked against its header:
 |---|---|---|---|
 | first run | 27.0 min | 396,850 s | 83,369 blocks failed: code MDBX transaction timed out; tail skipped (below) |
 | senders table, no bundle State, batch without copies, thread-local code cache | 23.9 min | 351,575 s | tail skipped: the last 889,000 blocks never ran |
-| + reader follows the index, one block at a time, reused CacheState, private code copies, `-s 64` | **23.3 min** | 350,905 s | **every block, 0 failures, 0 tasks aborted** |
+| + reader follows the index, one block at a time, reused CacheState, private code copies, `-s 64` | 23.3 min | 350,905 s | every block, 0 failures, 0 tasks aborted |
+| + one static copy of each contract's code, per-block `ReplayCache` in place of revm's `State` | **20.5 min** | 309,749 s | **every block, 0 failures, 0 tasks aborted**; peak 106 GB |
 
 The "tail skipped" runs looked clean and were not: gov5's senders table
 is appended in batches of 64 from wherever a resumed writer stood, so from
@@ -221,25 +222,58 @@ all first row. Witness replay removes the disk, not the host operations.
 ### Many threads
 
 One worker replays the 12.0M band at 2.8 Ggas/s; 16 workers at 2.79 each;
-32 at 2.30; 64 at 1.92; 128 at 1.20; 256 at 0.80 (SMT). Between 16 and
-128 threads the CPU time per block doubles (4.4 → 9.1 ms) with negligible
-system time: `perf stat` shows the same instructions per block but 49%
-more cycles (IPC 1.85 → 1.19) and no more LLC misses — each access is
-slower once every core is loading — and the all-core clock is 3.13 GHz
-against 4.16 GHz on one core. Memory latency and frequency, not locks.
+32 at 2.30; 64 at 1.92; 128 at 1.20; 256 at 0.80 (SMT). Between 8 and 128
+threads the instructions per block stay at 35M while the IPC falls from
+2.05 to 1.17, the clock only from 4.12 to 3.96 GHz, and nothing the fill
+counters see changes: demand DRAM fills 3k per block, L3 fills 22k, TLB
+misses, page faults and instruction-cache misses all flat, hardware
+prefetch traffic 0.5 MB per block, cross-CCD cache transfers zero, kernel
+time 0.2%. Pure compute (openssl sha256) scales to 128 cores at −1% per
+thread, and a pointer chase over 512 MB shows DRAM latency rising only from
+122 to 167 ns. Two independent 64-thread processes on the two halves of the
+chip finish 22% sooner than one 128-thread process on all of it, so the
+loss is inside the process, not in the silicon.
 
-What helped, at 256 threads on 200,000 blocks (CPU 2932 → 2440 s, wall
-13.0 → 12.0 s): reading one block at a time so a 64-block task holds one
-body instead of 64; reusing one `CacheState` per worker, cleared between
-blocks; private copies of hot bytecode in the per-thread cache, since a
-shared `Bytes` reference count bounces between every core running the
-same contract; and `-s 64`, which decodes each witness batch once. What
-did not: `taskset` onto physical cores, `-s 64` alone, dropping alloy's
-global keccak cache (16% slower on one thread), transparent huge pages
-set to `always` (684 MB of 18 GB anonymous memory ended up in huge pages;
-no change). The AOT path loses its single-thread gain at 32–128 threads
-for the same reason, amplified: every frame clones an `Arc` from the
-shared resident map.
+IBS sampling (no skid, with data source and latency) named it: at 128
+threads the latency-weighted memory stalls per block are ten times those
+at 8, and almost all of them are *HitM* — the line was found modified in
+another core's cache — at 1,355 cycles inside a CCX and 2,964 across CCDs
+against 67 and 436 on a quiet chip. The stalled instructions are the
+allocation and release paths of revm's `State`: `TransitionAccount` drops,
+`RawTable::drop_elements`, `load_cache_account_with`, `CacheAccount::change`.
+`State::commit` builds a `TransitionAccount` — a clone of the previous
+info and a fresh storage map — for every touched account of every
+transaction and drops it at once; the freed lines go back through the
+allocator and come to the next thread still owned by another core.
+
+Fixed by not doing it: `ReplayCache` (`src/cli/evm/replay_cache.rs`) is a
+per-block account cache that runs revm's own `AccountStatus` machine so the
+reads reaching the witness are the ones `State` would make, and commits
+without transitions; the executor is alloy-evm's `EthBlockExecutor`
+directly, whose `StateDB` bound any `Database + DatabaseCommit` satisfies.
+12.0M–12.2M at 256 threads: CPU 2394–2426 s to 1992–1999 s, wall 11.0 s to
+9.4 s; the full chain 23.3 to 20.5 minutes. Before it, sharing one static
+copy of each contract's code across threads (`Bytes::from_static` clones
+without a reference count, so a thread's private `Bytecode` can sit over
+the shared bytes) took the wall from 12.2–12.5 s to 11.0 s and 6 GB off the
+peak.
+
+Tried and measured as no gain, each against the same 200,000 blocks:
+`taskset` onto physical cores, pinning each worker to a CPU (migrations
+are 1.4 per thread per second), a thread-local keccak cache in place of
+alloy's global one, dropping that cache (16% slower on one thread, 5% at
+256), mimalloc for snmalloc (+3 GB, same time), transparent huge pages set
+to `always` (684 MB of 18 GB anonymous memory ended up in huge pages),
+`RAYON_NUM_THREADS` (rayon is not on the per-block path), and task sizes
+of 16, 256 or 1024 blocks against 64. The fixed cost of a block — the
+wrappers, the EVM, the executor, the header check — is 0.096 ms of CPU on
+near-empty blocks, under 1% of the run, so nothing is left to save by
+reusing them across a task.
+
+What remains at 256 threads is the interpreter itself and the SMT pair
+sharing a core: 128 threads on 64 cores replay as fast as 128 threads on
+128 cores, because a single thread of this workload leaves half the core
+idle on memory stalls and the sibling fills it.
 
 ### evmone instead of revm?
 

@@ -12,6 +12,7 @@ mod logged_db;
 mod profiling;
 mod codes_freezer;
 mod plain_state;
+mod replay_cache;
 mod recsplit;
 mod geth_freezer;
 mod heat;
@@ -3280,10 +3281,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                 // into the shared map once its tasks are done.
                 let mut heat_local = heat::HeatMap::new();
                 let heat_wanted = contract_heat_clone.is_some();
-                let mut reusable_cache = crate::revm::db::CacheState {
-                    accounts: crate::revm::primitives::HashMap::with_capacity_and_hasher(512, Default::default()),
-                    contracts: crate::revm::primitives::HashMap::with_capacity_and_hasher(64, Default::default()),
-                };
+                let mut reusable_cache = replay_cache::ReplayCacheStore::with_capacity(512);
                 let witness_failures = Arc::new(AtomicUsize::new(0));
 
                 // 无锁模式：使用预分配的任务迭代器
@@ -3546,25 +3544,34 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         // tables keep their capacity and stay
                                         // warm instead of being allocated and
                                         // freed a few hundred entries at a time.
-                                        let prestate = std::mem::take(&mut reusable_cache);
-                                        let mut state = crate::revm::State::builder()
-                                            .with_database(replay_db)
-                                            .with_cached_prestate(prestate)
-                                            .build();
+                                        let mut state = replay_cache::ReplayCache::new(
+                                            replay_db,
+                                            std::mem::take(&mut reusable_cache),
+                                        );
                                         let evm_env = evm_config.evm_env(block.sealed_block().header())?;
                                         let ctx = evm_config.context_for_block(block.sealed_block())?;
                                         let result = if heat_wanted {
                                             let inspector = heat::HeatInspector::new(&mut heat_local, block_number);
                                             let evm = evm_config.evm_with_env_and_inspector(&mut state, evm_env, inspector);
-                                            let executor = evm_config.create_executor(evm, ctx);
+                                            let executor = reth_evm::eth::EthBlockExecutor::new(
+                                                evm,
+                                                ctx,
+                                                evm_config.chain_spec().clone(),
+                                                reth_evm_ethereum::RethReceiptBuilder::default(),
+                                            );
                                             executor.execute_block(block.transactions_recovered())?
                                         } else {
                                             let evm = evm_config.evm_with_env(&mut state, evm_env);
-                                            let executor = evm_config.create_executor(evm, ctx);
+                                            let executor = reth_evm::eth::EthBlockExecutor::new(
+                                                evm,
+                                                ctx,
+                                                evm_config.chain_spec().clone(),
+                                                reth_evm_ethereum::RethReceiptBuilder::default(),
+                                            );
                                             executor.execute_block(block.transactions_recovered())?
                                         };
                                         verify_against_header(&chain_spec, block, &result, "replayed")?;
-                                        let mut cache = std::mem::take(&mut state.cache);
+                                        let (_, mut cache) = state.into_parts();
                                         cache.clear();
                                         reusable_cache = cache;
                                         // Running out of witness is caught by the

@@ -66,3 +66,5 @@ test_decompression.sh
 compression_report.md
 # Local build paths, machine specific
 .cargo/config.toml
+target-pgo/
+target-warm/

@@ -14,6 +14,9 @@ path = "src/main.rs"
 [features]
 # A/B against the default allocator: `--features mimalloc`.
 mimalloc = ["dep:mimalloc"]
+# GMP for the modexp precompile (needs libgmp-dev or m4): 0.1–1.4% less CPU
+# where modexp is densest (25.0M), nothing elsewhere.
+gmp = ["reth/gmp"]
 dev = []
 # revmc JIT for the replay path. Needs LLVM 22.1 at build time
 # (LLVM_SYS_221_PREFIX) and is switched on at run time with --jit.

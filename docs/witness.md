@@ -279,7 +279,8 @@ the journal's containers and the interpreter frames from block to block
 and handing the journal its emptied account table back after every
 transaction nothing (reverted); `-C target-cpu=native` nothing (sha3-asm
 already picks the scalar Keccak that is fastest on Zen 5). GMP for modexp
-is untested: `gmp-mpfr-sys` needs `libgmp-dev` or `m4`.
+(`--features gmp`): modexp is 0.03–0.6% of the CPU in most eras and 2.4%
+at 25.0M, and GMP takes 0.1–1.4% off there and 0.7% at 18.5M.
 
 What remains at 256 threads is the interpreter itself and the SMT pair
 sharing a core: 128 threads on 64 cores replay as fast as 128 threads on

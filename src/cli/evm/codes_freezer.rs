@@ -18,7 +18,8 @@ use crate::revm::{
     state::{AccountInfo, Bytecode},
     Database as RevmDatabase,
 };
-use alloy_primitives::{keccak256, Address, B256, U256};
+use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
+use crate::revm::bytecode::JumpTable;
 use eyre::{Context, Result};
 use reth_storage_errors::provider::ProviderError;
 use std::{fs, path::Path, sync::Arc};
@@ -384,10 +385,34 @@ impl CodeResolver {
     }
 
     fn remember(&self, code_hash: B256, code: Vec<u8>) -> Bytecode {
-        let bytecode = Bytecode::new_raw(code.into());
+        let bytecode = Self::shared(Bytecode::new_raw(code.into()));
         self.cache.insert(code_hash, bytecode.clone());
         Self::remember_locally(code_hash, &bytecode);
         bytecode
+    }
+
+    /// Rebuilds legacy code over leaked, static copies of its analysed bytes
+    /// and jump table. `Bytes` over static memory clones without touching a
+    /// reference count, so every thread can hold its own `Bytecode` (its own
+    /// `Arc`) over the one copy of the code: the cores of a CCD then share
+    /// that copy in L3 instead of each pulling a private one from DRAM, and
+    /// nothing shared is written when a frame clones it. The leak is bounded
+    /// by the code cache, which keeps every contract for the life of the run
+    /// anyway. Delegation designators keep their ordinary form.
+    fn shared(bytecode: Bytecode) -> Bytecode {
+        if !bytecode.is_legacy() {
+            return bytecode;
+        }
+        let Some(jump_table) = bytecode.legacy_jump_table() else {
+            return bytecode;
+        };
+        let original_len = bytecode.original_byte_slice().len();
+        let bytes: &'static [u8] = Box::leak(bytecode.bytes_slice().to_vec().into_boxed_slice());
+        let table: &'static [u8] = Box::leak(jump_table.as_slice().to_vec().into_boxed_slice());
+        let jump_table = JumpTable::from_static_slice(table, jump_table.len());
+        // SAFETY: the bytes and the jump table are the ones the analysis of
+        // this code produced, copied verbatim.
+        unsafe { Bytecode::new_analyzed(Bytes::from_static(bytes), original_len, jump_table) }
     }
 
     fn remember_locally(code_hash: B256, code: &Bytecode) {
@@ -396,13 +421,27 @@ impl CodeResolver {
             if local.len() >= LOCAL_CODES_CAPACITY {
                 local.clear();
             }
-            // A private copy: a clone would share the reference count with
-            // every other thread running the same contract, and a hot
-            // contract's count then bounces between all their caches on
-            // every account load.
-            let private = Bytecode::new_raw(alloy_primitives::Bytes::copy_from_slice(code.original_byte_slice()));
-            local.insert(code_hash, private);
+            local.insert(code_hash, Self::private(code));
         });
+    }
+
+    /// This thread's own `Bytecode` over the shared code: a clone of the
+    /// shared one would share its reference count with every other thread
+    /// running the same contract, and a hot contract's count then bounces
+    /// between all their caches on every account load. Over static bytes the
+    /// private one costs one small allocation; anything else gets a private
+    /// copy of the bytes.
+    fn private(code: &Bytecode) -> Bytecode {
+        if code.is_legacy() {
+            if let Some(jump_table) = code.legacy_jump_table() {
+                let original_len = code.original_byte_slice().len();
+                // SAFETY: the same bytes and jump table the shared code holds.
+                return unsafe {
+                    Bytecode::new_analyzed(code.bytes_ref().clone(), original_len, jump_table.clone())
+                };
+            }
+        }
+        Bytecode::new_raw(Bytes::copy_from_slice(code.original_byte_slice()))
     }
 }
 

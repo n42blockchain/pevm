@@ -523,6 +523,14 @@ impl DecodedBatch {
 }
 
 fn decode_batch(blob: &[u8], expected: usize, source: &str) -> Result<DecodedBatch> {
+    decode_batch_with(blob, expected, source, true)
+}
+
+/// `strict` refuses bytes after the last expected item. A blob cut short
+/// by a resumed writer — gov5 restarts from wherever it stood and the
+/// index then ends the old blob early, leaving its remaining items as
+/// trailing bytes — is read for the items the index gives it.
+fn decode_batch_with(blob: &[u8], expected: usize, source: &str, strict: bool) -> Result<DecodedBatch> {
     let raw: Vec<u8> = if blob.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
         zstd::stream::decode_all(blob).wrap_err("failed to decode witness batch")?
     } else {
@@ -543,7 +551,7 @@ fn decode_batch(blob: &[u8], expected: usize, source: &str) -> Result<DecodedBat
         bounds.push((position, position + length));
         position += length;
     }
-    if position != raw.len() {
+    if strict && position != raw.len() {
         eyre::bail!("witness batch in {} has trailing bytes", source)
     }
     Ok(DecodedBatch { raw, bounds })
@@ -744,6 +752,14 @@ impl SinkState {
 pub(super) struct WitnessFreezerReader {
     /// One `(file_number, offset)` per batch, in batch order.
     batches: Vec<(u16, u32)>,
+    /// The raw index and its header size: every item's `(file, offset)` is
+    /// the blob it lives in, and the blob's first item is found by walking
+    /// back while the entry stays the same. gov5 appends batches of 64 from
+    /// wherever a resumed writer stood, so from block 24,792,851 the senders
+    /// table's blobs start at 19 modulo 64 — a table's blobs are not aligned
+    /// to multiples of the batch size, and item positions must not assume it.
+    index: Vec<u8>,
+    header: u64,
     /// Mapped `.cdat` files, indexed by file number.
     data: Vec<memmap2::Mmap>,
     items: u64,
@@ -813,9 +829,50 @@ impl WitnessFreezerReader {
 
         Ok(Self {
             batches,
+            index: index_bytes,
+            header,
             data,
             items,
         })
+    }
+
+    /// The first item of the blob holding `item`, and the number of items in
+    /// that blob: found from the index entries themselves.
+    pub(super) fn blob_of(&self, item: u64) -> (u64, u64) {
+        let entry = |i: u64| read_index_entry_at(&self.index, self.header, i);
+        let here = entry(item);
+        let mut first = item;
+        while first > 0 && entry(first - 1) == here {
+            first -= 1;
+        }
+        let mut end = item + 1;
+        while end < self.items && entry(end) == here {
+            end += 1;
+        }
+        (first, end - first)
+    }
+
+    /// Decodes the blob holding `item`; returns its first item too.
+    pub(super) fn read_blob_of(&self, item: u64) -> Result<(u64, DecodedBatch)> {
+        let (first, count) = self.blob_of(item);
+        let (file_number, offset) = read_index_entry_at(&self.index, self.header, first);
+        let mapped = self
+            .data
+            .get(file_number as usize)
+            .ok_or_else(|| eyre::eyre!("witness data file {} is missing", file_number))?;
+        let end = if first + count < self.items {
+            let (next_file, next_offset) =
+                read_index_entry_at(&self.index, self.header, first + count);
+            if next_file == file_number { next_offset as usize } else { mapped.len() }
+        } else {
+            mapped.len()
+        };
+        let start = offset as usize;
+        if start > end || end > mapped.len() {
+            eyre::bail!("blob at item {} has an out-of-range offset", first)
+        }
+        let blob = decode_batch_with(&mapped[start..end], count as usize, &format!("blob at item {first}"), false)?;
+        Ok((first, blob))
     }
 
     /// Number of blocks in the freezer; item N is block N.
@@ -891,17 +948,16 @@ impl WitnessBatchCache {
             )
         }
 
-        let batch = WitnessFreezerReader::batch_of(block_number);
-        let reload = !matches!(&self.loaded, Some((cached, _)) if *cached == batch);
-        if reload {
-            self.loaded = Some((batch, reader.read_batch(batch)?));
+        let hit = matches!(&self.loaded, Some((first, entries)) if *first <= block_number && block_number < *first + entries.len() as u64);
+        if !hit {
+            self.loaded = Some(reader.read_blob_of(block_number)?);
         }
 
-        let (_, entries) = self.loaded.as_ref().expect("batch was just loaded");
-        let position = (block_number - WitnessFreezerReader::batch_start(batch)) as usize;
+        let (first, entries) = self.loaded.as_ref().expect("blob was just loaded");
+        let position = (block_number - first) as usize;
         entries
             .get(position)
-            .ok_or_else(|| eyre::eyre!("witness batch {} is missing block {}", batch, block_number))
+            .ok_or_else(|| eyre::eyre!("witness blob at {} is missing block {}", first, block_number))
     }
 }
 
@@ -911,6 +967,11 @@ impl WitnessBatchCache {
 /// paper over a witness that no longer matches the execution it was recorded
 /// from and report a clean run, so the read fails instead and the caller
 /// decides what to do with the block.
+/// `PEVM_TRACE_WITNESS=1` prints every read the replay makes, with the
+/// witness position, to diagnose a read sequence that drifts.
+static TRACE_READS: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("PEVM_TRACE_WITNESS").is_some());
+
 #[derive(Debug)]
 struct CodeResolveFailed(String);
 
@@ -1032,6 +1093,9 @@ impl<DB: RevmDatabase<Error = ProviderError>> RevmDatabase for WitnessReplayData
     type Error = ProviderError;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        if *TRACE_READS {
+            eprintln!("W basic {address:?} pos={}", self.position.consumed());
+        }
         match self.next_value() {
             // An absent account was recorded as a zero-length value; an account
             // that exists always carries at least its field-bits byte.
@@ -1046,6 +1110,9 @@ impl<DB: RevmDatabase<Error = ProviderError>> RevmDatabase for WitnessReplayData
                                 codes.code_for(address, account.code_hash).map_err(|error| {
                                     ProviderError::other(CodeResolveFailed(error.to_string()))
                                 })?;
+                            if *TRACE_READS {
+                                eprintln!("W   code attached={} hash={:?}", account.code.is_some(), account.code_hash);
+                            }
                         }
                     }
                     Ok(Some(account))
@@ -1057,6 +1124,9 @@ impl<DB: RevmDatabase<Error = ProviderError>> RevmDatabase for WitnessReplayData
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        if *TRACE_READS {
+            eprintln!("W code_by_hash {code_hash:?} pos={}", self.position.consumed());
+        }
         if let Some(codes) = self.codes.as_ref() {
             // With code sources configured, a code none of them has is an
             // error: the database behind `inner` would answer with empty
@@ -1073,7 +1143,9 @@ impl<DB: RevmDatabase<Error = ProviderError>> RevmDatabase for WitnessReplayData
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        let _ = (address, index);
+        if *TRACE_READS {
+            eprintln!("W storage {address:?} {index:#x} pos={}", self.position.consumed());
+        }
         match self.next_value() {
             // A record longer than a word is not a storage value: the read
             // sequence has drifted from the recording. An error, never a

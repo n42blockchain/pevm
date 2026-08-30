@@ -344,15 +344,14 @@ impl GethBlockSource {
 
         if let Some(table) = self.senders.as_ref() {
             if number < table.items() {
-                use super::witness::WitnessFreezerReader as Reader;
-                let batch = Reader::batch_of(number);
-                if !matches!(senders_batch, Some((cached, _)) if *cached == batch) {
-                    *senders_batch = Some((batch, table.read_batch(batch)?));
+                let hit = matches!(senders_batch, Some((first, entries)) if *first <= number && number < *first + entries.len() as u64);
+                if !hit {
+                    *senders_batch = Some(table.read_blob_of(number)?);
                 }
                 let raw = senders_batch
                     .as_ref()
-                    .and_then(|(_, entries)| entries.get((number - Reader::batch_start(batch)) as usize))
-                    .ok_or_else(|| eyre::eyre!("senders batch {batch} is missing block {number}"))?;
+                    .and_then(|(first, entries)| entries.get((number - first) as usize))
+                    .ok_or_else(|| eyre::eyre!("senders blob is missing block {number}"))?;
                 if raw.len() != body.transactions.len() * 20 {
                     eyre::bail!(
                         "senders item {number} holds {} bytes for {} transactions",

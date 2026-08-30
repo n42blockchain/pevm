@@ -2653,6 +2653,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         // One EVM configuration for every worker: with `--jit` it owns the
         // revmc backend and its resident map of compiled contracts, which the
         // workers share; without it, a thin wrapper over the plain factory.
+        // Tasks that ended in an error, which take their blocks with them:
+        // counted so a run cannot look clean while skipping whole tasks.
+        let task_errors = Arc::new(AtomicU64::new(0));
         let contract_heat: Option<Arc<Mutex<heat::HeatMap>>> = self
             .contract_heat
             .as_ref()
@@ -3222,6 +3225,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             // 在 v1.8.4 中，共享 blockchain_db 也能正常工作
             let shared_evm_config = shared_evm_config.clone();
             let contract_heat_clone = contract_heat.clone();
+            let task_errors_clone = task_errors.clone();
             // Witness replay reads one block at a time from the ancient store:
             // decoding a whole task's blocks up front holds every body of a
             // 64-block task in memory at once, per thread, and the point of a
@@ -3476,10 +3480,20 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                         return Ok(());
                                     }
                                     let block = if lazy_blocks {
-                                        lazy_block = geth_blocks_clone
+                                        // A block that cannot be read is one
+                                        // failed block, not a lost task.
+                                        match geth_blocks_clone
                                             .as_ref()
                                             .expect("lazy blocks need the ancient store")
-                                            .block(block_number, &mut senders_batch)?;
+                                            .block(block_number, &mut senders_batch)
+                                        {
+                                            Ok(block) => lazy_block = block,
+                                            Err(error) => {
+                                                witness_failures.fetch_add(1, Ordering::Relaxed);
+                                                error!("Witness replay failed for block {}: {}", block_number, error);
+                                                continue;
+                                            }
+                                        }
                                         &lazy_block
                                     } else {
                                         match blocks.iter().find(|b| b.sealed_block().header().number == block_number) {
@@ -3491,6 +3505,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                     // A block whose witness does not replay is
                                     // reported and skipped: one bad witness must
                                     // not hide every block queued behind it.
+                                    if std::env::var_os("PEVM_TRACE_WITNESS").is_some() {
+                                        eprintln!("W block {block_number}");
+                                    }
                                     let replayed = (|| -> eyre::Result<()> {
                                         let witness = witness_batch_cache
                                             .witness_for(reader, block_number)?;
@@ -4165,6 +4182,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
 
                         // 直接处理结果（不再需要处理 panic）
                         if let Err(e) = result {
+                            task_errors_clone.fetch_add(1, Ordering::Relaxed);
                             error!("Thread {:?} execution error: {:?}", thread_id, e);
                         }
 
@@ -4536,6 +4554,12 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             thread::sleep(Duration::from_secs(1));
             if let Some(resolver) = code_resolver.as_ref() {
                 info!(?resolver, "Code resolution");
+            }
+            let aborted = task_errors.load(Ordering::Relaxed);
+            if aborted > 0 {
+                error!(tasks = aborted, "Tasks aborted by an error; their blocks were not replayed");
+            } else {
+                info!("No task aborted");
             }
             if let (Some(path), Some(shared)) = (self.contract_heat.as_deref(), contract_heat.as_ref()) {
                 let total = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());

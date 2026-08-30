@@ -3494,6 +3494,12 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                                                 continue;
                                             }
                                         }
+                                        // Progress for a lazily read block: the
+                                        // shared tail counts `blocks`, which is
+                                        // empty on this path.
+                                        cumulative_gas.fetch_add(lazy_block.sealed_block().header().gas_used, Ordering::Relaxed);
+                                        txs_counter.fetch_add(lazy_block.sealed_block().body().transaction_count() as u64, Ordering::Relaxed);
+                                        block_counter.fetch_add(1, Ordering::Relaxed);
                                         &lazy_block
                                     } else {
                                         match blocks.iter().find(|b| b.sealed_block().header().number == block_number) {

@@ -270,6 +270,17 @@ wrappers, the EVM, the executor, the header check — is 0.096 ms of CPU on
 near-empty blocks, under 1% of the run, so nothing is left to save by
 reusing them across a task.
 
+After the per-block cache the 256-thread profile is interpreter 37%,
+state and journal 28%, keccak 12.5%, precompiles 9%, allocation 6%. Levers
+measured on the same 200,000 blocks since: a profile-guided build
+(`scripts/pgo-build.sh`) takes 2.7–3.7% off the CPU time; a 4M-entry
+keccak cache (`PEVM_KECCAK_CACHE_ENTRIES=4194304`, +0.5 GB) 1%; carrying
+the journal's containers and the interpreter frames from block to block
+and handing the journal its emptied account table back after every
+transaction nothing (reverted); `-C target-cpu=native` nothing (sha3-asm
+already picks the scalar Keccak that is fastest on Zen 5). GMP for modexp
+is untested: `gmp-mpfr-sys` needs `libgmp-dev` or `m4`.
+
 What remains at 256 threads is the interpreter itself and the SMT pair
 sharing a core: 128 threads on 64 cores replay as fast as 128 threads on
 128 cores, because a single thread of this workload leaves half the core

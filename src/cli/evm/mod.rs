@@ -15,6 +15,8 @@ mod plain_state;
 mod recsplit;
 mod geth_freezer;
 mod heat;
+#[cfg(feature = "jit")]
+mod aot;
 mod state_log;
 mod state_override;
 mod trace;
@@ -110,9 +112,15 @@ fn get_empty_code_hash() -> B256 {
 /// so the channel and the drain are sized to keep the hotness counts honest.
 /// Nothing is evicted during the run; the resident budget is the only cap.
 #[cfg(feature = "jit")]
+fn store_path_display(path: Option<&std::path::Path>) -> String {
+    path.map(|p| p.display().to_string()).unwrap_or_default()
+}
+
+#[cfg(feature = "jit")]
 fn replay_evm_config(
     chain_spec: Arc<ChainSpec>,
     jit: &reth_node_core::args::JitArgs,
+    store: Option<Arc<dyn revmc::runtime::ArtifactStore>>,
 ) -> eyre::Result<EthEvmConfig<ChainSpec, reth_evm_ethereum::factory::RethEvmFactory>> {
     use reth_evm_ethereum::factory::{JitBackend, JitMode, RethEvmFactory, RuntimeConfig, RuntimeTuning};
     if !jit.enabled {
@@ -134,6 +142,7 @@ fn replay_evm_config(
     let config = RuntimeConfig {
         enabled: true,
         tuning,
+        store,
         debug_assertions: jit.debug,
         blocking: jit.blocking,
         jit_mode: JitMode::InProcess,
@@ -284,6 +293,23 @@ pub struct EvmCommand<C: ChainSpecParser> {
     /// CSV at the end of a witness replay.
     #[arg(long)]
     contract_heat: Option<PathBuf>,
+
+    /// Directory of revmc AOT artifacts (`<code hash>_<spec>.so` + manifest).
+    /// With --jit, everything in it is loaded into the resident map before
+    /// the replay starts; with --aot-from-heat it is where compilation
+    /// writes. Needs the `jit` feature.
+    #[arg(long)]
+    aot_store: Option<PathBuf>,
+
+    /// Compile the hottest contracts of this contract-heat CSV (see
+    /// --contract-heat) into --aot-store, for every spec their block span
+    /// touches, then exit.
+    #[arg(long)]
+    aot_from_heat: Option<PathBuf>,
+
+    /// How many rows of the heat table to compile.
+    #[arg(long, default_value_t = 10_000)]
+    aot_top: usize,
 
     /// revmc JIT: `--jit` compiles hot contracts to machine code on
     /// background workers and runs the compiled code from then on. Only
@@ -2621,7 +2647,6 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
         // One EVM configuration for every worker: with `--jit` it owns the
         // revmc backend and its resident map of compiled contracts, which the
         // workers share; without it, a thin wrapper over the plain factory.
-        let shared_evm_config = Arc::new(replay_evm_config(chain_spec.clone(), &self.jit)?);
         let contract_heat: Option<Arc<Mutex<heat::HeatMap>>> = self
             .contract_heat
             .as_ref()
@@ -2869,6 +2894,48 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
             None
         };
 
+        #[cfg(feature = "jit")]
+        let aot_store = match self.aot_store.as_deref() {
+            Some(dir) => Some(Arc::new(aot::DirArtifactStore::open(dir)?)),
+            None => None,
+        };
+        #[cfg(feature = "jit")]
+        let shared_evm_config = Arc::new(replay_evm_config(
+            chain_spec.clone(),
+            &self.jit,
+            aot_store.clone().map(|s| s as Arc<dyn revmc::runtime::ArtifactStore>),
+        )?);
+        #[cfg(not(feature = "jit"))]
+        let shared_evm_config = Arc::new(replay_evm_config(chain_spec.clone(), &self.jit)?);
+        #[cfg(feature = "jit")]
+        if let Some(store) = aot_store.as_ref() {
+            if !self.jit.enabled {
+                eyre::bail!("--aot-store needs --jit");
+            }
+            let Some(resolver) = code_resolver.as_ref() else {
+                eyre::bail!("--aot-store needs --codes-dir / --code-mdbx to read the bytecodes")
+            };
+            let backend = shared_evm_config.executor_factory.evm_factory().backend();
+            let code_for = |hash: B256| -> Option<alloy_primitives::Bytes> {
+                resolver.by_hash(hash).ok().flatten().map(|code| code.original_bytes())
+            };
+            if let Some(heat) = self.aot_from_heat.as_deref() {
+                let Some(blocks) = geth_blocks.as_ref() else {
+                    eyre::bail!("--aot-from-heat needs --geth-ancient-dir for the block timestamps")
+                };
+                let timeline = aot::SpecTimeline::build(&chain_spec, blocks, self.end_number)?;
+                let contracts = aot::read_heat(heat, self.aot_top)?;
+                let (requests, missing) = aot::requests_for(&contracts, &timeline, code_for);
+                info!(contracts = contracts.len(), requests = requests.len(), missing, "AOT build");
+                aot::drive(backend, requests, "compile")?;
+                let (count, bytes) = store.size();
+                info!(count, mib = bytes / (1024 * 1024), path = %store_path_display(self.aot_store.as_deref()), "AOT artifacts");
+                return Ok(());
+            }
+            let requests = aot::requests_from_store(store, code_for);
+            info!(artifacts = requests.len(), "loading AOT artifacts into the resident map");
+            aot::drive(backend, requests, "load")?;
+        }
         // 步骤4: 创建任务池
         // 取消续传逻辑：从 --begin 开始创建所有任务
         // 块级别的过滤在 worker 线程中进行（只处理不存在的块，补齐模式）

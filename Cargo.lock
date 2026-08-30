@@ -6929,6 +6929,7 @@ dependencies = [
  "reth-trie-common",
  "reth-trie-db",
  "reth-trie-parallel",
+ "revmc",
  "ringbuffer 0.15.0",
  "rmp-serde",
  "roaring 0.10.12",

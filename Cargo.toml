@@ -15,7 +15,7 @@ path = "src/main.rs"
 dev = []
 # revmc JIT for the replay path. Needs LLVM 22.1 at build time
 # (LLVM_SYS_221_PREFIX) and is switched on at run time with --jit.
-jit = ["reth-node-ethereum/jit"]
+jit = ["reth-node-ethereum/jit", "dep:revmc"]
 
 [lints]
 rust.missing_debug_implementations = "warn"
@@ -197,6 +197,9 @@ inherits = "release"
 lto = "fat"
 
 [dependencies]
+# The JIT runtime itself, for AOT compilation and the artifact store; the same
+# copy reth-patched builds against (see the [patch] at the bottom).
+revmc = { path = "../revmc-cf68a87/crates/revmc", optional = true, default-features = false, features = ["llvm-prefer-static", "alloy-evm"] }
 num_cpus = "1.17"
 memmap2 = "0.9.4"
 # Snappy: geth ancient `.cdat` payloads are snappy-compressed.

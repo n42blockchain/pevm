@@ -237,6 +237,14 @@ impl GethBlockSource {
         Ok(B256::from_slice(&raw))
     }
 
+    /// Timestamp of block `number`, from its header.
+    pub(super) fn timestamp(&self, number: u64) -> Result<u64> {
+        let header_rlp = self.headers.get(number)?;
+        let header = Header::decode(&mut header_rlp.as_slice())
+            .wrap_err_with(|| format!("failed to decode header {number}"))?;
+        Ok(header.timestamp)
+    }
+
     /// Highest block the store holds.
     pub(super) const fn last_block(&self) -> u64 {
         self.headers.items().saturating_sub(1)

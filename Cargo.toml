@@ -15,7 +15,7 @@ path = "src/main.rs"
 dev = []
 # revmc JIT for the replay path. Needs LLVM 22.1 at build time
 # (LLVM_SYS_221_PREFIX) and is switched on at run time with --jit.
-jit = ["reth-node-ethereum/jit", "dep:revmc"]
+jit = ["reth-node-ethereum/jit", "dep:revmc", "dep:revmc-build"]
 
 [lints]
 rust.missing_debug_implementations = "warn"
@@ -548,6 +548,9 @@ inline_colorization = "0.1.6"
 inferno = { version = "0.12", default-features = false }
 backtrace = "0.3"
 tokio-util = { version = "0.7", features = ["codec"] }
+
+[build-dependencies]
+revmc-build = { path = "../revmc-cf68a87/crates/revmc-build", optional = true }
 
 [dev-dependencies]
 tempfile = "3.24"

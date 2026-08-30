@@ -41,7 +41,23 @@ impl std::fmt::Debug for DirArtifactStore {
 }
 
 fn spec_name(spec: revmc::primitives::hardfork::SpecId) -> String {
-    format!("{spec:?}")
+    spec.to_string()
+}
+
+/// Parses a spec by its `Display` name (`Cancun`), or by the `Debug` name
+/// (`CANCUN`) an earlier store wrote.
+fn parse_spec(name: &str) -> Option<revmc::primitives::hardfork::SpecId> {
+    use revmc::primitives::hardfork::SpecId;
+    if let Ok(spec) = SpecId::from_str(name) {
+        return Some(spec);
+    }
+    [
+        SpecId::FRONTIER, SpecId::HOMESTEAD, SpecId::TANGERINE, SpecId::SPURIOUS_DRAGON,
+        SpecId::BYZANTIUM, SpecId::PETERSBURG, SpecId::ISTANBUL, SpecId::BERLIN, SpecId::LONDON,
+        SpecId::MERGE, SpecId::SHANGHAI, SpecId::CANCUN, SpecId::PRAGUE, SpecId::OSAKA,
+    ]
+    .into_iter()
+    .find(|spec| format!("{spec:?}") == name)
 }
 
 impl DirArtifactStore {
@@ -58,10 +74,8 @@ impl DirArtifactStore {
                 .wrap_err_with(|| format!("bad manifest {}", path.display()))?;
             let get = |k: &str| value.get(k).cloned().unwrap_or(serde_json::Value::Null);
             let code_hash = B256::from_str(get("code_hash").as_str().unwrap_or_default())?;
-            let spec_id = revmc::primitives::hardfork::SpecId::from_str(
-                get("spec_id").as_str().unwrap_or_default(),
-            )
-            .map_err(|_| eyre::eyre!("unknown spec in {}", path.display()))?;
+            let spec_id = parse_spec(get("spec_id").as_str().unwrap_or_default())
+                .ok_or_else(|| eyre::eyre!("unknown spec in {}", path.display()))?;
             let key = ArtifactKey {
                 runtime: RuntimeCacheKey { code_hash, spec_id },
                 backend: BackendSelection::Llvm,
@@ -245,38 +259,59 @@ pub(super) fn read_heat(path: &Path, top: usize) -> Result<Vec<HotContract>> {
     Ok(order.into_iter().filter_map(|h| by_hash.remove(&h)).collect())
 }
 
-/// Hands `requests` to the backend and waits until every one has been
-/// compiled, loaded from the store, or failed.
+/// Hands `requests` to the backend in waves and waits until every one has
+/// been compiled, loaded from the store, or failed. The backend drops a
+/// request outright once its pending count reaches `jit_max_pending_jobs`,
+/// so a wave never exceeds half of that default.
 pub(super) fn drive(backend: &JitBackend, requests: Vec<AotRequest>, what: &str) -> Result<()> {
+    const WAVE: usize = 1024;
+    // The backend preloads the whole store at startup; a request for a key
+    // already resident is a no-op that would never show up in any counter.
+    let offered = requests.len();
+    let requests: Vec<AotRequest> = requests
+        .into_iter()
+        .filter(|r| backend.get_compiled(r.code_hash, r.spec_id).is_none())
+        .collect();
+    info!(what, offered, to_do = requests.len(), "AOT requests");
     let total = requests.len() as u64;
     let before = backend.stats();
-    let baseline = before.compilations_succeeded + before.compilations_failed;
     let started = Instant::now();
-    for chunk in requests.chunks(256) {
-        backend.prepare_aot_batch(chunk.to_vec());
-    }
+    let mut sent = 0u64;
     let mut last_report = Instant::now();
+    let mut waves = requests.chunks(WAVE);
     loop {
         let stats = backend.stats();
-        let done = stats.compilations_succeeded + stats.compilations_failed - baseline;
-        if done >= total && stats.pending_jobs == 0 {
-            info!(
-                what,
-                total,
-                succeeded = stats.compilations_succeeded - before.compilations_succeeded,
-                failed = stats.compilations_failed - before.compilations_failed,
-                resident = stats.resident_entries,
-                code_mib = stats.jit_code_bytes / (1024 * 1024),
-                elapsed = ?started.elapsed(),
-                "AOT done"
-            );
-            return Ok(());
+        // A request ends as a resident entry — compiled, or loaded from the
+        // store, which counts as no compilation at all — or as a failure.
+        let done = (stats.resident_entries - before.resident_entries)
+            + (stats.compilations_failed - before.compilations_failed);
+        // Keep the backend fed while everything sent so far is accounted for.
+        if done >= sent && stats.pending_jobs == 0 {
+            match waves.next() {
+                Some(wave) => {
+                    backend.prepare_aot_batch(wave.to_vec());
+                    sent += wave.len() as u64;
+                }
+                None => {
+                    info!(
+                        what,
+                        total,
+                        succeeded = stats.compilations_succeeded - before.compilations_succeeded,
+                        failed = stats.compilations_failed - before.compilations_failed,
+                        resident = stats.resident_entries,
+                        code_mib = stats.jit_code_bytes / (1024 * 1024),
+                        elapsed = ?started.elapsed(),
+                        "AOT done"
+                    );
+                    return Ok(());
+                }
+            }
         }
         if last_report.elapsed() > Duration::from_secs(10) {
-            info!(what, done, total, pending = stats.pending_jobs, resident = stats.resident_entries, "AOT progress");
+            info!(what, done, sent, total, pending = stats.pending_jobs, resident = stats.resident_entries, "AOT progress");
             last_report = Instant::now();
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 

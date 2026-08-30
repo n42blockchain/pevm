@@ -48,6 +48,38 @@ n42-eth-snapshot follow ... --verify-cmd \
      --witness-dir {datadir}/chain/freezer --use-witness on ...'
 ```
 
+## Tested against the real archive
+
+Three tests over `/data/blockchain/witness` (gov5's real 858 GiB
+archive input set) and `/data/witness-rust` (the pevm-recorded
+witness), 2026-08-30:
+
+1. **Manifest + verify on real files** — an archive-shaped datadir
+   with 19 GB of real freezer files: Go and Rust `manifest` produce the
+   same `manifest_id`, each side's `verify` accepts the other's
+   manifest (Rust 2.2 s, Go 7.6 s), and a single flipped byte in a
+   2 GB segment is reported by both, naming the file.
+2. **Delta catch-up over HTTP** — a mirror publishing release A
+   (witness through segment 0) and release B (+ segment 1): `fetch` of
+   A in 2.3 s, `status` reports 788k blocks behind, `catch-up` applies
+   the 2.0 GB delta in ~2 s and lands on B's manifest_id; the Go
+   client run against the same datadir agrees.
+3. **Follow + replay verification** — `follow` polling every 5 s picks
+   up a release published mid-run, applies the delta, and
+   `--verify-cmd` replays the 787,649 appended blocks from the fetched
+   witness in **17.7 s** with zero failures and no aborted tasks —
+   catch-up plus full re-execution of the new range, well inside a
+   minute.
+
+One finding worth the fixture rebuild it caused: a positional witness
+replays only through the engine that recorded it. gov5's shipped
+`witness.*` is its own executor's read stream and fails immediately
+under pevm (nonce/balance mismatches from the first blocks); the
+pevm-recorded witness in the same NCIX container replays cleanly. A
+distribution whose archive tier is meant to be verified by a given
+client must ship that client's witness stream — the container format
+is shared, the stream is per-recorder.
+
 ## Not ported yet
 
 `pevm evm` reads the standard freezer tables (witness, senders, codes)

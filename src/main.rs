@@ -2,8 +2,13 @@
 
 #![allow(missing_docs)]
 
+#[cfg(not(feature = "mimalloc"))]
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::Parser;
 use pevm::cli::chainspec::EthereumChainSpecParser;

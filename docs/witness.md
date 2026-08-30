@@ -175,7 +175,8 @@ checked against its header:
 | first run | 27.0 min | 396,850 s | 83,369 blocks failed: code MDBX transaction timed out; tail skipped (below) |
 | senders table, no bundle State, batch without copies, thread-local code cache | 23.9 min | 351,575 s | tail skipped: the last 889,000 blocks never ran |
 | + reader follows the index, one block at a time, reused CacheState, private code copies, `-s 64` | 23.3 min | 350,905 s | every block, 0 failures, 0 tasks aborted |
-| + one static copy of each contract's code, per-block `ReplayCache` in place of revm's `State` | **20.5 min** | 309,749 s | **every block, 0 failures, 0 tasks aborted**; peak 106 GB |
+| + one static copy of each contract's code, per-block `ReplayCache` in place of revm's `State` | 20.5 min | 309,749 s | every block, 0 failures, 0 tasks aborted; peak 106 GB |
+| + profile-guided build with `gmp`, 4M-entry keccak cache | **20.0 min** | 301,299 s | **every block, 0 failures, 0 tasks aborted**; peak 105 GB; `scripts/pgo-build.sh` with `CARGO_FEATURES=gmp`, `PEVM_KECCAK_CACHE_ENTRIES=4194304` |
 
 The "tail skipped" runs looked clean and were not: gov5's senders table
 is appended in batches of 64 from wherever a resumed writer stood, so from

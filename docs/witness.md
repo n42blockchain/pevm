@@ -167,23 +167,89 @@ error on the first full run. And `senders` is gov5's legacy headerless
 batched table, read through the witness reader's batch decoder.
 
 Measured on 128 cores / 256 threads (EPYC 9B45), 25,765,565 blocks,
-3,678,099,879 transactions and 312,450 Ggas (`--geth-census`), every block checked against
-its header:
+3,678,099,879 transactions and 312,450 Ggas (`--geth-census`), every block
+checked against its header:
 
 | build | wall | CPU | notes |
 |---|---|---|---|
-| first run | 27.0 min | 396,850 s | 83,369 blocks failed: code MDBX transaction timed out |
-| senders table, no bundle State, batch without copies, thread-local code cache | **23.9 min** | 351,575 s | 0 failures |
-| same, `maxperf` + `target-cpu=native` | 23.8 min | 352,160 s | no gain at full scale |
+| first run | 27.0 min | 396,850 s | 83,369 blocks failed: code MDBX transaction timed out; tail skipped (below) |
+| senders table, no bundle State, batch without copies, thread-local code cache | 23.9 min | 351,575 s | tail skipped: the last 889,000 blocks never ran |
+| + reader follows the index, one block at a time, reused CacheState, private code copies, `-s 64` | **23.3 min** | 350,905 s | **every block, 0 failures, 0 tasks aborted** |
+
+The "tail skipped" runs looked clean and were not: gov5's senders table
+is appended in batches of 64 from wherever a resumed writer stood, so from
+block 24,792,851 its blobs start at 19 modulo 64, and a reader that
+assumed blobs at multiples of 64 handed every later block another block's
+senders. The length check refused the block, the error took the whole
+3-block task with it, and that was logged as a thread execution error —
+not a failed block, not in the failure count. 296,277 tasks were lost that
+way in each of those runs. The reader now finds a blob by walking the
+index entries, a block that cannot be read is one failed block, and tasks
+that abort are counted and printed at the end. The tail is the heaviest
+part of the chain, which is why the honest number is only slightly better
+than the flawed one despite the work below.
 
 gov5's own replay of the same range takes 41 minutes (49m48s in its
 measured notes). Sender recovery was the first bottleneck: reth recovers
 signatures on rayon from every worker at once, and a profile of a dense
 range put 56% of CPU in crossbeam and 22% in secp256k1 before the senders
 table removed both. After it the profile is the EVM itself — interpreter
-dispatch, keccak, revm's State cache, bn254 pairings — at roughly
+dispatch, keccak, revm's State cache, precompiles — at roughly
 1.5 Ggas/s per physical core, which is the interpreter's natural pace;
 substrate-bn in place of arkworks was 10% slower.
+
+### Where a single thread spends its time
+
+`perf` on one worker, 1,000 blocks per range, self time by category:
+
+| | 12.0M | 16.0M | 20.0M |
+|---|---|---|---|
+| interpreter proper (opcode implementations, dispatch, gas, jump analysis, U256) | 48.7% | 47.4% | 40.8% |
+| precompiles (ecrecover; bn254; BLS12-381 / KZG after Cancun) | 8.2% | 13.6% | 32.5% |
+| keccak | 13.6% | 14.3% | 8.9% |
+| revm State / journal | 8.3% | 5.8% | 4.5% |
+| kernel, decode, allocation, frames, other | 21% | 19% | 13% |
+
+A bytecode compiler touches the first row only. Even at infinite speed
+that caps a block at 1.95× / 1.90× / 1.69×; revmc's own 1.85–2.77× on
+WETH-like code puts the realistic figure at 1.3–1.45×, and that is what
+the top-10k AOT measures on one thread: 1.44× at 12M, 1.36× at 16M, 1.29×
+at 20M (3,000 blocks each). The 19× (revmc, Fibonacci), 6.9× (BNB, fib_255)
+and 15× (Nethermind, a spin loop) in the literature are for code that is
+all first row. Witness replay removes the disk, not the host operations.
+
+### Many threads
+
+One worker replays the 12.0M band at 2.8 Ggas/s; 16 workers at 2.79 each;
+32 at 2.30; 64 at 1.92; 128 at 1.20; 256 at 0.80 (SMT). Between 16 and
+128 threads the CPU time per block doubles (4.4 → 9.1 ms) with negligible
+system time: `perf stat` shows the same instructions per block but 49%
+more cycles (IPC 1.85 → 1.19) and no more LLC misses — each access is
+slower once every core is loading — and the all-core clock is 3.13 GHz
+against 4.16 GHz on one core. Memory latency and frequency, not locks.
+
+What helped, at 256 threads on 200,000 blocks (CPU 2932 → 2440 s, wall
+13.0 → 12.0 s): reading one block at a time so a 64-block task holds one
+body instead of 64; reusing one `CacheState` per worker, cleared between
+blocks; private copies of hot bytecode in the per-thread cache, since a
+shared `Bytes` reference count bounces between every core running the
+same contract; and `-s 64`, which decodes each witness batch once. What
+did not: `taskset` onto physical cores, `-s 64` alone, dropping alloy's
+global keccak cache (16% slower on one thread), transparent huge pages
+set to `always` (684 MB of 18 GB anonymous memory ended up in huge pages;
+no change). The AOT path loses its single-thread gain at 32–128 threads
+for the same reason, amplified: every frame clones an `Arc` from the
+shared resident map.
+
+### evmone instead of revm?
+
+evmone (C++, EVMC) runs 4.9× faster than geth's interpreter on synthetic
+loops but sits in revm's tier — guillotine reports "on par with evmone,
+ahead of revm". Interpreter differences of 1.2–1.5× apply to the first
+row above, so the block-level expectation is under 1.15×, for an EVMC host
+bridge crossed on every SLOAD, SSTORE and CALL, a re-plumbed executor, and
+a witness that would have to be recorded again through evmone. Not worth
+it for this workload.
 
 ### revmc JIT does not fit a positional witness
 

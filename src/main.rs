@@ -20,11 +20,14 @@ use reth_node_ethereum::EthereumNode;
 use tracing::info;
 
 fn main() {
-    // alloy's global keccak cache holds 131k entries by default;
-    // `PEVM_KECCAK_CACHE_ENTRIES` sizes it before anything hashes.
-    if let Some(entries) = std::env::var("PEVM_KECCAK_CACHE_ENTRIES").ok().and_then(|v| v.parse::<usize>().ok()) {
-        let _ = alloy_primitives::utils::init_keccak_cache(entries);
-    }
+    // alloy's global keccak cache holds 131k entries by default; 4M entries
+    // measured 1% less CPU at 256 threads for half a gigabyte, so that is
+    // the default here, and `PEVM_KECCAK_CACHE_ENTRIES` overrides it.
+    let entries = std::env::var("PEVM_KECCAK_CACHE_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4 << 20);
+    let _ = alloy_primitives::utils::init_keccak_cache(entries);
     // A JIT backend in out-of-process mode re-executes this binary as its
     // compile helper; that process must answer the job and exit here.
     #[cfg(feature = "jit")]

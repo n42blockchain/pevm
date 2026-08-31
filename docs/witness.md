@@ -259,6 +259,13 @@ without a reference count, so a thread's private `Bytecode` can sit over
 the shared bytes) took the wall from 12.2–12.5 s to 11.0 s and 6 GB off the
 peak.
 
+Also in: code attaches lazily — `basic()` no longer resolves the code
+of every contract account it decodes, the EVM's `code_by_hash` (which
+reads no witness) fetches it when execution actually needs it — and the
+4M-entry keccak cache is the default. Both measured neutral-to-1% on
+200,000-block ranges; the lazy attach also drops the address from the
+resolve path entirely.
+
 Tried and measured as no gain, each against the same 200,000 blocks:
 `taskset` onto physical cores, pinning each worker to a CPU (migrations
 are 1.4 per thread per second), a thread-local keccak cache in place of

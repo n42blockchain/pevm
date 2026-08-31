@@ -1101,20 +1101,11 @@ impl<DB: RevmDatabase<Error = ProviderError>> RevmDatabase for WitnessReplayData
             // that exists always carries at least its field-bits byte.
             Some([]) => Ok(None),
             Some(value) => match decode_account_v2(value) {
-                Some(mut account) => {
-                    // The record names the code hash; the code itself comes
-                    // by address, which only this read knows.
-                    if account.code_hash != alloy_primitives::KECCAK256_EMPTY {
-                        if let Some(codes) = self.codes.as_ref() {
-                            account.code =
-                                codes.code_for(address, account.code_hash).map_err(|error| {
-                                    ProviderError::other(CodeResolveFailed(error.to_string()))
-                                })?;
-                            if *TRACE_READS {
-                                eprintln!("W   code attached={} hash={:?}", account.code.is_some(), account.code_hash);
-                            }
-                        }
-                    }
+                Some(account) => {
+                    // The record names the code hash; the code itself is
+                    // fetched only when the EVM asks for it (`code_by_hash`
+                    // reads no witness), so an account whose balance is
+                    // merely inspected costs no code lookup.
                     Ok(Some(account))
                 }
                 None => Err(self.unavailable("malformed account record")),

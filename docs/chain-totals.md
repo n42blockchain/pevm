@@ -38,3 +38,7 @@ below 25765565. The totals are therefore no argument against that claim.
 They say nothing about how long any particular machine takes. Replaying blocks
 19089319..25765565 from the witness freezer on the machine used here took 10273s
 on 8 threads - that is one quarter of the chain in nearly three hours.
+
+With all 256 threads and the tuned replay path, the same machine now does the
+whole extended chain (25,864,982 blocks, 315,472 Ggas) in 1184 s — 19.7
+minutes, 266.4 Ggas/s, 3.13M transactions per second (`docs/witness.md`).

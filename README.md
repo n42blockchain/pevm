@@ -2,6 +2,16 @@
 
 This project implements an Ethereum Virtual Machine (EVM) command executor, leveraging Rust's powerful concurrency features. The executor processes blocks from a blockchain, performing transactions in parallel using multiple threads to maximize efficiency.
 
+## Headline result
+
+The whole Ethereum mainnet chain — 25,864,982 blocks, 3,706,813,771
+transactions, 315,472 Ggas — replays statelessly from per-block witnesses
+and verifies every block against its header in **19.7 minutes** on one
+128-core EPYC 9B45: **266.4 Ggas/s, 3.13M transactions per second**, 2.08
+seconds of chain per second of wall clock. See `docs/witness.md` for the
+measurement history, the profiling that got there, and how to reproduce
+it (`scripts/pgo-build.sh`, `pevm evm --use-witness on ...`).
+
 ## Features
 
 - Executes EVM commands within a defined block range.

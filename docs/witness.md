@@ -166,9 +166,13 @@ five-minute read-transaction timeout turned every lookup past that into an
 error on the first full run. And `senders` is gov5's legacy headerless
 batched table, read through the witness reader's batch decoder.
 
-Measured on 128 cores / 256 threads (EPYC 9B45), 25,765,565 blocks,
-3,678,099,879 transactions and 312,450 Ggas (`--geth-census`), every block
-checked against its header:
+**Headline (2026-08-31): the whole chain — 25,864,982 blocks,
+3,706,813,771 transactions, 315,472 Ggas — replays and verifies in
+19.7 minutes: 266.4 Ggas/s, 3.13M transactions per second, 2.08 s of
+chain per second of wall clock, on one 128-core EPYC 9B45.**
+
+Measured on the same machine, every block checked against its header
+(the first rows predate the chain's extension to 25.86M blocks):
 
 | build | wall | CPU | notes |
 |---|---|---|---|

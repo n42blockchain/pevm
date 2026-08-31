@@ -2861,12 +2861,31 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> EvmCommand<C> {
                     }
                     None => None,
                 };
-                Some(Arc::new(CodeResolver::new(Some(Arc::new(by_address)), mdbx)))
+                Some(Arc::new(CodeResolver::new(Some(Arc::new(by_address)), None, mdbx)))
             }
-            _ => match self.code_mdbx.as_deref() {
-                Some(directory) => Some(Arc::new(CodeResolver::new(None, Some(Arc::new(CodeMdbx::open(directory)?))))),
-                None => None,
-            },
+            _ => {
+                let freezer = match self.codes_dir.as_deref() {
+                    Some(directory) if directory.join("codes.hidx").exists() => {
+                        let freezer = CodesFreezer::open(directory)?;
+                        info!(
+                            contracts = freezer.entries(),
+                            path = %directory.display(),
+                            "Reading contract code from the content-addressed codes freezer"
+                        );
+                        Some(Arc::new(freezer))
+                    }
+                    _ => None,
+                };
+                let mdbx = match self.code_mdbx.as_deref() {
+                    Some(directory) => Some(Arc::new(CodeMdbx::open(directory)?)),
+                    None => None,
+                };
+                if freezer.is_some() || mdbx.is_some() {
+                    Some(Arc::new(CodeResolver::new(None, freezer, mdbx)))
+                } else {
+                    None
+                }
+            }
         };
         let codes = match self.codes_dir.as_deref() {
             Some(directory) if code_resolver.is_some() && AddressCodes::is_present(directory) => None,

@@ -309,6 +309,9 @@ impl CodeMdbx {
 /// then the code MDBX. Shared by every worker.
 pub(super) struct CodeResolver {
     by_address: Option<Arc<AddressCodes>>,
+    /// The content-addressed freezer (codes.hidx), when the codes dir ships
+    /// one instead of the address index.
+    freezer: Option<Arc<CodesFreezer>>,
     mdbx: Option<Arc<CodeMdbx>>,
     /// Keyed by a hash already, so the map hashes with alloy's fast hasher
     /// rather than SipHash: this is read on every contract account.
@@ -331,9 +334,14 @@ impl std::fmt::Debug for CodeResolver {
 }
 
 impl CodeResolver {
-    pub(super) fn new(by_address: Option<Arc<AddressCodes>>, mdbx: Option<Arc<CodeMdbx>>) -> Self {
+    pub(super) fn new(
+        by_address: Option<Arc<AddressCodes>>,
+        freezer: Option<Arc<CodesFreezer>>,
+        mdbx: Option<Arc<CodeMdbx>>,
+    ) -> Self {
         Self {
             by_address,
+            freezer,
             mdbx,
             cache: dashmap::DashMap::with_hasher(Default::default()),
             hits: Default::default(),
@@ -375,10 +383,20 @@ impl CodeResolver {
                 }
             }
         }
+        if let Some(freezer) = self.freezer.as_ref() {
+            // The freezer verifies keccak itself.
+            if let Some(code) = freezer.code_by_hash(code_hash)? {
+                return Ok(Some(self.remember(code_hash, code)))
+            }
+        }
         if let Some(mdbx) = self.mdbx.as_ref() {
             if let Some(code) = mdbx.code_by_hash(code_hash)? {
-                self.mdbx_hits.fetch_add(1, Relaxed);
-                return Ok(Some(self.remember(code_hash, code)))
+                // Verified like every other source: a wrong value under this
+                // key would otherwise diverge the replay unnoticed.
+                if keccak256(&code) == code_hash {
+                    self.mdbx_hits.fetch_add(1, Relaxed);
+                    return Ok(Some(self.remember(code_hash, code)))
+                }
             }
         }
         Ok(None)

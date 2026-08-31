@@ -288,6 +288,19 @@ sharing a core: 128 threads on 64 cores replay as fast as 128 threads on
 128 cores, because a single thread of this workload leaves half the core
 idle on memory stalls and the sibling fills it.
 
+### The codes source moved to content-addressing
+
+gov5's codes freezer dropped its address index for `codes.hidx` — a
+RecSplit MPHF over the code hashes with a 10-byte slot table
+(`codes.hoff`) into the same per-contract zstd blobs. The resolver now
+opens whichever the directory ships (the hash index has no join against
+the account table behind it, so the publisher can extend it cheaply),
+and the code MDBX fallback verifies keccak like every other source: an
+unverified wrong value under a hash key diverged replay into "malformed
+account record" errors that looked like recorder drift — 1,852 blocks of
+the first extended-witness run failed exactly that way, and every one of
+them replays once the verified freezer answers first.
+
 ### evmone instead of revm?
 
 evmone (C++, EVMC) runs 4.9× faster than geth's interpreter on synthetic

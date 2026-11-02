@@ -289,6 +289,13 @@ impl WitnessFreezerWriter {
 
             let tail = (items % FREEZER_BATCH_SIZE as u64) as usize;
             if tail == 0 {
+                // The index can be durable before the data it points at, so
+                // the last blob has to be proven readable before appending.
+                let mut count = 1u64;
+                while count < items && read_index_entry(&index_bytes, items - 1 - count) == last {
+                    count += 1;
+                }
+                check_last_blob(&path, u64::from(last.1), size, count as usize)?;
                 (last.0, items, Vec::with_capacity(FREEZER_BATCH_SIZE))
             } else {
                 let batch_start = items - tail as u64;
@@ -484,6 +491,32 @@ fn compress_batch(raw: &[u8]) -> Result<Vec<u8>> {
     encoder
         .finish()
         .wrap_err("failed to compress witness batch")
+}
+
+/// Checks that the blob starting at `start` decodes to `count` items.
+///
+/// Bytes after the blob are tolerated: a run that died after writing a batch
+/// but before indexing it leaves them behind, and the next append goes after
+/// them. A compressed blob is therefore decoded as a single zstd frame.
+fn check_last_blob(path: &Path, start: u64, end: u64, count: usize) -> Result<()> {
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut blob = vec![0u8; (end - start) as usize];
+    file.read_exact(&mut blob)?;
+    let source = path.display().to_string();
+    let raw = if blob.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        let mut raw = Vec::new();
+        zstd::stream::read::Decoder::new(&blob[..])?
+            .single_frame()
+            .read_to_end(&mut raw)
+            .wrap_err_with(|| format!("last witness batch in {source} is corrupt"))?;
+        raw
+    } else {
+        blob
+    };
+    decode_batch_with(&raw, count, &source, false)
+        .wrap_err("last indexed witness batch is truncated; the data file lost bytes the index still references")?;
+    Ok(())
 }
 
 fn read_batch(path: &Path, start: u64, end: u64, expected: usize) -> Result<Vec<Vec<u8>>> {
@@ -1276,6 +1309,53 @@ mod tests {
             stream.take(),
             vec![6, 3, 0xac, 0x02, 2, 0x03, 0xe8, 2, 0x42, 0xab]
         );
+    }
+
+    fn freezer_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pevm_wit_{}_{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn write_blocks(dir: &Path, from: u64, to: u64) {
+        let mut writer = WitnessFreezerWriter::open(dir, from).unwrap();
+        for block in from..to {
+            writer.push(block, vec![block as u8; 100 + block as usize]).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn resume_rejects_truncated_last_full_batch() {
+        let dir = freezer_dir("trunc");
+        write_blocks(&dir, 0, 128);
+        let data = dir.join("witness.0000.cdat");
+        let file = OpenOptions::new().write(true).open(&data).unwrap();
+        let len = file.metadata().unwrap().len();
+        file.set_len(len - 3).unwrap();
+        drop(file);
+        assert!(WitnessFreezerWriter::open(&dir, 128).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_tolerates_unindexed_trailing_batch() {
+        let dir = freezer_dir("orphan");
+        write_blocks(&dir, 0, 128);
+        let index = dir.join("witness.cidx");
+        let file = OpenOptions::new().write(true).open(&index).unwrap();
+        let len = file.metadata().unwrap().len();
+        // Drop the second batch from the index but keep its data.
+        file.set_len(len - 64 * CIDX_ENTRY_SIZE).unwrap();
+        drop(file);
+        write_blocks(&dir, 64, 192);
+        let reader = WitnessFreezerReader::open(&dir).unwrap();
+        assert_eq!(reader.items(), 192);
+        let mut cache = WitnessBatchCache::default();
+        for block in [0u64, 63, 64, 127, 128, 191] {
+            assert_eq!(cache.witness_for(&reader, block).unwrap(), &vec![block as u8; 100 + block as usize][..]);
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

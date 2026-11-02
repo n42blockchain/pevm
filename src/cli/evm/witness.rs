@@ -304,9 +304,14 @@ impl WitnessFreezerWriter {
                     eyre::bail!("partial witness batch does not share one cidx offset")
                 }
                 let recovered = read_batch(&path, u64::from(batch_entry.1), size, tail)?;
+                // Shrink the index first. If the process dies between the two
+                // steps the data file merely keeps an unindexed tail, which a
+                // later resume tolerates; the reverse order leaves index
+                // entries pointing at bytes that are gone for good.
+                index_file.set_len(CIDX_HEADER_SIZE + batch_start * CIDX_ENTRY_SIZE)?;
+                index_file.sync_all()?;
                 let data_file = OpenOptions::new().write(true).open(&path)?;
                 data_file.set_len(u64::from(batch_entry.1))?;
-                index_file.set_len(CIDX_HEADER_SIZE + batch_start * CIDX_ENTRY_SIZE)?;
                 (batch_entry.0, batch_start, recovered)
             }
         };

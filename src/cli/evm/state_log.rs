@@ -139,7 +139,8 @@ impl MmapStateLogReader {
                 && offset >= 32
                 && offset <= data_end
                 && length > 0
-                && length < 10_000_000;
+                && length < 10_000_000
+                && offset + length as u64 <= data_end;
 
             if is_valid {
                 index.insert(block_number, (offset, length));
@@ -541,7 +542,8 @@ impl MmapStateLogDatabase {
                 && offset >= Self::HEADER_SIZE
                 && offset <= data_end
                 && length > 0
-                && length < 10_000_000;
+                && length < 10_000_000
+                && offset + length as u64 <= data_end;
 
             if is_valid {
                 index.insert(block_number, (offset, length));
@@ -2188,6 +2190,28 @@ mod crash_tests {
         let d = std::env::temp_dir().join(format!("pevm_crash_{}_{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn torn_data_tail_is_not_indexed() {
+        let dir = tmpdir("data");
+        {
+            let mut db = MmapStateLogDatabase::open_for_write(&dir).unwrap();
+            db.write_block_logs_batch(&[(1, entry(1)), (2, entry(2))]).unwrap();
+            db.flush().unwrap();
+        }
+        let f = OpenOptions::new().write(true).open(dir.join("state_logs_data.bin")).unwrap();
+        let len = f.metadata().unwrap().len();
+        f.set_len(len - 5).unwrap();
+        drop(f);
+        let mut db = MmapStateLogDatabase::open_for_write(&dir).unwrap();
+        assert!(db.index.contains_key(&1));
+        assert!(!db.index.contains_key(&2), "entry extending past data_end must be dropped");
+        db.write_block_logs_batch(&[(2, entry(2))]).unwrap();
+        db.flush().unwrap();
+        let db = MmapStateLogDatabase::open(&dir).unwrap();
+        assert_eq!(db.read_block_log(2).unwrap(), &MmapStateLogDatabase::serialize_entries(&entry(2)).unwrap()[..]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

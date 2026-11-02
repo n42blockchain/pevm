@@ -18,6 +18,10 @@ The patch replaces both with shims that keep `FileExt` on unix and drive
 Windows' `seek_read` / `seek_write` to completion (those may transfer less than
 asked, unlike the unix `_exact` / `_all` variants).
 
+It also sets `observe_lookups` where `crates/ethereum/node/src/node.rs` builds
+`RuntimeTuning`. That field comes from `revmc-cf68a87-runtime.patch`, so the two
+patches must be applied together.
+
 ### Applying it
 
 The build expects a patched reth checkout at the path named in the `[patch]`

@@ -140,3 +140,13 @@
 +        Ok(())
 +    }
 +}
+--- a/crates/ethereum/node/src/node.rs
++++ b/crates/ethereum/node/src/node.rs
+@@ -481,6 +481,7 @@ fn jit_runtime_config(jit: &JitArgs) -> RuntimeConfig {
+     let tuning = RuntimeTuning {
+         channel_capacity: jit.channel_capacity,
+         jit_hot_threshold: jit.hot_threshold,
++        observe_lookups: default_tuning.observe_lookups,
+         jit_max_bytecode_len: jit.max_bytecode_len,
+         jit_max_pending_jobs: jit.max_pending_jobs,
+         jit_worker_count: jit.worker_count.unwrap_or(default_tuning.jit_worker_count),

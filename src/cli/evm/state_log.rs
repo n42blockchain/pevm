@@ -822,7 +822,16 @@ impl MmapStateLogDatabase {
             .write(true)
             .open(&self.index_file_path)?;
         // 移动到文件末尾准备追加
-        let index_end = index_file.seek(SeekFrom::End(0))?;
+        // Append at the last whole entry boundary: a torn trailing entry from a
+        // crash would otherwise shift every later entry out of alignment.
+        let raw_end = index_file.seek(SeekFrom::End(0))?;
+        let index_end = if raw_end > Self::HEADER_SIZE {
+            Self::HEADER_SIZE
+                + (raw_end - Self::HEADER_SIZE) / Self::INDEX_ENTRY_SIZE * Self::INDEX_ENTRY_SIZE
+        } else {
+            raw_end
+        };
+        index_file.seek(SeekFrom::Start(index_end))?;
         let mut index_writer = BufWriter::with_capacity(1024 * 1024, index_file); // 1MB buffer
 
         let mut current_offset = self.data_end;
@@ -2163,5 +2172,43 @@ impl MmapStateLogDatabase {
                 None
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod crash_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn entry(n: u8) -> Vec<ReadLogEntry> {
+        vec![ReadLogEntry::Account { address: alloy_primitives::Address::ZERO, data: vec![n; 40] }]
+    }
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("pevm_crash_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn torn_index_tail_does_not_misalign() {
+        let dir = tmpdir("index");
+        {
+            let mut db = MmapStateLogDatabase::open_for_write(&dir).unwrap();
+            db.write_block_logs_batch(&[(1, entry(1))]).unwrap();
+            db.flush().unwrap();
+        }
+        let mut f = OpenOptions::new().append(true).open(dir.join("state_logs_index.bin")).unwrap();
+        f.write_all(&[0xAB; 7]).unwrap();
+        drop(f);
+        {
+            let mut db = MmapStateLogDatabase::open_for_write(&dir).unwrap();
+            db.write_block_logs_batch(&[(3, entry(3))]).unwrap();
+            db.flush().unwrap();
+        }
+        let db = MmapStateLogDatabase::open(&dir).unwrap();
+        assert!(db.read_block_log(1).is_some());
+        assert_eq!(db.read_block_log(3).unwrap(), &MmapStateLogDatabase::serialize_entries(&entry(3)).unwrap()[..]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

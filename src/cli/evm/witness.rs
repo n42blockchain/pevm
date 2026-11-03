@@ -854,6 +854,9 @@ impl WitnessFreezerReader {
             .map(|(file_number, _)| *file_number as usize + 1)
             .unwrap_or(1);
         let mut data = Vec::with_capacity(file_count);
+        // An empty freezer has nothing to map, and mapping a zero-length file
+        // is an error.
+        let file_count = if items == 0 { 0 } else { file_count };
         for file_number in 0..file_count {
             let path = table_data_path(directory, name, file_number as u16);
             let file = fs::File::open(&path)
@@ -1360,6 +1363,17 @@ mod tests {
         for block in [0u64, 63, 64, 127, 128, 191] {
             assert_eq!(cache.witness_for(&reader, block).unwrap(), &vec![block as u8; 100 + block as usize][..]);
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reader_opens_an_empty_freezer() {
+        let dir = freezer_dir("empty");
+        WitnessFreezerWriter::open(&dir, 0).unwrap().finish().unwrap();
+        let reader = WitnessFreezerReader::open(&dir).unwrap();
+        assert_eq!(reader.items(), 0);
+        let mut cache = WitnessBatchCache::default();
+        assert!(cache.witness_for(&reader, 0).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -384,12 +384,21 @@ impl WitnessFreezerWriter {
                 .checked_add(1)
                 .ok_or_else(|| eyre::eyre!("witness freezer data file number overflow"))?;
             let path = data_path(&self.output_dir, self.head_file);
+            // An earlier run may have died after creating this file but before
+            // indexing anything in it; an empty leftover is safe to reuse.
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
-                .create_new(true)
+                .create(true)
+                .truncate(false)
                 .open(&path)
                 .wrap_err_with(|| format!("failed to create {}", path.display()))?;
+            if file.metadata()?.len() != 0 {
+                eyre::bail!(
+                    "{} already exists and is not empty; refusing to overwrite it",
+                    path.display()
+                )
+            }
             self.data = BufWriter::new(file);
             self.head_size = 0;
         }
@@ -1374,6 +1383,22 @@ mod tests {
         assert_eq!(reader.items(), 0);
         let mut cache = WitnessBatchCache::default();
         assert!(cache.witness_for(&reader, 0).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_reuses_an_empty_leftover_data_file() {
+        let dir = freezer_dir("rotate");
+        let mut writer = WitnessFreezerWriter::open(&dir, 0).unwrap();
+        fs::write(dir.join("witness.0001.cdat"), b"").unwrap();
+        writer.head_size = FREEZER_MAX_FILE_SIZE;
+        for block in 0..64u64 {
+            writer.push(block, vec![block as u8; 50]).unwrap();
+        }
+        writer.finish().unwrap();
+        let reader = WitnessFreezerReader::open(&dir).unwrap();
+        let mut cache = WitnessBatchCache::default();
+        assert_eq!(cache.witness_for(&reader, 5).unwrap(), &[5u8; 50][..]);
         let _ = fs::remove_dir_all(&dir);
     }
 

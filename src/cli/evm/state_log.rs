@@ -809,6 +809,20 @@ impl MmapStateLogDatabase {
 
         let pending_count = self.pending_writes.len();
 
+        // The index stores lengths as u32; refuse before touching any file
+        // rather than record a truncated length.
+        if let Some((block, data)) = self
+            .pending_writes
+            .iter()
+            .find(|(_, data)| u32::try_from(data.len()).is_err())
+        {
+            return Err(eyre::eyre!(
+                "state log for block {} is {} bytes, which exceeds the u32 index length",
+                block,
+                data.len()
+            ));
+        }
+
         // 同步写入策略：使用缓冲写入提高效率，每 1000 个块同步刷盘
         // 每 10000 个块更新头部，确保崩溃时头部信息也是最新的
 
@@ -844,7 +858,7 @@ impl MmapStateLogDatabase {
 
         // 批量写入：数据和索引一起写入缓冲，定期同步
         for (block_number, data) in self.pending_writes.drain(..) {
-            let data_len = data.len() as u32;
+            let data_len = u32::try_from(data.len()).expect("length checked above");
 
             // 写入数据到缓冲
             data_writer.write_all(&data)?;
@@ -2211,6 +2225,18 @@ mod crash_tests {
         db.flush().unwrap();
         let db = MmapStateLogDatabase::open(&dir).unwrap();
         assert_eq!(db.read_block_log(2).unwrap(), &MmapStateLogDatabase::serialize_entries(&entry(2)).unwrap()[..]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_rejects_block_larger_than_u32() {
+        let dir = tmpdir("big");
+        let mut db = MmapStateLogDatabase::open_for_write(&dir).unwrap();
+        // Avoid allocating 4 GiB: a sparse zeroed vec is lazily committed.
+        db.pending_writes.push((7, vec![0u8; u32::MAX as usize + 1]));
+        assert!(db.flush().is_err());
+        assert!(db.index.is_empty());
+        db.pending_writes.clear();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
